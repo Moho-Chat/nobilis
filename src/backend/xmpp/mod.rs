@@ -16,8 +16,10 @@
 //! The resource is `moho.<8 characters>`, made once per account and kept, so a restart is the same device. Nothing else
 //! is said that the protocol does not require.
 
+pub mod bookmarks;
 pub mod caps;
 pub mod connect;
+pub mod dataform;
 pub mod dispatch;
 pub mod incoming;
 pub mod init;
@@ -25,6 +27,7 @@ pub mod iq;
 pub mod mam;
 pub mod messages;
 pub mod muc;
+pub mod muc_admin;
 pub mod ns;
 pub mod roster;
 pub mod send;

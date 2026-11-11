@@ -9,7 +9,16 @@ use tokio_xmpp::Stanza;
 pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
     tracing::trace!("xmpp[{}]: <- {stanza:?}", handle.account_id);
     match stanza {
-        Stanza::Message(m) => messages::handle(state, handle, m).await,
+        Stanza::Message(m) => {
+            // A change another client made to the bookmarks.
+            if let Some(event) = m.payloads.iter().find(|p| p.is("event", ns::PUBSUB_EVENT)) {
+                if m.from.as_ref().is_some_and(|f| f.to_bare() == handle.own()) {
+                    super::bookmarks::notified(state, handle, event).await;
+                }
+                return;
+            }
+            messages::handle(state, handle, m).await
+        }
         Stanza::Presence(p) => roster::handle_presence(state, handle, &p).await,
         Stanza::Iq(request) => match &request {
             Iq::Result { .. } | Iq::Error { .. } => {

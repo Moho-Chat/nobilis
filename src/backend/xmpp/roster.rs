@@ -160,6 +160,10 @@ pub fn publish_presence(state: &AppState, handle: &Handle, jid: &BareJid) {
 pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
     let Some(from) = p.from.clone() else { return };
     let bare = from.to_bare();
+    // A room's occupants are not contacts.
+    if super::muc::is_room(handle, &bare) {
+        return super::muc::handle_presence(state, handle, p).await;
+    }
     match p.type_ {
         PresenceType::None | PresenceType::Unavailable => {
             if bare == handle.own() {

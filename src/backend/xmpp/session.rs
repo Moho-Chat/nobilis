@@ -82,6 +82,22 @@ pub struct Session {
     pub requests: BTreeMap<BareJid, String>,
     /// The last message each person sent, by their address: what a "displayed" marker is about.
     pub last_incoming: HashMap<String, String>,
+    /// The rooms this account is in or is joining, by the room's address.
+    pub rooms: HashMap<BareJid, super::muc::Room>,
+    /// A message's id as the room stamped it (its stanza-id), by the id it is kept under: what reactions, retractions and
+    /// replies in a room must name.
+    pub room_ids: HashMap<String, String>,
+    /// Invitations to rooms that have not been answered.
+    pub room_invites: Vec<RoomInvite>,
+}
+
+/// Somebody asked this account into a room.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomInvite {
+    pub room: String,
+    pub from: String,
+    pub reason: String,
+    pub password: Option<String>,
 }
 
 /// One message out of the archive, as it arrived.

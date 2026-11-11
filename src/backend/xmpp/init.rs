@@ -20,6 +20,7 @@ pub async fn run(state: &AppState, handle: &Handle) {
         (if s.own_show.is_empty() { "online".to_string() } else { s.own_show.clone() }, s.own_status.clone())
     };
     roster::set_own(handle, &show, &status).await;
+    super::bookmarks::load(state, handle).await;
     mam::catch_up(state, handle).await;
     let _ = caps::NAME;
 }

@@ -3520,6 +3520,13 @@ pub async fn dispatch(
                                     return (Some(ok_node()), None);
                                 }
                             }
+                        } else if buffer.account_id.starts_with("xmpp:") && buffer.kind == "channel" {
+                            // Leaving a room leaves it for good: it is taken off the account's bookmarks, or it would be
+                            // opened again at the next sign-in, here and on every other client.
+                            if let (Some(handle), Some(room)) = (state.runtime.xmpp_handle(&buffer.account_id), buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok())) {
+                                backend::xmpp::muc::leave(state, &handle, &room).await;
+                                let _ = backend::xmpp::bookmarks::remove(&handle, room.as_str()).await;
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -5001,6 +5008,132 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "accountId": account_id })), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Rooms: joining one (and keeping it among the account's bookmarks), what the account's own server offers, who
+        // is invited, and what a room's owner and moderators do. A room is the buffer's `remoteId`.
+        "xmppJoinRoom" | "xmppListRooms" | "xmppInvites" | "xmppAnswerInvite" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            match method {
+                "xmppInvites" => (Some(serde_json::json!(backend::xmpp::messages::invites_json(&handle))), None),
+                "xmppListRooms" => {
+                    // The conference services of the account's own server, found by asking it what it hosts.
+                    let domain = handle.own().domain().as_str().to_string();
+                    let Ok(server) = domain.parse::<tokio_xmpp::jid::Jid>() else { return (None, Some("the server's address is not usable".to_string())) };
+                    let items = match handle.request(Some(server), false, tokio_xmpp::minidom::Element::builder("query", backend::xmpp::ns::DISCO_ITEMS).build()).await {
+                        Ok(q) => q.map(|q| q.children().filter_map(|c| c.attr("jid").map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default(),
+                        Err(e) => return (None, Some(e.words())),
+                    };
+                    let mut rooms = Vec::new();
+                    for service in items {
+                        let Ok(jid) = service.parse::<tokio_xmpp::jid::Jid>() else { continue };
+                        let info = handle.request(Some(jid.clone()), false, tokio_xmpp::minidom::Element::builder("query", backend::xmpp::ns::DISCO_INFO).build()).await.ok().flatten();
+                        if !info.is_some_and(|q| q.children().any(|c| c.name() == "identity" && c.attr("category") == Some("conference"))) {
+                            continue;
+                        }
+                        if let Ok(list) = backend::xmpp::muc::list_rooms(&handle, &jid).await {
+                            rooms.extend(list.into_iter().map(|(jid, name)| serde_json::json!({ "jid": jid, "name": name, "service": service })));
+                        }
+                    }
+                    (Some(serde_json::json!({ "rooms": rooms })), None)
+                }
+                "xmppAnswerInvite" => {
+                    let Some(room) = p_str_opt(params, "roomId") else { return (None, Some("xmppAnswerInvite requires \"roomId\"".to_string())) };
+                    let invite = {
+                        let mut s = handle.session();
+                        let at = s.room_invites.iter().position(|i| i.room == room);
+                        at.map(|at| s.room_invites.remove(at))
+                    };
+                    backend::xmpp::messages::announce_invites(state, &handle);
+                    let (Some(invite), Ok(jid)) = (invite, room.parse::<tokio_xmpp::jid::BareJid>()) else { return (None, Some("no such invitation".to_string())) };
+                    if p_bool(params, "accept", true) {
+                        if let Err(e) = backend::xmpp::muc::join(state, &handle, &jid, None, invite.password.as_deref()).await {
+                            return (None, Some(e));
+                        }
+                        let _ = backend::xmpp::bookmarks::save(&handle, &backend::xmpp::bookmarks::Bookmark { room: room.to_string(), autojoin: true, password: invite.password, ..Default::default() }).await;
+                    }
+                    (Some(ok_node()), None)
+                }
+                _ => {
+                    let jid = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                        Some(Ok(jid)) => jid,
+                        Some(Err(e)) => return (None, Some(e)),
+                        None => return (None, Some("xmppJoinRoom requires \"jid\"".to_string())),
+                    };
+                    let nick = p_str_opt(params, "nick").map(str::trim).filter(|n| !n.is_empty());
+                    let password = p_str_opt(params, "password").filter(|p| !p.is_empty());
+                    if let Err(e) = backend::xmpp::muc::join(state, &handle, &jid, nick, password).await {
+                        return (None, Some(e));
+                    }
+                    let nick_used = handle.session().rooms.get(&jid).map(|r| r.nick.clone());
+                    if p_bool(params, "bookmark", true) {
+                        let b = backend::xmpp::bookmarks::Bookmark { room: jid.to_string(), autojoin: true, nick: nick_used, password: password.map(str::to_string), ..Default::default() };
+                        if let Err(e) = backend::xmpp::bookmarks::save(&handle, &b).await {
+                            tracing::info!("xmpp: the room was joined but not bookmarked: {e}");
+                        }
+                    }
+                    let buffer = backend::xmpp::muc::find_buffer(state, &handle, &jid);
+                    (Some(serde_json::json!({ "bufferId": buffer.map(|b| b.id) })), None)
+                }
+            }
+        }
+
+        "xmppRoomAction" | "xmppRoomConfig" | "xmppSetRoomConfig" | "xmppInvite" | "xmppSetSubject" | "xmppSetNick" | "xmppAffiliations" | "xmppDestroyRoom" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "channel") else {
+                return (None, Some(format!("{method} needs a room's \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(room) = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok()) else { return (None, Some("this is not a room".to_string())) };
+            let reason = p_str(params, "reason", "");
+            let result: Result<serde_json::Value, String> = match method {
+                "xmppSetSubject" => {
+                    backend::xmpp::muc_admin::set_subject(&handle, &room, p_str(params, "subject", "")).await;
+                    Ok(serde_json::json!({}))
+                }
+                "xmppSetNick" => backend::xmpp::muc_admin::change_nick(&handle, &room, p_str(params, "nick", "")).await.map(|_| serde_json::json!({})),
+                "xmppInvite" => match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                    Some(Ok(who)) => {
+                        backend::xmpp::muc_admin::invite(&handle, &room, &who, reason, None).await;
+                        Ok(serde_json::json!({}))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err("xmppInvite requires \"jid\"".to_string()),
+                },
+                "xmppAffiliations" => backend::xmpp::muc_admin::affiliates(&handle, &room, p_str(params, "affiliation", "member")).await.map(|l| serde_json::json!({ "people": l.into_iter().map(|(jid, reason)| serde_json::json!({ "jid": jid, "reason": reason })).collect::<Vec<_>>() })),
+                "xmppRoomConfig" => backend::xmpp::muc_admin::config(&handle, &room).await.map(|f| serde_json::json!(f)),
+                "xmppSetRoomConfig" => match backend::xmpp::muc_admin::config(&handle, &room).await {
+                    Ok(form) => backend::xmpp::muc_admin::set_config(&handle, &room, &form, params.get("answers").unwrap_or(&serde_json::Value::Null)).await.map(|_| serde_json::json!({})),
+                    Err(e) => Err(e),
+                },
+                "xmppDestroyRoom" => backend::xmpp::muc_admin::destroy(&handle, &room, reason).await.map(|_| serde_json::json!({})),
+                _ => {
+                    // A person is removed, silenced, given voice, made a moderator, banned: each is a role or an
+                    // affiliation, and which one decides how the person is named (a role by nickname, an affiliation
+                    // by address).
+                    let action = p_str(params, "action", "");
+                    let nick = p_str(params, "nick", "");
+                    let jid = p_str_opt(params, "jid").and_then(|j| backend::xmpp::connect::normalise_jid(j).ok());
+                    let known = handle.session().rooms.get(&room).and_then(|r| r.occupants.get(nick).and_then(|o| o.jid.clone()));
+                    let address = jid.or(known);
+                    match (action, address.as_ref()) {
+                        ("kick", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "none", reason).await,
+                        ("mute", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "visitor", reason).await,
+                        ("voice", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "participant", reason).await,
+                        ("moderator", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "moderator", reason).await,
+                        ("ban", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, "outcast", reason).await,
+                        ("unban" | "unmember", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, "none", reason).await,
+                        ("member" | "admin" | "owner", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, action, reason).await,
+                        (_, None) => Err("this room does not show that person's address, so it cannot be done by address".to_string()),
+                        _ => Err(format!("unknown room action {action:?}")),
+                    }
+                    .map(|_| serde_json::json!({}))
+                }
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
             }
         }
 

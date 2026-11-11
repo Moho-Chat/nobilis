@@ -20,9 +20,23 @@ fn target(state: &AppState, buffer: &Buffer) -> Result<(Handle, BareJid), String
     Ok((handle, jid))
 }
 
+/// Whether this conversation is a room: what is sent in it is `groupchat`, and is recorded when the room says it has it.
+fn in_room(buffer: &Buffer) -> bool {
+    buffer.kind == "channel"
+}
+
+/// The id of a message as the other side must name it: in a room, the room's own stamp on it.
+fn named(handle: &Handle, buffer: &Buffer, local: &str) -> String {
+    if in_room(buffer) {
+        handle.session().room_ids.get(local).cloned().unwrap_or_else(|| local.to_string())
+    } else {
+        local.to_string()
+    }
+}
+
 /// A message to this person with the id it is sent under, and the markers every chat message carries.
-fn chat(to: &BareJid, id: &str) -> Message {
-    let mut m = Message::chat(Jid::from(to.clone()));
+fn chat(to: &BareJid, id: &str, room: bool) -> Message {
+    let mut m = if room { Message::groupchat(Jid::from(to.clone())) } else { Message::chat(Jid::from(to.clone())) };
     m.id = Some(Id(id.to_string()));
     m.payloads.push(Element::builder("origin-id", ns::SID).at("id", id).build());
     m
@@ -51,15 +65,15 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         return Err("There is nothing to send".to_string());
     }
     let id = xml::new_id();
-    let mut m = chat(&jid, &id);
+    let mut m = chat(&jid, &id, in_room(buffer));
     let mut preview = None;
     let wire_body = match reply_to.as_deref().filter(|r| !r.is_empty()) {
         Some(target_id) => {
             let quoted = state.store.get_message(&buffer.id, target_id).ok().flatten();
             let (who, said) = quoted.as_ref().map(|q| (q.from.clone(), q.body.clone())).unwrap_or_default();
             // The reply names the message by the id it was sent under, which is the one stored.
-            let to = if quoted.as_ref().is_some_and(|q| q.is_own) { handle.bound.to_bare() } else { jid.clone() };
-            m.payloads.push(Element::builder("reply", ns::REPLY).at("id", target_id).at("to", to.to_string()).build());
+            let to = if in_room(buffer) { format!("{jid}/{who}") } else if quoted.as_ref().is_some_and(|q| q.is_own) { handle.bound.to_bare().to_string() } else { jid.to_string() };
+            m.payloads.push(Element::builder("reply", ns::REPLY).at("id", named(&handle, buffer, target_id)).at("to", to).build());
             let (fallback, n) = reply_fallback(&who, &said);
             m.payloads.push(Element::builder("fallback", ns::FALLBACK).at("for", ns::REPLY).append(Element::builder("body", ns::FALLBACK).at("start", "0").at("end", n.to_string()).build()).build());
             preview = Some(crate::model::ReplyPreview { id: target_id.to_string(), from: who, body: said, ..Default::default() });
@@ -68,9 +82,17 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         None => body.to_string(),
     };
     m.bodies.insert(Default::default(), wire_body);
-    m.payloads.push(xml::empty("request", ns::RECEIPTS));
+    if !in_room(buffer) {
+        m.payloads.push(xml::empty("request", ns::RECEIPTS));
+    }
     m.payloads.push(xml::empty("markable", ns::MARKERS));
     m.payloads.push(xml::empty("active", ns::CHATSTATES));
+    if in_room(buffer) {
+        // The room sends it back to everybody including its sender, and that copy is what is shown: a message the room
+        // refused (no voice, a ban) is then not shown as if it had been said.
+        handle.send_message(m).await;
+        return Ok(());
+    }
     handle.session().sent.insert(id.clone());
     let own = handle.own().to_string();
     state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, "dm", &own, body, false, "chat", preview, Some(id), false, None, Vec::new(), Vec::new(), Some(own.clone()), None, None, None);
@@ -89,13 +111,15 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
         return Err("Only a message you sent can be changed".to_string());
     }
     let id = xml::new_id();
-    let mut m = chat(&jid, &id);
+    let mut m = chat(&jid, &id, in_room(buffer));
     m.bodies.insert(Default::default(), body.to_string());
     m.payloads.push(Element::builder("replace", ns::CORRECT).at("id", msg_id).build());
-    m.payloads.push(xml::empty("request", ns::RECEIPTS));
     handle.session().sent.insert(id.clone());
     handle.session().aliases.insert(id, msg_id.to_string());
-    state.runtime.update_message(state, &buffer.id, msg_id, body, &[], &[]);
+    // In a room the correction is shown when the room says it, like the message was.
+    if !in_room(buffer) {
+        state.runtime.update_message(state, &buffer.id, msg_id, body, &[], &[]);
+    }
     handle.send_message(m).await;
     Ok(())
 }
@@ -108,15 +132,21 @@ pub async fn delete(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<(
         return Err("Only a message you sent can be taken back".to_string());
     }
     let id = xml::new_id();
-    let mut m = chat(&jid, &id);
+    let mut m = chat(&jid, &id, in_room(buffer));
     let note = "This person attempted to retract a previous message, but it's unsupported by your client.";
     m.bodies.insert(Default::default(), note.to_string());
-    m.payloads.push(Element::builder("retract", ns::RETRACT).at("id", msg_id).build());
+    m.payloads.push(Element::builder("retract", ns::RETRACT).at("id", named(&handle, buffer, msg_id)).build());
     m.payloads.push(Element::builder("fallback", ns::FALLBACK).at("for", ns::RETRACT).build());
     m.payloads.push(xml::empty("store", ns::HINTS));
     handle.session().sent.insert(id);
-    state.runtime.delete_message(state, &buffer.id, msg_id);
+    if !in_room(buffer) {
+        state.runtime.delete_message(state, &buffer.id, msg_id);
+    }
     handle.send_message(m).await;
+    if in_room(buffer) {
+        // A room does not send a retraction back to its sender in every implementation: it is taken out here as well.
+        state.runtime.delete_message(state, &buffer.id, msg_id);
+    }
     Ok(())
 }
 
@@ -139,11 +169,11 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
         return Ok(());
     }
     handle.session().reactions.insert(key, set.clone());
-    let mut r = Element::builder("reactions", ns::REACTIONS).at("id", msg_id).build();
+    let mut r = Element::builder("reactions", ns::REACTIONS).at("id", named(&handle, buffer, msg_id)).build();
     for e in &set {
         r.append_child(Element::builder("reaction", ns::REACTIONS).append(e.clone()).build());
     }
-    let mut m = chat(&jid, &xml::new_id());
+    let mut m = chat(&jid, &xml::new_id(), in_room(buffer));
     m.payloads.push(r);
     m.payloads.push(xml::empty("store", ns::HINTS));
     state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
@@ -154,7 +184,7 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
 /// Whether this account may tell this person things that are only for those it talks to (typing, reading): somebody on
 /// the roster, not a stranger who wrote first.
 fn trusted(handle: &Handle, jid: &BareJid) -> bool {
-    handle.session().roster.get(jid).is_some_and(|c| c.subscription != "none" || c.ask)
+    super::muc::is_room(handle, jid) || handle.session().roster.get(jid).is_some_and(|c| c.subscription != "none" || c.ask)
 }
 
 /// Says that this account is writing, or has stopped (XEP-0085).
@@ -172,7 +202,7 @@ pub async fn typing(state: &AppState, buffer: &Buffer, composing: bool) -> Resul
     } else {
         handle.session().typing_to.remove(jid.as_str());
     }
-    let mut m = Message::chat(Jid::from(jid));
+    let mut m = if in_room(buffer) { Message::groupchat(Jid::from(jid)) } else { Message::chat(Jid::from(jid)) };
     m.payloads.push(xml::empty(if composing { "composing" } else { "paused" }, ns::CHATSTATES));
     m.payloads.push(xml::empty("no-store", ns::HINTS));
     handle.send_message(m).await;
@@ -189,9 +219,9 @@ pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> 
     if !handle.session().answered.insert(format!("displayed:{last}")) {
         return Ok(());
     }
-    let mut m = Message::chat(Jid::from(jid));
+    let mut m = if in_room(buffer) { Message::groupchat(Jid::from(jid)) } else { Message::chat(Jid::from(jid)) };
     m.id = Some(Id(xml::new_id()));
-    m.payloads.push(Element::builder("displayed", ns::MARKERS).at("id", last).build());
+    m.payloads.push(Element::builder("displayed", ns::MARKERS).at("id", named(&handle, buffer, &last)).build());
     m.payloads.push(xml::empty("store", ns::HINTS));
     handle.send_message(m).await;
     Ok(())
@@ -218,7 +248,7 @@ mod tests {
     #[test]
     fn a_chat_message_carries_the_id_it_is_sent_under_twice_as_xep_0359_asks() {
         let to: BareJid = "bob@example.org".parse().unwrap();
-        let m = chat(&to, "moho-1");
+        let m = chat(&to, "moho-1", false);
         assert_eq!(m.id.as_ref().map(|i| i.0.as_str()), Some("moho-1"));
         assert!(m.payloads.iter().any(|p| p.is("origin-id", ns::SID) && p.attr("id") == Some("moho-1")));
         assert_eq!(m.to.as_ref().map(|j| j.to_string()), Some("bob@example.org".to_string()));

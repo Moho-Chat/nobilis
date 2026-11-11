@@ -1,8 +1,551 @@
-//! Group chats (XEP-0045). Milestone 3: until then a room's messages are not shown.
+//! Group chats (XEP-0045), with the extensions that make them usable: occupant ids (XEP-0421), room archives (MAM on the
+//! room), the room's own subject, and everything the common clients show about who is in a room and what they may do.
+//!
+//! A room is a conversation of kind `channel` named by its disco name (or the local part of its address) and filed under
+//! "Rooms"; its occupants are the member list. Joining is a presence to `room/nick`; the room answers with the occupants'
+//! presences (each carrying a role and an affiliation, and, in a room that shows them, the real address), then the subject,
+//! and `110` in a presence marks our own, which is when we are in. A refusal is an error presence, and says why.
+//!
+//! What a message from the room says about who sent it is the occupant's nickname, which can change; the sender id kept
+//! with the message is the occupant id when the room gives one, so a correction or a retraction is still accepted from
+//! the same person after a nickname change, and from nobody else.
 
-use super::messages::Origin;
-use super::session::Handle;
+use super::messages::{self, Conv, Origin};
+use super::session::{Failure, Handle};
+use super::xml::Attr;
+use super::{incoming, ns, roster};
+use crate::model::Buffer;
 use crate::state::AppState;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashSet};
+use tokio_xmpp::jid::{BareJid, Jid};
+use tokio_xmpp::minidom::Element;
 use tokio_xmpp::parsers::message::Message;
+use tokio_xmpp::parsers::presence::{Presence, Type as PresenceType};
 
-pub async fn handle_groupchat(_state: &AppState, _handle: &Handle, _message: Message, _origin: Origin) {}
+pub const MUC: &str = "http://jabber.org/protocol/muc";
+pub const MUC_USER: &str = "http://jabber.org/protocol/muc#user";
+pub const MUC_ADMIN: &str = "http://jabber.org/protocol/muc#admin";
+pub const MUC_OWNER: &str = "http://jabber.org/protocol/muc#owner";
+pub const OCCUPANT_ID: &str = "urn:xmpp:occupant-id:0";
+pub const CATEGORY: &str = "Rooms";
+
+/// Somebody in a room.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Occupant {
+    /// Their address, if the room says (a room that is not anonymous).
+    pub jid: Option<BareJid>,
+    pub role: String,
+    pub affiliation: String,
+    pub show: String,
+    pub status: String,
+    pub occupant_id: Option<String>,
+}
+
+/// A room this account is in, or is joining.
+#[derive(Debug, Clone, Default)]
+pub struct Room {
+    pub nick: String,
+    pub joined: bool,
+    pub password: Option<String>,
+    pub subject: Option<String>,
+    pub name: Option<String>,
+    pub occupants: BTreeMap<String, Occupant>,
+    pub features: HashSet<String>,
+    pub own_role: String,
+    pub own_affiliation: String,
+    /// Our own occupant id in this room, which marks our messages whatever we are called.
+    pub own_occupant_id: Option<String>,
+    /// The first subject has been seen (what comes with the history is the room's state, not a change).
+    pub subject_seen: bool,
+}
+
+impl Room {
+    pub fn anonymous(&self) -> bool {
+        !self.features.contains("muc_nonanonymous")
+    }
+
+    pub fn has_archive(&self) -> bool {
+        self.features.contains(ns::MAM)
+    }
+}
+
+/// The codes a room's presence carries (`<status code='110'/>`).
+pub fn status_codes(user: &Element) -> Vec<u16> {
+    user.children().filter(|c| c.name() == "status").filter_map(|c| c.attr("code").and_then(|v| v.parse().ok())).collect()
+}
+
+fn user_element(p_payloads: &[Element]) -> Option<&Element> {
+    p_payloads.iter().find(|e| e.is("x", MUC_USER))
+}
+
+/// The occupant id a stanza carries, when it was stamped by `room`.
+pub fn occupant_id_of(payloads: &[Element], room: &BareJid) -> Option<String> {
+    payloads.iter().filter(|e| e.is("occupant-id", OCCUPANT_ID)).find(|e| e.attr("by").and_then(|b| b.parse::<Jid>().ok()).is_some_and(|b| &b.to_bare() == room)).and_then(|e| e.attr("id").map(str::to_string))
+}
+
+pub fn is_room(handle: &Handle, jid: &BareJid) -> bool {
+    handle.session().rooms.contains_key(jid)
+}
+
+/// The buffer of a room, if it has one.
+pub fn find_buffer(state: &AppState, handle: &Handle, room: &BareJid) -> Option<Buffer> {
+    let remote = room.to_string();
+    state.runtime.list_buffers().into_iter().find(|b| b.account_id == handle.account_id && b.kind == "channel" && b.remote_id.as_deref() == Some(remote.as_str()))
+}
+
+/// The conversation of a room, made if it is not there.
+pub fn ensure_buffer(state: &AppState, handle: &Handle, room: &BareJid) -> Buffer {
+    let known = handle.session().rooms.get(room).and_then(|r| r.name.clone()).filter(|n| !n.trim().is_empty());
+    // A room whose name is not known yet keeps the name its conversation already has, rather than being renamed to its
+    // address and back as the name turns up.
+    if known.is_none() {
+        if let Some(found) = find_buffer(state, handle, room) {
+            return found;
+        }
+    }
+    let display = known.unwrap_or_else(|| room.node().map(|n| n.to_string()).unwrap_or_else(|| room.to_string()));
+    let taken = |name: &str| state.runtime.list_buffers().into_iter().any(|b| b.account_id == handle.account_id && b.name == name && b.remote_id.as_deref() != Some(room.as_str()));
+    let name = if taken(&display) { format!("{display} ({room})") } else { display };
+    let buffer = match find_buffer(state, handle, room) {
+        Some(found) if found.name == name => found,
+        Some(found) => {
+            state.runtime.rename_buffer(state, &handle.account_id, &found.name, &name, "channel");
+            state.runtime.get_buffer(&crate::model::buffer_id(&handle.account_id, &name)).unwrap_or(found)
+        }
+        None => state.runtime.ensure_buffer(state, &handle.account_id, &name, "channel"),
+    };
+    state.runtime.set_buffer_remote_id(state, &buffer.id, room.as_str());
+    state.runtime.set_buffer_category(state, &buffer.id, Some(CATEGORY), 0);
+    state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
+}
+
+/// A system line in a room: somebody came, went, was removed, changed the subject.
+fn card(state: &AppState, handle: &Handle, buffer: &Buffer, kind: &str, text: &str) {
+    state.runtime.record_message_at(state, &handle.account_id, &buffer.name, "channel", "*", text, false, kind, None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
+}
+
+// --- joining -------------------------------------------------------------------------------------------------------
+
+/// What a room says about itself: its name and what it supports.
+async fn disco(handle: &Handle, room: &BareJid) -> (Option<String>, HashSet<String>) {
+    let to = Jid::from(room.clone());
+    match handle.request(Some(to), false, Element::builder("query", ns::DISCO_INFO).build()).await {
+        Ok(Some(q)) => {
+            let name = q.children().find(|c| c.name() == "identity" && c.attr("category") == Some("conference")).and_then(|c| c.attr("name").map(str::to_string));
+            let features = q.children().filter(|c| c.name() == "feature").filter_map(|c| c.attr("var").map(str::to_string)).collect();
+            (name, features)
+        }
+        _ => (None, HashSet::new()),
+    }
+}
+
+/// Joins a room (or rejoins it). The answer is the room's presences, handled as they arrive.
+pub async fn join(state: &AppState, handle: &Handle, room: &BareJid, nick: Option<&str>, password: Option<&str>) -> Result<(), String> {
+    let (name, features) = disco(handle, room).await;
+    let nick = nick.map(str::to_string).or_else(|| handle.session().rooms.get(room).map(|r| r.nick.clone()).filter(|n| !n.is_empty())).unwrap_or_else(|| handle.own().node().map(|n| n.to_string()).unwrap_or_else(|| "moho".to_string()));
+    {
+        let mut s = handle.session();
+        let entry = s.rooms.entry(room.clone()).or_default();
+        entry.nick = nick.clone();
+        entry.joined = false;
+        entry.password = password.map(str::to_string).or(entry.password.take());
+        entry.name = name.or(entry.name.take());
+        entry.features = features.clone();
+    }
+    ensure_buffer(state, handle, room);
+    let Ok(to) = format!("{room}/{nick}").parse::<Jid>() else { return Err(format!("{nick:?} is not a usable nickname")) };
+    let mut x = Element::builder("x", MUC).build();
+    if let Some(pw) = handle.session().rooms.get(room).and_then(|r| r.password.clone()) {
+        x.append_child(Element::builder("password", MUC).append(pw).build());
+    }
+    // A room with an archive is read from the archive; one without sends what it has on joining.
+    if features.contains(ns::MAM) {
+        x.append_child(Element::builder("history", MUC).at("maxchars", "0").build());
+    }
+    let mut p = Presence::new(PresenceType::None).with_to(to);
+    p.payloads.push(x);
+    p.payloads.push(super::caps::presence_element());
+    handle.send_presence(p).await;
+    Ok(())
+}
+
+/// Leaves a room. The conversation stays, with what was said in it.
+pub async fn leave(state: &AppState, handle: &Handle, room: &BareJid) {
+    let nick = handle.session().rooms.get(room).map(|r| r.nick.clone()).unwrap_or_default();
+    if let Ok(to) = format!("{room}/{nick}").parse::<Jid>() {
+        handle.send_presence(Presence::new(PresenceType::Unavailable).with_to(to)).await;
+    }
+    handle.session().rooms.remove(room);
+    if let Some(b) = find_buffer(state, handle, room) {
+        state.runtime.set_buffer_read_only(state, &b.id, Some("You are not in this room"));
+        state.runtime.set_presence(&b.id, json!([]));
+        state.events.emit("presenceChange", json!({ "bufferId": b.id, "members": [], "total": 0 }));
+    }
+}
+
+// --- presence --------------------------------------------------------------------------------------------------------
+
+fn why_join_failed(error: &Element) -> String {
+    let condition = error.children().map(|c| c.name().to_string()).find(|n| n != "text").unwrap_or_default();
+    match condition.as_str() {
+        "conflict" => "That nickname is taken in this room".into(),
+        "forbidden" => "You are banned from this room".into(),
+        "not-authorized" => "This room needs a password".into(),
+        "registration-required" => "This room is for members only".into(),
+        "service-unavailable" => "This room is full".into(),
+        "item-not-found" => "This room does not exist, or is locked".into(),
+        "not-allowed" => "You may not create rooms here".into(),
+        "jid-malformed" => "That is not a usable room address or nickname".into(),
+        "remote-server-not-found" | "remote-server-timeout" => "The room's server cannot be reached".into(),
+        _ => format!("The room refused: {}", condition.replace('-', " ")),
+    }
+}
+
+/// A presence from a room (`room/nick`) or from the room itself.
+pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
+    let Some(from) = p.from.clone() else { return };
+    let room = from.to_bare();
+    let nick = from.resource().map(|r| r.to_string()).unwrap_or_default();
+    // A presence from the room itself, with no occupant behind it, is not somebody in the room.
+    if nick.is_empty() && p.type_ != PresenceType::Error {
+        return;
+    }
+    let buffer = ensure_buffer(state, handle, &room);
+    if p.type_ == PresenceType::Error {
+        let reason = p.payloads.iter().find(|e| e.name() == "error").map(why_join_failed).unwrap_or_else(|| "The room refused".to_string());
+        let was_joined = handle.session().rooms.get(&room).is_some_and(|r| r.joined);
+        if !was_joined {
+            handle.session().rooms.remove(&room);
+            state.runtime.set_buffer_read_only(state, &buffer.id, Some(&reason));
+        }
+        card(state, handle, &buffer, "system", &reason);
+        return;
+    }
+    let user = user_element(&p.payloads).cloned().unwrap_or_else(|| Element::builder("x", MUC_USER).build());
+    let codes = status_codes(&user);
+    let item = user.children().find(|c| c.name() == "item").cloned();
+    let attr = |name: &str| item.as_ref().and_then(|i| i.attr(name)).map(str::to_string);
+    let is_self = codes.contains(&110) || handle.session().rooms.get(&room).is_some_and(|r| !r.nick.is_empty() && r.nick == nick);
+    let reason = item.as_ref().and_then(|i| i.children().find(|c| c.name() == "reason")).map(|r| r.text()).filter(|r| !r.is_empty());
+
+    if p.type_ == PresenceType::Unavailable {
+        let gone = handle.session().rooms.get_mut(&room).and_then(|r| r.occupants.remove(&nick));
+        let who = nick.clone();
+        if codes.contains(&303) {
+            // A nickname change: the room says unavailable for the old one and then available for the new one.
+            let new = attr("nick").unwrap_or_default();
+            if let Some(o) = gone {
+                if let Some(r) = handle.session().rooms.get_mut(&room) {
+                    r.occupants.insert(new.clone(), o);
+                    if is_self {
+                        r.nick = new.clone();
+                    }
+                }
+            }
+            card(state, handle, &buffer, "nick", &format!("{who} is now known as {new}"));
+        } else if is_self {
+            let words = if codes.contains(&307) {
+                format!("You were kicked from the room{}", reason.map(|r| format!(": {r}")).unwrap_or_default())
+            } else if codes.contains(&301) {
+                format!("You were banned from the room{}", reason.map(|r| format!(": {r}")).unwrap_or_default())
+            } else if codes.contains(&321) {
+                "You were removed from the room because its membership changed".into()
+            } else if codes.contains(&322) {
+                "You were removed from the room because it became members-only".into()
+            } else if codes.contains(&332) {
+                "You were removed from the room because its service is shutting down".into()
+            } else {
+                "You left the room".into()
+            };
+            if let Some(r) = handle.session().rooms.get_mut(&room) {
+                r.joined = false;
+                r.occupants.clear();
+            }
+            state.runtime.set_buffer_read_only(state, &buffer.id, Some(&words));
+            card(state, handle, &buffer, "part", &words);
+        } else if gone.is_some() {
+            let words = if codes.contains(&307) {
+                format!("{who} was kicked{}", reason.map(|r| format!(": {r}")).unwrap_or_default())
+            } else if codes.contains(&301) {
+                format!("{who} was banned{}", reason.map(|r| format!(": {r}")).unwrap_or_default())
+            } else {
+                format!("{who} left")
+            };
+            card(state, handle, &buffer, "part", &words);
+        }
+        publish_occupants(state, handle, &room);
+        return;
+    }
+
+    // Somebody is here: new, or changed.
+    let show = match p.show {
+        Some(tokio_xmpp::parsers::presence::Show::Away) => "away",
+        Some(tokio_xmpp::parsers::presence::Show::Xa) => "xa",
+        Some(tokio_xmpp::parsers::presence::Show::Dnd) => "dnd",
+        _ => "online",
+    };
+    let occupant = Occupant {
+        jid: attr("jid").and_then(|j| j.parse::<Jid>().ok()).map(|j| j.to_bare()),
+        role: attr("role").unwrap_or_else(|| "participant".into()),
+        affiliation: attr("affiliation").unwrap_or_else(|| "none".into()),
+        show: show.into(),
+        status: p.statuses.values().next().cloned().unwrap_or_default(),
+        occupant_id: occupant_id_of(&p.payloads, &room),
+    };
+    let first_time = {
+        let mut s = handle.session();
+        let Some(r) = s.rooms.get_mut(&room) else { return };
+        let new = !r.occupants.contains_key(&nick);
+        if is_self {
+            r.own_role = occupant.role.clone();
+            r.own_affiliation = occupant.affiliation.clone();
+            r.own_occupant_id = occupant.occupant_id.clone();
+        }
+        r.occupants.insert(nick.clone(), occupant.clone());
+        new
+    };
+    if is_self && !handle.session().rooms.get(&room).is_some_and(|r| r.joined) {
+        if let Some(r) = handle.session().rooms.get_mut(&room) {
+            r.joined = true;
+        }
+        state.runtime.set_buffer_read_only(state, &buffer.id, None);
+        // Who can see whom: said once, on coming in, since it decides what anybody should write here.
+        let hidden = handle.session().rooms.get(&room).is_some_and(|r| r.anonymous());
+        card(state, handle, &buffer, "system", if hidden { "This room does not show people's addresses" } else { "This room shows everyone's address to everyone in it" });
+        if codes.contains(&201) {
+            // A room that did not exist is created locked, and is opened with its default settings, which the owner
+            // can change from the room's settings afterwards.
+            let form = Element::builder("x", ns::DATA).at("type", "submit").build();
+            let query = Element::builder("query", MUC_OWNER).append(form).build();
+            let _ = handle.request(Some(Jid::from(room.clone())), true, query).await;
+            card(state, handle, &buffer, "system", "You created this room");
+        }
+        let h = handle.clone();
+        let s = state.clone();
+        let r = room.clone();
+        tokio::spawn(async move { super::mam::room_catch_up(&s, &h, &r).await });
+        if codes.contains(&104) || codes.contains(&170) {
+            tracing::debug!("xmpp[{}]: room {room} changed its configuration", handle.account_id);
+        }
+    } else if first_time && !is_self && handle.session().rooms.get(&room).is_some_and(|r| r.joined) {
+        card(state, handle, &buffer, "join", &format!("{nick} joined"));
+    }
+    publish_occupants(state, handle, &room);
+}
+
+/// The window's member list for a room.
+pub fn publish_occupants(state: &AppState, handle: &Handle, room: &BareJid) {
+    let Some(buffer) = find_buffer(state, handle, room) else { return };
+    let list: Vec<Value> = {
+        let s = handle.session();
+        let Some(r) = s.rooms.get(room) else { return };
+        r.occupants
+            .iter()
+            .map(|(nick, o)| {
+                let prefix = match (o.affiliation.as_str(), o.role.as_str()) {
+                    ("owner", _) => "~",
+                    ("admin", _) => "&",
+                    (_, "moderator") => "@",
+                    (_, "participant") => "+",
+                    _ => "",
+                };
+                let status = roster::status_word(&o.show);
+                json!({
+                    "nick": nick,
+                    "userId": o.jid.as_ref().map(|j| j.to_string()).unwrap_or_else(|| format!("{room}/{nick}")),
+                    "prefix": prefix,
+                    "away": false,
+                    "status": status,
+                    "activity": if o.status.is_empty() { Value::Null } else { json!({ "kind": "custom", "text": o.status }) },
+                    "bot": false,
+                    "relationship": "",
+                    "avatarUrl": Value::Null,
+                    "roles": [o.affiliation, o.role],
+                })
+            })
+            .collect()
+    };
+    let total = list.len();
+    let list = Value::Array(list);
+    state.runtime.set_presence(&buffer.id, list.clone());
+    state.runtime.set_presence_total(&buffer.id, total);
+    state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": list, "total": total }));
+}
+
+// --- messages --------------------------------------------------------------------------------------------------------
+
+/// A message of type groupchat: live from the room, or out of its archive.
+pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Message, origin: Origin) {
+    let Some(from) = message.from.clone() else { return };
+    let room = from.to_bare();
+    let nick = from.resource().map(|r| r.to_string()).unwrap_or_default();
+    // A room this account is not in (and has never been in) is not talking to it.
+    if !is_room(handle, &room) && !matches!(origin, Origin::Archive { .. }) {
+        return;
+    }
+    let buffer = ensure_buffer(state, handle, &room);
+    let p = incoming::parse(&message);
+    // The room's subject: who set it, and what it is.
+    if message.bodies.is_empty() {
+        if let Some(subject) = &p.subject {
+            let first = {
+                let mut s = handle.session();
+                match s.rooms.get_mut(&room) {
+                    Some(r) => {
+                        let first = !r.subject_seen;
+                        r.subject_seen = true;
+                        r.subject = Some(subject.clone());
+                        first
+                    }
+                    None => true,
+                }
+            };
+            state.runtime.set_buffer_topic(state, &buffer.id, subject);
+            if !first && !nick.is_empty() && !matches!(origin, Origin::Archive { .. }) {
+                card(state, handle, &buffer, "topic", &format!("{nick} changed the subject to: {subject}"));
+            }
+            return;
+        }
+    }
+    // The room itself speaking (no nickname): its notices, shown as what they are.
+    if nick.is_empty() {
+        if let Some(body) = &p.body {
+            card(state, handle, &buffer, "system", body);
+        }
+        return;
+    }
+    let (own_nick, own_oid) = {
+        let s = handle.session();
+        s.rooms.get(&room).map(|r| (r.nick.clone(), r.own_occupant_id.clone())).unwrap_or_default()
+    };
+    let oid = occupant_id_of(&message.payloads, &room);
+    let is_own = nick == own_nick || (oid.is_some() && oid == own_oid);
+    let sender_id = match &oid {
+        Some(oid) => format!("{room}#{oid}"),
+        None => format!("{room}/{nick}"),
+    };
+    // The room's own id for the message is the one later reactions and retractions of it may name.
+    if let Some(sid) = p.stanza_ids.iter().find(|s| s.by == room.as_str()) {
+        if let Some(local) = incoming::local_id(&p) {
+            handle.session().room_ids.insert(local, sid.id.clone());
+        }
+    }
+    let own_identity = handle.own().to_string();
+    let mentioned = !is_own && mentions(&p, &own_nick, &room);
+    let conv = Conv { buffer, kind: "channel", from_name: if is_own { own_identity } else { nick.clone() }, sender_id, is_own, key: room.to_string(), mentioned };
+    messages::deliver(state, handle, &conv, p, origin).await;
+}
+
+/// Whether a message is addressed to this account in a room: it names the nickname, or answers one of its messages.
+pub fn mentions(p: &incoming::Parsed, nick: &str, room: &BareJid) -> bool {
+    if nick.is_empty() {
+        return false;
+    }
+    if p.reply.as_ref().and_then(|r| r.to.as_deref()).is_some_and(|to| to == format!("{room}/{nick}")) {
+        return true;
+    }
+    let Some(body) = &p.body else { return false };
+    let body = incoming::strip_fallbacks(body, &p.fallbacks, &[ns::REPLY]).to_lowercase();
+    let nick = nick.to_lowercase();
+    let mut from = 0;
+    while let Some(at) = body[from..].find(&nick) {
+        let start = from + at;
+        let end = start + nick.len();
+        let before = body[..start].chars().next_back();
+        let after = body[end..].chars().next();
+        let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if edge(before) && edge(after) {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// A message to one occupant of a room (type chat from `room/nick`): a conversation of its own, named for them.
+pub fn private_conversation(state: &AppState, handle: &Handle, message: &Message, is_own: bool) -> Option<Conv> {
+    let counterpart = if is_own { message.to.clone()? } else { message.from.clone()? };
+    let room = counterpart.to_bare();
+    if !is_room(handle, &room) {
+        return None;
+    }
+    let nick = counterpart.resource().map(|r| r.to_string())?;
+    let name = format!("{nick} in {}", handle.session().rooms.get(&room).and_then(|r| r.name.clone()).unwrap_or_else(|| room.to_string()));
+    let buffer = state.runtime.ensure_buffer(state, &handle.account_id, &name, "dm");
+    state.runtime.set_buffer_remote_id(state, &buffer.id, &counterpart.to_string());
+    state.runtime.set_buffer_category(state, &buffer.id, Some(roster::DEFAULT_CATEGORY), 0);
+    let own = handle.own().to_string();
+    Some(Conv { buffer, kind: "dm", from_name: if is_own { own } else { nick.clone() }, sender_id: format!("{room}/{nick}"), is_own, key: counterpart.to_string(), mentioned: false })
+}
+
+// --- asking ----------------------------------------------------------------------------------------------------------
+
+/// What a room's owner or admin set up, as a form (XEP-0004), to be shown and sent back.
+pub async fn config_form(handle: &Handle, room: &BareJid) -> Result<Option<Element>, Failure> {
+    handle.request(Some(Jid::from(room.clone())), false, Element::builder("query", MUC_OWNER).build()).await
+}
+
+/// The addresses of the rooms an account's service offers (disco#items of the conference service).
+pub async fn list_rooms(handle: &Handle, service: &Jid) -> Result<Vec<(String, String)>, Failure> {
+    let q = handle.request(Some(service.clone()), false, Element::builder("query", ns::DISCO_ITEMS).build()).await?;
+    Ok(q.map(|q| q.children().filter(|c| c.name() == "item").filter_map(|c| Some((c.attr("jid")?.to_string(), c.attr("name").unwrap_or_default().to_string()))).collect()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn a_rooms_presence_codes_are_read() {
+        let x = Element::from_str("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='participant'/><status code='110'/><status code='201'/></x>").unwrap();
+        assert_eq!(status_codes(&x), vec![110, 201]);
+    }
+
+    #[test]
+    fn a_stamp_from_another_service_is_not_an_occupant_id() {
+        let room: BareJid = "room@muc.example.org".parse().unwrap();
+        let good = Element::from_str("<occupant-id xmlns='urn:xmpp:occupant-id:0' id='abc' by='room@muc.example.org'/>").unwrap();
+        let forged = Element::from_str("<occupant-id xmlns='urn:xmpp:occupant-id:0' id='abc' by='evil@muc.example.org'/>").unwrap();
+        assert_eq!(occupant_id_of(&[good], &room).as_deref(), Some("abc"));
+        assert_eq!(occupant_id_of(&[forged], &room), None);
+    }
+
+    fn parsed(body: &str, reply_to: Option<&str>) -> incoming::Parsed {
+        incoming::Parsed { body: Some(body.into()), reply: reply_to.map(|t| incoming::Reply { id: "x".into(), to: Some(t.into()) }), ..Default::default() }
+    }
+
+    #[test]
+    fn being_named_in_a_room_is_a_mention_only_as_a_whole_word() {
+        let room: BareJid = "room@muc.example.org".parse().unwrap();
+        assert!(mentions(&parsed("hey Alice, look", None), "alice", &room));
+        assert!(mentions(&parsed("alice: look", None), "alice", &room));
+        assert!(mentions(&parsed("look @alice", None), "alice", &room));
+        assert!(mentions(&parsed("malice is not alice-like", None), "alice", &room));
+        assert!(!mentions(&parsed("malicetown", None), "alice", &room));
+        assert!(!mentions(&parsed("alices", None), "alice", &room));
+        assert!(mentions(&parsed("yes", Some("room@muc.example.org/alice")), "alice", &room), "an answer to one of our messages counts");
+        assert!(!mentions(&parsed("alice", None), "", &room));
+    }
+
+    #[test]
+    fn what_a_room_refused_is_said_in_words() {
+        let e = |c: &str| Element::from_str(&format!("<error xmlns='jabber:client' type='cancel'><{c} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>")).unwrap();
+        assert_eq!(why_join_failed(&e("conflict")), "That nickname is taken in this room");
+        assert_eq!(why_join_failed(&e("not-authorized")), "This room needs a password");
+        assert_eq!(why_join_failed(&e("registration-required")), "This room is for members only");
+        assert!(why_join_failed(&e("gone")).contains("gone"));
+    }
+
+    #[test]
+    fn a_room_that_does_not_say_it_shows_addresses_is_anonymous() {
+        let mut r = Room::default();
+        assert!(r.anonymous());
+        r.features.insert("muc_nonanonymous".into());
+        assert!(!r.anonymous());
+        assert!(!r.has_archive());
+        r.features.insert(ns::MAM.into());
+        assert!(r.has_archive());
+    }
+}

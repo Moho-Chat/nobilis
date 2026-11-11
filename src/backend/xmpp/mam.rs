@@ -146,11 +146,42 @@ pub async fn catch_up(state: &AppState, handle: &Handle) {
     tracing::info!("xmpp[{}]: caught up on {total} archived messages", handle.account_id);
 }
 
+/// After joining a room: what was said in it since this client last had anything, or its latest page if it has nothing.
+pub async fn room_catch_up(state: &AppState, handle: &Handle, room: &BareJid) {
+    tracing::debug!("xmpp[{}]: reading the archive of {room}", handle.account_id);
+    let Some(buffer) = super::muc::find_buffer(state, handle, room) else { return };
+    if !handle.session().rooms.get(room).is_some_and(|r| r.has_archive()) {
+        tracing::debug!("xmpp[{}]: {room} keeps no archive", handle.account_id);
+        return;
+    }
+    let to = Jid::from(room.clone());
+    let mut query = if buffer.last_activity_ts == 0 { Query { before: Some(None), max: 50, ..Default::default() } } else { Query { start: Some(buffer.last_activity_ts - 120), max: PAGE, ..Default::default() } };
+    for _ in 0..MAX_PAGES {
+        match run(handle, Some(to.clone()), &query).await {
+            Ok(page) => {
+                let (complete, last) = (page.complete, page.last.clone());
+                tracing::debug!("xmpp[{}]: {} archived messages of {room}, complete: {complete}", handle.account_id, page.items.len());
+                show(state, handle, page).await;
+                match (complete, last, query.before.is_some()) {
+                    (false, Some(last), false) => query = Query { start: query.start, after: Some(last), max: PAGE, ..Default::default() },
+                    _ => break,
+                }
+            }
+            Err(e) => {
+                tracing::debug!("xmpp[{}]: the archive of {room}: {e}", handle.account_id);
+                break;
+            }
+        }
+    }
+}
+
 /// Older messages for a conversation, from the archive: the page before the oldest this client holds.
 pub async fn scrollback(state: &AppState, handle: &Handle, buffer: &Buffer, oldest_ts: i64) {
     let Some(peer) = buffer.remote_id.as_deref().and_then(|j| j.parse::<BareJid>().ok()) else { return };
-    let q = Query { with: Some(peer.to_string()), end: (oldest_ts > 0).then_some(oldest_ts), before: Some(None), max: 50, ..Default::default() };
-    match run(handle, None, &q).await {
+    // A room is its own archive; a person's messages are in the account's.
+    let (to, with) = if buffer.kind == "channel" { (Some(Jid::from(peer.clone())), None) } else { (None, Some(peer.to_string())) };
+    let q = Query { with, end: (oldest_ts > 0).then_some(oldest_ts), before: Some(None), max: 50, ..Default::default() };
+    match run(handle, to, &q).await {
         Ok(page) => {
             let n = show(state, handle, page).await;
             tracing::debug!("xmpp[{}]: {n} older messages with {peer}", handle.account_id);
