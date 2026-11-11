@@ -137,6 +137,13 @@ sonora = "0.2"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis"] }
 imagesize = "0.13"
 iana-time-zone = "0.1.65"
+x25519-dalek = "2"
+curve25519-dalek = "4"
+hkdf = "0.12"
+cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.8"
+hmac012 = { version = "0.12", package = "hmac" }
+thiserror = "2"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

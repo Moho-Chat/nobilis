@@ -2881,6 +2881,24 @@ impl Runtime {
         }
     }
 
+    /// Says whether a conversation is encrypted, for the services where that is something a person turns on (XMPP's OMEMO), as
+    /// the lock beside the message box.
+    pub fn set_buffer_encrypted(&self, state: &AppState, buffer_id: &str, on: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.encrypted != Some(on) => {
+                    b.encrypted = Some(on);
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn is_matrix_room_encrypted(&self, buffer_id: &str) -> bool {
         self.matrix_encrypted_rooms.lock().unwrap().contains(buffer_id)
     }

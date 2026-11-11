@@ -32,6 +32,7 @@ pub mod mam;
 pub mod media;
 pub mod messages;
 pub mod muc;
+pub mod omemo;
 pub mod muc_admin;
 pub mod ns;
 pub mod roster;

@@ -97,6 +97,8 @@ pub struct Session {
     pub avatar_source: HashMap<BareJid, String>,
     /// Addresses this account has blocked (XEP-0191).
     pub blocked: HashSet<String>,
+    /// This device's OMEMO keys and sessions, once opened.
+    pub omemo: Option<Arc<super::omemo::Omemo>>,
 }
 
 /// Somebody asked this account into a room.

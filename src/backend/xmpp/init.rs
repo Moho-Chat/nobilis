@@ -15,6 +15,13 @@ pub async fn run(state: &AppState, handle: &Handle) {
         tracing::info!("xmpp[{}]: the server does not do carbons", handle.account_id);
     }
     super::blocking::load(handle).await;
+    {
+        // This device's OMEMO keys: opened (or made, the first time) and published, so people can write to it.
+        let path = crate::default_data_dir().join("xmpp").join(format!("{}.omemo", handle.own()));
+        let omemo = std::sync::Arc::new(super::omemo::Omemo::open(Some(path)));
+        handle.session().omemo = Some(omemo.clone());
+        super::omemo::publish_device(handle, &omemo).await;
+    }
     roster::fetch(state, handle).await;
     let (show, status) = {
         let s = handle.session();

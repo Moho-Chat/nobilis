@@ -84,6 +84,8 @@ pub struct Parsed {
     pub no_store: bool,
     /// Something is encrypted that this client cannot read (XEP-0380 names what).
     pub encrypted: Option<String>,
+    /// An OMEMO message, to be decrypted.
+    pub omemo: Option<super::omemo::Envelope>,
     /// The message carries a body that is only there for clients that cannot show what it points at.
     pub styling_disabled: bool,
 }
@@ -233,7 +235,13 @@ fn read_payload(p: &mut Parsed, e: &Element) {
         ("no-store" | "no-permanent-store", ns::HINTS) => p.no_store = true,
         ("encryption", ns::EME) => p.encrypted = Some(e.attr("name").map(str::to_string).unwrap_or_else(|| e.attr("namespace").unwrap_or("an encryption").to_string())),
         // OMEMO's own element, when nothing named it.
-        ("encrypted", "eu.siacs.conversations.axolotl" | "urn:xmpp:omemo:2") if p.encrypted.is_none() => p.encrypted = Some("OMEMO".to_string()),
+        ("encrypted", super::omemo::NS) => {
+            p.omemo = super::omemo::parse_envelope(e);
+            if p.encrypted.is_none() {
+                p.encrypted = Some("OMEMO".to_string());
+            }
+        }
+        ("encrypted", "urn:xmpp:omemo:2") if p.encrypted.is_none() => p.encrypted = Some("OMEMO 2".to_string()),
         _ => {}
     }
 }

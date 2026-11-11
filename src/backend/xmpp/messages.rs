@@ -209,7 +209,8 @@ pub async fn handle_one(state: &AppState, handle: &Handle, message: Message, ori
 }
 
 /// What a parsed message does in its conversation: says something, changes something said, or says how things stand.
-pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, p: Parsed, origin: Origin) {
+pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Parsed, origin: Origin) {
+    decrypt_in_place(state, handle, conv, &mut p).await;
     let replay = matches!(origin, Origin::Archive { .. });
     let sent_at = match &origin {
         Origin::Archive { stamp, .. } => p.sent_at.or(*stamp),
@@ -322,6 +323,47 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, p: Parsed, 
             if let Ok(peer) = conv.key.parse::<BareJid>() {
                 acknowledge(handle, &peer, &p).await;
             }
+        }
+    }
+}
+
+/// An OMEMO message becomes the message it holds. One that cannot be read says so and why, rather than showing nothing or the
+/// words every client puts in for clients that cannot read it.
+async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mut Parsed) {
+    let Some(envelope) = p.omemo.clone() else { return };
+    let omemo = handle.session().omemo.clone();
+    let result = match &omemo {
+        Some(o) => o.decrypt(conv.sender_id.split('/').next().unwrap_or_default(), &envelope),
+        None => Err(super::omemo::Error::NoSession),
+    };
+    match result {
+        Ok(done) => {
+            p.encrypted = None;
+            match done.text {
+                Some(text) => p.body = Some(text),
+                // A key sent to set a session up: there is nothing to show.
+                None => p.body = None,
+            }
+            state.runtime.set_buffer_encrypted(state, &conv.buffer.id, true);
+            if done.seen == super::omemo::store::Seen::Changed {
+                state.runtime.record_message_at(state, &handle.account_id, &conv.buffer.name, conv.kind, "*", &format!("The encryption key of a device of {} changed. Messages to it are held until you decide whether to trust it", conv.key), false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
+            }
+            if done.republish {
+                if let Some(o) = omemo {
+                    let h = handle.clone();
+                    tokio::spawn(async move { super::omemo::publish_device(&h, &o).await });
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("xmpp[{}]: an encrypted message from {} could not be read: {e}", handle.account_id, conv.key);
+            let why = match e {
+                super::omemo::Error::NotForUs => "it was not encrypted for this device".to_string(),
+                super::omemo::Error::NoSession => "there is no session with the device that sent it yet".to_string(),
+                other => other.to_string(),
+            };
+            p.body = Some(format!("This message is encrypted with OMEMO and could not be read here: {why}"));
+            p.encrypted = None;
         }
     }
 }

@@ -5341,6 +5341,86 @@ pub async fn dispatch(
             }
         }
 
+        // OMEMO: a conversation encrypted or not, and who is trusted. A fingerprint is the identity key a device showed; trusting
+        // one is the person's call after comparing it with the other person.
+        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" => {
+            let (account_id, buffer) = match method {
+                "xmppSetEncryption" => {
+                    let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "dm") else {
+                        return (None, Some("encryption is turned on for a conversation with a person".to_string()));
+                    };
+                    (b.account_id.clone(), Some(b))
+                }
+                _ => match p_str_opt(params, "accountId") {
+                    Some(a) => (a.to_string(), None),
+                    None => return (None, Some(format!("{method} requires \"accountId\""))),
+                },
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(omemo) = handle.session().omemo.clone() else { return (None, Some("OMEMO is not ready on this account yet".to_string())) };
+            match method {
+                "xmppSetEncryption" => {
+                    let Some(buffer) = buffer else { return (None, Some("no such conversation".to_string())) };
+                    let on = p_bool(params, "on", true);
+                    let Some(jid) = buffer.remote_id.clone() else { return (None, Some("no such conversation".to_string())) };
+                    if on {
+                        // Only if there is somebody to encrypt to: turning it on and then failing every send is worse than saying no now.
+                        let Ok(bare) = jid.parse::<tokio_xmpp::jid::BareJid>() else { return (None, Some("not an address".to_string())) };
+                        if backend::xmpp::omemo::usable_devices(&handle, &omemo, &bare, false).await.is_empty() {
+                            return (None, Some(format!("{jid} has no device that can be encrypted to: they may not use OMEMO, or their devices are not trusted")));
+                        }
+                    }
+                    {
+                        let mut store = omemo.store();
+                        if on {
+                            store.state.enabled.insert(jid);
+                        } else {
+                            store.state.enabled.remove(&jid);
+                        }
+                        store.save();
+                    }
+                    state.runtime.set_buffer_encrypted(state, &buffer.id, on);
+                    (Some(ok_node()), None)
+                }
+                "xmppOmemoDevices" => {
+                    let mut out = Vec::new();
+                    let me = handle.own();
+                    let people: Vec<tokio_xmpp::jid::BareJid> = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                        Some(Ok(j)) => vec![j, me.clone()],
+                        _ => vec![me.clone()],
+                    };
+                    for person in &people {
+                        for device in backend::xmpp::omemo::devices_of(&handle, &omemo, person, true).await {
+                            let store = omemo.store();
+                            let key = backend::xmpp::omemo::store::key(person.as_str(), device);
+                            let identity = store.state.identities.get(&key).cloned().unwrap_or_default();
+                            out.push(serde_json::json!({
+                                "jid": person.to_string(), "device": device, "own": device == store.state.device_id && *person == me,
+                                "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&identity), "known": !identity.is_empty(),
+                                "trust": store.trust_of(person.as_str(), device),
+                            }));
+                        }
+                    }
+                    let store = omemo.store();
+                    let own = backend::xmpp::omemo::curve::hex(&store.identity().public);
+                    (Some(serde_json::json!({ "deviceId": store.state.device_id, "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&own), "devices": out })), None)
+                }
+                _ => {
+                    let (Some(jid), Some(device), Some(trust)) = (p_str_opt(params, "jid"), params.get("device").and_then(|v| v.as_u64()), p_str_opt(params, "trust")) else {
+                        return (None, Some("xmppOmemoTrust requires \"jid\", \"device\" and \"trust\"".to_string()));
+                    };
+                    let trust = match trust {
+                        "trusted" => backend::xmpp::omemo::store::Trust::Trusted,
+                        "verified" => backend::xmpp::omemo::store::Trust::Verified,
+                        "untrusted" => backend::xmpp::omemo::store::Trust::Untrusted,
+                        _ => return (None, Some("trust is trusted, verified or untrusted".to_string())),
+                    };
+                    omemo.store().set_trust(jid, device as u32, trust);
+                    (Some(ok_node()), None)
+                }
+            }
+        }
+
         // The account's own picture: a file, or nothing to take it off.
         "xmppSetAvatar" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("xmppSetAvatar requires \"accountId\"".to_string())) };

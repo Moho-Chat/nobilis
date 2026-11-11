@@ -58,6 +58,25 @@ pub fn reply_fallback(from: &str, quoted: &str) -> (String, usize) {
     (text, n)
 }
 
+/// Whether this conversation is encrypted.
+fn encrypting(handle: &Handle, jid: &BareJid) -> bool {
+    handle.session().omemo.as_ref().is_some_and(|o| o.store().state.enabled.contains(jid.as_str()))
+}
+
+/// What an encrypted message carries in place of its body: the encrypted element, the note that says what it is for clients
+/// that cannot read it, and the words they show. Fails if there is no device of the person to encrypt to.
+async fn encrypt_for(handle: &Handle, jid: &BareJid, plaintext: &str) -> Result<Vec<Element>, String> {
+    let omemo = handle.session().omemo.clone().ok_or("OMEMO is not ready on this account yet")?;
+    let mut targets = super::omemo::usable_devices(handle, &omemo, jid, false).await;
+    if targets.is_empty() {
+        return Err(format!("None of {jid}'s devices can be encrypted to (they may use none that speak OMEMO, or have no device you trust). Nothing was sent"));
+    }
+    targets.extend(super::omemo::usable_devices(handle, &omemo, &handle.own(), true).await);
+    let encrypted = omemo.encrypt(&targets, plaintext.as_bytes()).map_err(|e| e.to_string())?;
+    let note = Element::builder("encryption", ns::EME).at("namespace", super::omemo::NS).at("name", "OMEMO").build();
+    Ok(vec![encrypted, note, xml::empty("store", ns::HINTS)])
+}
+
 /// Sends a message.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<String>) -> Result<(), String> {
     let (handle, jid) = target(state, buffer)?;
@@ -81,7 +100,12 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         }
         None => body.to_string(),
     };
-    m.bodies.insert(Default::default(), wire_body);
+    if !in_room(buffer) && encrypting(&handle, &jid) {
+        m.payloads.extend(encrypt_for(&handle, &jid, &wire_body).await?);
+        m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());
+    } else {
+        m.bodies.insert(Default::default(), wire_body);
+    }
     if !in_room(buffer) {
         m.payloads.push(xml::empty("request", ns::RECEIPTS));
     }
@@ -107,6 +131,9 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
         return send(state, buffer, caption, reply_to.map(str::to_string)).await;
     }
     let (handle, jid) = target(state, buffer)?;
+    if !in_room(buffer) && encrypting(&handle, &jid) {
+        return Err("Files cannot be sent in an encrypted conversation yet: they would go unencrypted. Turn encryption off for this conversation to send one".to_string());
+    }
     let (service, most) = super::upload::service(&handle).await?;
     let ca = state.accounts.get_xmpp(&buffer.account_id).map(|c| c.ca_pem).unwrap_or_default();
     let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
@@ -182,7 +209,12 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
     }
     let id = xml::new_id();
     let mut m = chat(&jid, &id, in_room(buffer));
-    m.bodies.insert(Default::default(), body.to_string());
+    if !in_room(buffer) && encrypting(&handle, &jid) {
+        m.payloads.extend(encrypt_for(&handle, &jid, body).await?);
+        m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());
+    } else {
+        m.bodies.insert(Default::default(), body.to_string());
+    }
     m.payloads.push(Element::builder("replace", ns::CORRECT).at("id", msg_id).build());
     handle.session().sent.insert(id.clone());
     handle.session().aliases.insert(id, msg_id.to_string());
