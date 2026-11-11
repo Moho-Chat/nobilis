@@ -69,6 +69,7 @@ pub struct Creds {
     /// A FAST token and the mechanism it was made for.
     pub fast: Option<(String, String)>,
     pub user_agent_id: String,
+    pub way: sasl::Way,
 }
 
 /// A FAST token the server gave.
@@ -229,6 +230,8 @@ fn start(m: &Mechanism, binding: Option<&'static str>, username: &str, creds: &C
             Running::Scram(Box::new(Scram::new(*hash, username, &creds.password, bound, could, expect)))
         }
         Mechanism::Plain => Running::Plain(sasl::plain(username, &creds.password)),
+        // EXTERNAL with no authorisation identity asks for the one the certificate names (RFC 6120 6.3.8); ANONYMOUS says nothing.
+        Mechanism::External | Mechanism::Anonymous => Running::Plain(Vec::new()),
         Mechanism::Ht { .. } => unreachable!("a token mechanism is started from a token"),
     }
 }
@@ -242,7 +245,11 @@ where
 {
     let domain = identity.domain().as_str().to_string();
     let bare = identity.to_bare().to_string();
-    let username = identity.node().map(|n| n.as_str().to_string()).ok_or_else(|| LoginError::Setup("the address has no user part".to_string()))?;
+    let username = match identity.node() {
+        Some(n) => n.as_str().to_string(),
+        None if creds.way == sasl::Way::Anonymous => String::new(),
+        None => return Err(LoginError::Setup("the address has no user part".to_string())),
+    };
     send(&mut wire, &header(&domain, &bare)).await?;
     let stream_id = read_header(&mut wire).await?;
     let (features, _) = read_element(&mut wire).await?;
@@ -254,7 +261,7 @@ where
     let sasl2 = super::xml::child(&features, "authentication", NS_SASL2);
     let sasl1 = super::xml::child(&features, "mechanisms", NS_SASL);
     let offered = mechanisms(sasl2.or(sasl1));
-    let (chosen, binding) = sasl::choose(&offered, &bindings, cb_list.as_deref().unwrap_or(&[]), creds.floor).map_err(LoginError::Setup)?;
+    let (chosen, binding) = sasl::choose(&offered, &bindings, cb_list.as_deref().unwrap_or(&[]), creds.floor, creds.way).map_err(LoginError::Setup)?;
     tracing::info!("xmpp[{bare}]: the server offers {} over {}; moho uses {}{}", offered.join(" "), if sasl2.is_some() { "SASL2" } else { "SASL" }, chosen.name(), binding.map(|b| format!(" bound to {b}")).unwrap_or_default());
 
     let Some(sasl2) = sasl2.cloned() else {
@@ -313,7 +320,8 @@ where
         attempts.push((mech, Running::Ht { token, cb }));
     }
     attempts.push((chosen.clone(), start(&chosen, binding, &username, creds, &bindings, &offered, cb_list.as_deref())));
-    let request = sasl::fast_to_request(&fast_offered, &bindings);
+    // A token is for an account; a session with no account gets none.
+    let request = if creds.way == sasl::Way::Anonymous { None } else { sasl::fast_to_request(&fast_offered, &bindings) };
 
     for (mech, mut running) in attempts {
         let using_token = matches!(mech, Mechanism::Ht { .. });

@@ -645,6 +645,13 @@ pub struct XmppAccountConfig {
     /// later stops matching can be told apart from it in words.
     #[serde(default)]
     pub pin_info: String,
+    /// A client certificate and its private key (PEM), for a server that signs people in by certificate (SASL EXTERNAL).
+    #[serde(default)]
+    pub client_cert_pem: String,
+    /// No account at all: the server lets anybody in (SASL ANONYMOUS) and gives an address for the session. `jid` is the
+    /// domain alone.
+    #[serde(default)]
+    pub anonymous: bool,
 }
 
 impl XmppAccountConfig {
@@ -652,9 +659,9 @@ impl XmppAccountConfig {
         format!("xmpp:{}", self.jid)
     }
 
-    /// Whether there is a sign-in behind this account.
+    /// Whether there is a sign-in behind this account: a password, a client certificate, or none needed.
     pub fn is_signed_in(&self) -> bool {
-        !self.jid.is_empty() && !self.password.is_empty()
+        !self.jid.is_empty() && (!self.password.is_empty() || !self.client_cert_pem.trim().is_empty() || self.anonymous)
     }
 }
 

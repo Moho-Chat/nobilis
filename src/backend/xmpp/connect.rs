@@ -166,6 +166,13 @@ async fn attempt(state: &AppState, account_id: &str, connector: &Connector, iden
         floor: super::sasl::Floor::from_config(&config.sasl_floor),
         fast: (!config.fast_token.is_empty()).then(|| (config.fast_token.clone(), config.fast_mechanism.clone())),
         user_agent_id: config.user_agent_id.clone(),
+        way: if config.anonymous {
+            super::sasl::Way::Anonymous
+        } else if !config.client_cert_pem.trim().is_empty() {
+            super::sasl::Way::Certificate
+        } else {
+            super::sasl::Way::Password
+        },
     };
     let (raw, bindings) = connector.open(identity).await.map_err(LoginError::Transport)?;
     let wire = super::wire::Wire::new(raw, observed.clone());
@@ -340,7 +347,10 @@ async fn run(state: &AppState, account_id: &str) {
         set_stop_reason(account_id, reason);
         state.runtime.set_conn_state(state, account_id, conn, Some(&format!("{}.{advice}", stop.message().trim_end_matches('.'))));
     };
-    let identity = match normalise_jid(&config.jid) {
+    let bare = if config.anonymous { Jid::new(config.jid.trim()).map(|j| j.to_bare()).map_err(|e| format!("{:?} is not a server's address: {e}", config.jid)) } else { normalise_jid(&config.jid) };
+    let identity = match bare {
+        // An anonymous account is a domain: the server makes the address, resource and all.
+        Ok(bare) if config.anonymous => Jid::from(bare),
         Ok(bare) => {
             let resource = if config.resource.is_empty() { new_resource() } else { config.resource.clone() };
             if resource != config.resource {
@@ -360,7 +370,7 @@ async fn run(state: &AppState, account_id: &str) {
     }
     let seen: SeenSlot = Default::default();
     let observed: super::wire::ObservedSlot = Default::default();
-    let settings = Settings { account_id: account_id.to_string(), host: config.host.clone(), port: config.port, direct: config.security == "direct", websocket: config.security == "websocket", ca_pem: config.ca_pem.clone(), pin_sha256: config.pin_sha256.clone() };
+    let settings = Settings { account_id: account_id.to_string(), host: config.host.clone(), port: config.port, direct: config.security == "direct", websocket: config.security == "websocket", ca_pem: config.ca_pem.clone(), pin_sha256: config.pin_sha256.clone(), client_cert_pem: config.client_cert_pem.clone() };
     let connector = match Connector::new(settings, &seen) {
         Ok(c) => c,
         Err(e) => return stopped(&Stop::Setup(format!("{e:#}"))),

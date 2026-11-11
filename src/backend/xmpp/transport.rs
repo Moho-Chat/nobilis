@@ -90,6 +90,8 @@ pub struct Settings {
     pub ca_pem: String,
     /// One certificate trusted whatever signed it (SHA-256, hex); empty for none.
     pub pin_sha256: String,
+    /// A client certificate and its key (PEM) to present, for SASL EXTERNAL; empty for none.
+    pub client_cert_pem: String,
 }
 
 /// What a certificate says about itself, for the person deciding whether to trust it.
@@ -227,12 +229,21 @@ pub fn tls_config(settings: &Settings, seen: &SeenSlot) -> Result<Arc<ClientConf
         "" => None,
         pin => Some(normalise_pin(pin).ok_or_else(|| anyhow!("the pinned certificate is not a SHA-256 fingerprint"))?),
     };
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("TLS versions")?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Trust { chain, pin, seen: seen.clone() }))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(Arc::new(Trust { chain, pin, seen: seen.clone() }));
+    let mut config = if settings.client_cert_pem.trim().is_empty() {
+        config.with_no_client_auth()
+    } else {
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(settings.client_cert_pem.as_bytes()).collect::<Result<_, _>>().map_err(|e| anyhow!("the client certificate is not PEM: {e}"))?;
+        if certs.is_empty() {
+            return Err(anyhow!("the client certificate text holds no certificate"));
+        }
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(settings.client_cert_pem.as_bytes()).map_err(|_| anyhow!("the client certificate text holds no private key (paste the certificate and its key together)"))?;
+        config.with_client_auth_cert(certs, key).map_err(|e| anyhow!("the client certificate and key do not go together: {e}"))?
+    };
     if settings.direct {
         // XEP-0368: how a server that shares its port with something else knows this is XMPP.
         config.alpn_protocols = vec![b"xmpp-client".to_vec()];
@@ -606,7 +617,7 @@ mod tests {
     }
 
     fn settings(ca: &str, pin: &str) -> Settings {
-        Settings { account_id: "xmpp:a@example.org".into(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: ca.into(), pin_sha256: pin.into() }
+        Settings { account_id: "xmpp:a@example.org".into(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: ca.into(), pin_sha256: pin.into(), client_cert_pem: String::new() }
     }
 
     #[test]
@@ -617,6 +628,8 @@ mod tests {
         assert!(tls_config(&settings("", "not a fingerprint"), &seen).is_err());
         assert!(tls_config(&settings("this is not PEM", ""), &seen).is_err());
         assert!(tls_config(&settings("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", ""), &seen).is_err());
+        let not_pem = Settings { client_cert_pem: "nothing".into(), ..settings("", "") };
+        assert!(tls_config(&not_pem, &seen).is_err(), "a client certificate that is not one is said at once");
     }
 
     #[test]

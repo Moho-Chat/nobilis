@@ -127,6 +127,10 @@ pub enum Mechanism {
     Plain,
     /// FAST's token mechanism; `binding` is the channel binding type it proves (`None` for `-NONE`).
     Ht { binding: Option<&'static str> },
+    /// The client certificate TLS already presented (RFC 6120 6.4.3 with RFC 4422 EXTERNAL).
+    External,
+    /// No account (RFC 4505).
+    Anonymous,
 }
 
 impl Mechanism {
@@ -134,6 +138,8 @@ impl Mechanism {
         match self {
             Mechanism::Scram { hash, plus } => format!("SCRAM-{}{}", hash.name(), if *plus { "-PLUS" } else { "" }),
             Mechanism::Plain => "PLAIN".to_string(),
+            Mechanism::External => "EXTERNAL".to_string(),
+            Mechanism::Anonymous => "ANONYMOUS".to_string(),
             Mechanism::Ht { binding } => format!(
                 "HT-SHA-256-{}",
                 match *binding {
@@ -156,6 +162,8 @@ impl Mechanism {
             "SCRAM-SHA-512" => scram(Hash::Sha512, false),
             "SCRAM-SHA-512-PLUS" => scram(Hash::Sha512, true),
             "PLAIN" => Some(Mechanism::Plain),
+            "EXTERNAL" => Some(Mechanism::External),
+            "ANONYMOUS" => Some(Mechanism::Anonymous),
             "HT-SHA-256-NONE" => Some(Mechanism::Ht { binding: None }),
             "HT-SHA-256-EXPR" => Some(Mechanism::Ht { binding: Some("tls-exporter") }),
             "HT-SHA-256-ENDP" => Some(Mechanism::Ht { binding: Some("tls-server-end-point") }),
@@ -191,7 +199,7 @@ impl Floor {
     pub fn of(m: &Mechanism) -> Floor {
         match m {
             // A token says nothing about how the password is protected: it does not raise the floor.
-            Mechanism::Plain | Mechanism::Ht { .. } => Floor::None,
+            Mechanism::Plain | Mechanism::Ht { .. } | Mechanism::External | Mechanism::Anonymous => Floor::None,
             Mechanism::Scram { .. } => Floor::Scram,
         }
     }
@@ -199,8 +207,25 @@ impl Floor {
 
 /// The password mechanism to use from what the server offers: the strongest SCRAM, channel-bound when both sides can,
 /// then PLAIN only where nothing better is offered and nothing better was ever used. `Err` says why there is none.
-pub fn choose(offered: &[String], bindings: &Bindings, cb_offered: &[String], floor: Floor) -> Result<(Mechanism, Option<&'static str>), String> {
+/// How this account signs in, besides a password it may have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Way {
+    #[default]
+    Password,
+    /// It has a client certificate: EXTERNAL where the server offers it, the password otherwise.
+    Certificate,
+    /// It is no account: ANONYMOUS or nothing.
+    Anonymous,
+}
+
+pub fn choose(offered: &[String], bindings: &Bindings, cb_offered: &[String], floor: Floor, way: Way) -> Result<(Mechanism, Option<&'static str>), String> {
     let has = |n: &str| offered.iter().any(|o| o == n);
+    match way {
+        Way::Anonymous if has("ANONYMOUS") => return Ok((Mechanism::Anonymous, None)),
+        Way::Anonymous => return Err("This server does not let anybody in without an account (it offers no ANONYMOUS sign-in)".to_string()),
+        Way::Certificate if has("EXTERNAL") => return Ok((Mechanism::External, None)),
+        _ => {}
+    }
     let binding = bindings.choose(cb_offered);
     for hash in [Hash::Sha512, Hash::Sha256, Hash::Sha1] {
         let plus = Mechanism::Scram { hash, plus: true };
@@ -465,13 +490,23 @@ mod tests {
     fn the_strongest_mechanism_is_chosen_and_bound_when_possible() {
         let all = s(&["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-512", "SCRAM-SHA-512-PLUS"]);
         let tls13 = Bindings { exporter: Some(vec![1]), endpoint: Some(vec![2]) };
-        assert_eq!(choose(&all, &tls13, &s(&["tls-exporter"]), Floor::None).unwrap(), (Mechanism::Scram { hash: Hash::Sha512, plus: true }, Some("tls-exporter")));
-        assert_eq!(choose(&all, &tls13, &s(&["tls-server-end-point"]), Floor::None).unwrap().1, Some("tls-server-end-point"));
-        assert_eq!(choose(&all, &Bindings::default(), &[], Floor::None).unwrap().0, Mechanism::Scram { hash: Hash::Sha512, plus: false });
-        assert_eq!(choose(&s(&["PLAIN", "SCRAM-SHA-1"]), &tls13, &[], Floor::None).unwrap().0, Mechanism::Scram { hash: Hash::Sha1, plus: false });
-        assert_eq!(choose(&s(&["PLAIN"]), &tls13, &[], Floor::None).unwrap().0, Mechanism::Plain);
-        assert!(choose(&s(&["PLAIN"]), &tls13, &[], Floor::Scram).is_err(), "an account that used SCRAM is not downgraded to PLAIN");
-        assert!(choose(&s(&["DIGEST-MD5", "X-OAUTH2"]), &tls13, &[], Floor::None).is_err());
+        assert_eq!(choose(&all, &tls13, &s(&["tls-exporter"]), Floor::None, Way::Password).unwrap(), (Mechanism::Scram { hash: Hash::Sha512, plus: true }, Some("tls-exporter")));
+        assert_eq!(choose(&all, &tls13, &s(&["tls-server-end-point"]), Floor::None, Way::Password).unwrap().1, Some("tls-server-end-point"));
+        assert_eq!(choose(&all, &Bindings::default(), &[], Floor::None, Way::Password).unwrap().0, Mechanism::Scram { hash: Hash::Sha512, plus: false });
+        assert_eq!(choose(&s(&["PLAIN", "SCRAM-SHA-1"]), &tls13, &[], Floor::None, Way::Password).unwrap().0, Mechanism::Scram { hash: Hash::Sha1, plus: false });
+        assert_eq!(choose(&s(&["PLAIN"]), &tls13, &[], Floor::None, Way::Password).unwrap().0, Mechanism::Plain);
+        assert!(choose(&s(&["PLAIN"]), &tls13, &[], Floor::Scram, Way::Password).is_err(), "an account that used SCRAM is not downgraded to PLAIN");
+        assert!(choose(&s(&["DIGEST-MD5", "X-OAUTH2"]), &tls13, &[], Floor::None, Way::Password).is_err());
+    }
+
+    #[test]
+    fn a_certificate_or_no_account_decides_before_the_password_does() {
+        let offered = s(&["EXTERNAL", "ANONYMOUS", "SCRAM-SHA-256", "PLAIN"]);
+        assert_eq!(choose(&offered, &Bindings::default(), &[], Floor::None, Way::Certificate).unwrap().0, Mechanism::External);
+        assert_eq!(choose(&offered, &Bindings::default(), &[], Floor::None, Way::Anonymous).unwrap().0, Mechanism::Anonymous);
+        assert_eq!(choose(&offered, &Bindings::default(), &[], Floor::None, Way::Password).unwrap().0, Mechanism::Scram { hash: Hash::Sha256, plus: false }, "ANONYMOUS is never taken for an account");
+        assert_eq!(choose(&s(&["SCRAM-SHA-1"]), &Bindings::default(), &[], Floor::None, Way::Certificate).unwrap().0, Mechanism::Scram { hash: Hash::Sha1, plus: false }, "no EXTERNAL: the password");
+        assert!(choose(&s(&["SCRAM-SHA-1"]), &Bindings::default(), &[], Floor::None, Way::Anonymous).is_err());
     }
 
     #[test]

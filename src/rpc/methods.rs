@@ -5008,12 +5008,27 @@ pub async fn dispatch(
         // made, kept and connected at once, and how the connection fares is the usual connection state. A server with its
         // own certificate authority, or a self-signed certificate the person has looked at and pinned, is named here too.
         "addXmppAccount" => {
-            let (Some(jid), Some(password)) = (p_str_opt(params, "jid"), p_str_opt(params, "password")) else {
-                return (None, Some("addXmppAccount requires \"jid\" and \"password\"".to_string()));
+            // A password, a client certificate (SASL EXTERNAL), or neither for an anonymous session.
+            let anonymous = p_bool(params, "anonymous", false);
+            let client_cert_pem = p_str(params, "clientCertPem", "").trim().to_string();
+            let password = p_str(params, "password", "");
+            let Some(jid) = p_str_opt(params, "jid") else {
+                return (None, Some("addXmppAccount requires \"jid\"".to_string()));
             };
-            let jid = match backend::xmpp::connect::normalise_jid(jid) {
-                Ok(jid) => jid.to_string(),
-                Err(e) => return (None, Some(e)),
+            if password.is_empty() && client_cert_pem.is_empty() && !anonymous {
+                return (None, Some("addXmppAccount requires \"password\" (or a client certificate, or an anonymous sign-in)".to_string()));
+            }
+            let jid = if anonymous {
+                // The server's address alone; a user part typed with it is not one's own (the server will choose).
+                match tokio_xmpp::jid::Jid::new(jid.trim().trim_start_matches('@')) {
+                    Ok(j) => j.domain().as_str().trim_end_matches('.').to_string(),
+                    Err(e) => return (None, Some(format!("{jid:?} is not a server's address: {e}"))),
+                }
+            } else {
+                match backend::xmpp::connect::normalise_jid(jid) {
+                    Ok(jid) => jid.to_string(),
+                    Err(e) => return (None, Some(e)),
+                }
             };
             let security = match p_str(params, "security", "starttls") {
                 "direct" => "direct",
@@ -5035,8 +5050,16 @@ pub async fn dispatch(
                 resource: p_str(params, "resource", "").trim().to_string(),
                 // The form's Tor switch: without it the account was made unrouted and connected directly.
                 use_tor: p_bool(params, "useTor", false),
+                client_cert_pem: client_cert_pem.clone(),
+                anonymous,
                 ..Default::default()
             };
+            if !config.client_cert_pem.is_empty() {
+                let check = backend::xmpp::transport::Settings { account_id: String::new(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: String::new(), pin_sha256: String::new(), client_cert_pem: config.client_cert_pem.clone() };
+                if let Err(e) = backend::xmpp::transport::tls_config(&check, &Default::default()) {
+                    return (None, Some(format!("{e:#}")));
+                }
+            }
             if !config.resource.is_empty() && tokio_xmpp::jid::BareJid::new(&config.jid).ok().and_then(|b| b.with_resource_str(&config.resource).ok()).is_none() {
                 return (None, Some(format!("{:?} cannot be a resource", config.resource)));
             }
@@ -5277,7 +5300,7 @@ pub async fn dispatch(
             (
                 Some(serde_json::json!({
                     "jid": a.jid, "host": a.host, "port": a.port, "security": if a.security.is_empty() { "starttls" } else { a.security.as_str() },
-                    "caPem": a.ca_pem, "pinSha256": a.pin_sha256, "pinned": pinned, "resource": a.resource,
+                    "caPem": a.ca_pem, "pinSha256": a.pin_sha256, "clientCertPem": a.client_cert_pem, "anonymous": a.anonymous, "pinned": pinned, "resource": a.resource,
                     "lastConnected": a.last_connected, "lastMechanism": a.last_mechanism, "fastToken": !a.fast_token.is_empty(), "fastExpiry": a.fast_expiry,
                     "scramOnly": a.sasl_floor == "scram",
                 })),
@@ -5322,14 +5345,15 @@ pub async fn dispatch(
                 return (None, Some(format!("{resource:?} cannot be a resource")));
             }
             // The trust settings are tried before they are kept: a CA that is not a certificate is said now, not at connecting.
-            let settings = backend::xmpp::transport::Settings { account_id: account_id.to_string(), host: host.clone(), port, direct: security == "direct", websocket: security == "websocket", ca_pem: ca_pem.clone(), pin_sha256: pin.clone() };
+            let client_cert_pem = p_str(params, "clientCertPem", &current.client_cert_pem).trim().to_string();
+            let settings = backend::xmpp::transport::Settings { account_id: account_id.to_string(), host: host.clone(), port, direct: security == "direct", websocket: security == "websocket", ca_pem: ca_pem.clone(), pin_sha256: pin.clone(), client_cert_pem: client_cert_pem.clone() };
             if let Err(e) = backend::xmpp::transport::tls_config(&settings, &Default::default()) {
                 return (None, Some(format!("{e:#}")));
             }
-            let changed = (host != current.host) || port != current.port || security != current.security || ca_pem != current.ca_pem || pin != current.pin_sha256 || resource != current.resource;
+            let changed = (host != current.host) || port != current.port || security != current.security || ca_pem != current.ca_pem || pin != current.pin_sha256 || resource != current.resource || client_cert_pem != current.client_cert_pem;
             let pin_changed = pin != current.pin_sha256;
             match state.accounts.mutate_xmpp(account_id, move |a| {
-                (a.host, a.port, a.security, a.ca_pem, a.resource) = (host, port, security, ca_pem, resource);
+                (a.host, a.port, a.security, a.ca_pem, a.resource, a.client_cert_pem) = (host, port, security, ca_pem, resource, client_cert_pem);
                 if pin_changed {
                     a.pin_sha256 = pin;
                     a.pin_info.clear();
@@ -5394,6 +5418,7 @@ pub async fn dispatch(
                 websocket: p_str(params, "security", "starttls") == "websocket",
                 ca_pem: p_str(params, "caPem", "").to_string(),
                 pin_sha256: backend::xmpp::transport::normalise_pin(p_str(params, "pinSha256", "")).unwrap_or_default(),
+                client_cert_pem: String::new(),
             };
             let preauth = p_str(params, "preauth", "").to_string();
             let registration = match backend::xmpp::register::form(settings.clone(), &domain, &preauth).await {
