@@ -87,7 +87,8 @@ pub fn attachment(account_id: &str, f: &super::incoming::FileRef) -> Attachment 
         blurhash: None,
         duration_secs: f.duration,
         waveform: None,
-        voice: false,
+        // A recording that says how long it is: how XMPP clients send voice messages (there is no other mark).
+        voice: kind == "audio" && f.duration.is_some(),
         path: Some(cached(account_id, MEDIA, &f.url, f.name.as_deref(), f.media_type.as_deref())),
         thumbnail_path: None,
         url: Some(f.url.clone()),

@@ -86,7 +86,7 @@ pub async fn request_slot(handle: &Handle, service: &Jid, name: &str, size: u64,
 }
 
 /// The elements that describe a shared file in a message: XEP-0066 for old clients and XEP-0447 for the rest.
-pub fn file_payloads(url: &str, name: &str, content_type: &str, size: u64, dims: Option<(u32, u32)>, description: Option<&str>) -> Vec<Element> {
+pub fn file_payloads(url: &str, name: &str, content_type: &str, size: u64, dims: Option<(u32, u32)>, description: Option<&str>, length_secs: Option<f64>) -> Vec<Element> {
     let mut file = Element::builder("file", ns::FILE_METADATA).build();
     file.append_child(Element::builder("media-type", ns::FILE_METADATA).append(content_type).build());
     file.append_child(Element::builder("name", ns::FILE_METADATA).append(name).build());
@@ -96,6 +96,10 @@ pub fn file_payloads(url: &str, name: &str, content_type: &str, size: u64, dims:
     }
     if let Some(d) = description {
         file.append_child(Element::builder("desc", ns::FILE_METADATA).append(d).build());
+    }
+    // How long a recording runs (XEP-0446 `length`, in milliseconds): a player can say it before fetching anything.
+    if let Some(secs) = length_secs {
+        file.append_child(Element::builder("length", ns::FILE_METADATA).append(((secs * 1000.0).round() as u64).to_string()).build());
     }
     let sources = Element::builder("sources", ns::SFS).append(Element::builder("url-data", ns::URL_DATA).at("target", url).build()).build();
     let sharing = Element::builder("file-sharing", ns::SFS).at("disposition", "inline").append(file).append(sources).build();
@@ -161,7 +165,9 @@ mod tests {
 
     #[test]
     fn a_shared_file_is_described_the_way_other_clients_read() {
-        let p = file_payloads("https://up.example.org/a.png", "a.png", "image/png", 12, Some((3, 4)), None);
+        let voice = file_payloads("https://up.example.org/v.ogg", "v.ogg", "audio/ogg", 9, None, None, Some(2.5));
+        assert!(String::from(&voice[1]).contains("<length>2500</length>"), "a recording says how long it is");
+        let p = file_payloads("https://up.example.org/a.png", "a.png", "image/png", 12, Some((3, 4)), None, None);
         assert!(p[0].is("x", ns::OOB));
         let sharing = &p[1];
         assert!(sharing.is("file-sharing", ns::SFS));

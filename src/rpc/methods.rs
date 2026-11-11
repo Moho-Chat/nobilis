@@ -1613,6 +1613,10 @@ pub async fn dispatch(
                 .await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("xmpp:") {
+                // An Ogg Opus file over HTTP Upload that says how long it is: what XMPP clients play as a voice message.
+                let path = finished.path.to_string_lossy().to_string();
+                backend::xmpp::send::send_files(state, &buffer, "", &[(path, false)], None, None, Some(finished.duration_secs)).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
                 backend::matrix::send_voice_message(
                     state,
@@ -3757,7 +3761,7 @@ pub async fn dispatch(
                         None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
                     };
                     let files: Vec<(String, bool)> = paths.into_iter().map(|p| (p, false)).collect();
-                    let sent = backend::xmpp::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    let sent = backend::xmpp::send::send_files(state, &buffer, body, &files, reply_to_id, progress, None).await;
                     if let Some(p) = progress {
                         if !files.is_empty() {
                             p.done(sent.as_ref().err().map(String::as_str));

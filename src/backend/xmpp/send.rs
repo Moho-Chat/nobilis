@@ -178,7 +178,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
 
 /// Sends files: each goes to the server's upload service and is then sent as a message holding its address. The caption, if
 /// there is one, is a message of its own before them, as the other clients do it.
-pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+/// `voice`: the files are one recording made in the window, this long (seconds) - sent as an audio file that says its length,
+/// which is how XMPP clients send voice messages, and shown here as a voice message.
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>, voice: Option<f64>) -> Result<(), String> {
     if files.is_empty() {
         return send(state, buffer, caption, reply_to.map(str::to_string)).await;
     }
@@ -225,7 +227,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
             let slot = super::upload::request_slot(&handle, &service, &name, size, content_type).await?;
             super::upload::put(&buffer.account_id, &ca, &slot, path, content_type, size).await?;
             m.bodies.insert(Default::default(), slot.get.clone());
-            m.payloads.extend(super::upload::file_payloads(&slot.get, &name, content_type, size, dims, None));
+            m.payloads.extend(super::upload::file_payloads(&slot.get, &name, content_type, size, dims, None, voice));
             slot.get
         };
         done += size;
@@ -245,9 +247,9 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
                 width: dims.map(|d| d.0),
                 height: dims.map(|d| d.1),
                 blurhash: None,
-                duration_secs: None,
+                duration_secs: voice,
                 waveform: None,
-                voice: false,
+                voice: voice.is_some(),
                 path: Some(format!("file://{path}")),
                 thumbnail_path: None,
                 url: Some(slot.get.clone()),
