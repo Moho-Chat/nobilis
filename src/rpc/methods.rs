@@ -5296,7 +5296,7 @@ pub async fn dispatch(
 
         // Things an XMPP account does on the server it is on: its password, its end, what the server says it is, the people it
         // has blocked, and the commands that things offer (a server's own administration, a gateway's menu).
-        "xmppChangePassword" | "xmppDeleteAccount" | "xmppServerInfo" | "xmppBlocklist" | "xmppBlock" | "xmppCommands" | "xmppCommand" => {
+        "xmppChangePassword" | "xmppDeleteAccount" | "xmppServerInfo" | "xmppBlocklist" | "xmppBlock" | "xmppCommands" | "xmppCommand" | "xmppArchivePrefs" | "xmppSetArchivePrefs" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
             let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
             let result: Result<serde_json::Value, String> = match method {
@@ -5316,9 +5316,19 @@ pub async fn dispatch(
                 "xmppServerInfo" => backend::xmpp::account::server_info(&handle).await,
                 "xmppBlocklist" => Ok(serde_json::json!({ "blocked": handle.session().blocked.iter().cloned().collect::<Vec<_>>() })),
                 "xmppBlock" => match p_str_opt(params, "jid") {
-                    Some(j) => backend::xmpp::blocking::set(&handle, j.trim(), p_bool(params, "block", true)).await.map(|_| serde_json::json!({})),
+                    Some(j) => {
+                        // Said to the server as spam or abuse too, if the person chose to (XEP-0377).
+                        let report = p_str_opt(params, "report").filter(|r| !r.is_empty()).map(|r| (r, p_str(params, "reportText", "")));
+                        backend::xmpp::blocking::set_reporting(&handle, j.trim(), p_bool(params, "block", true), report).await.map(|_| serde_json::json!({}))
+                    }
                     None => Err("xmppBlock requires \"jid\"".to_string()),
                 },
+                "xmppArchivePrefs" => backend::xmpp::archive_prefs::get(&handle).await.map(|p| serde_json::json!(p)),
+                "xmppSetArchivePrefs" => {
+                    let list = |k: &str| params.get(k).and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|j| j.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+                    let prefs = backend::xmpp::archive_prefs::Prefs { default: p_str(params, "default", "always").to_string(), always: list("always"), never: list("never") };
+                    backend::xmpp::archive_prefs::set(&handle, &prefs).await.map(|_| serde_json::json!({}))
+                }
                 _ => {
                     // The address whose commands these are: the account's server by default.
                     let to = p_str_opt(params, "to").filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(|| handle.own().domain().as_str().to_string());

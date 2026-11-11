@@ -18,9 +18,34 @@ pub async fn load(handle: &Handle) {
     }
 }
 
+pub const REPORTING: &str = "urn:xmpp:reporting:1";
+
 /// Blocks or unblocks an address (a person, or a domain).
 pub async fn set(handle: &Handle, jid: &str, block: bool) -> Result<(), String> {
-    let item = Element::builder("item", BLOCKING).at("jid", jid).build();
+    set_reporting(handle, jid, block, None).await
+}
+
+/// The same, saying to the server why (XEP-0377: `spam` or `abuse`), so that it can act on the sender for everybody. A server that
+/// does not take the report is told the plain block instead: the person's wish is the block.
+pub async fn set_reporting(handle: &Handle, jid: &str, block: bool, report: Option<(&str, &str)>) -> Result<(), String> {
+    let mut item = Element::builder("item", BLOCKING).at("jid", jid).build();
+    if let (true, Some((kind, text))) = (block, report) {
+        let reason = match kind {
+            "abuse" => "urn:xmpp:reporting:abuse",
+            _ => "urn:xmpp:reporting:spam",
+        };
+        let mut r = Element::builder("report", REPORTING).at("reason", reason).build();
+        if !text.is_empty() {
+            r.append_child(Element::builder("text", REPORTING).append(text).build());
+        }
+        item.append_child(r);
+        let q = Element::builder("block", BLOCKING).append(item).build();
+        if handle.request(None, true, q).await.is_ok() {
+            handle.session().blocked.insert(jid.to_string());
+            return Ok(());
+        }
+        item = Element::builder("item", BLOCKING).at("jid", jid).build();
+    }
     let q = Element::builder(if block { "block" } else { "unblock" }, BLOCKING).append(item).build();
     handle.request(None, true, q).await.map(|_| ()).map_err(|e| e.words())?;
     let mut s = handle.session();
@@ -60,6 +85,12 @@ pub fn is_blocked(handle: &Handle, from: &tokio_xmpp::jid::Jid) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn a_report_names_the_reason_as_the_specification_spells_it() {
+        let report = Element::builder("report", REPORTING).at("reason", "urn:xmpp:reporting:spam").build();
+        assert_eq!(report.attr("reason"), Some("urn:xmpp:reporting:spam"));
+    }
 
     #[test]
     fn a_list_is_the_addresses_of_its_items() {
