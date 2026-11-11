@@ -5095,6 +5095,19 @@ pub async fn dispatch(
             }
         }
 
+        // What this account may do in a room, from its own role and standing there: advisory, since the room decides.
+        "getXmppPowers" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "channel") else {
+                return (Some(serde_json::json!({})), None);
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (Some(serde_json::json!({})), None) };
+            let room = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok());
+            let (role, affiliation) = room.and_then(|r| handle.session().rooms.get(&r).map(|room| (room.own_role.clone(), room.own_affiliation.clone()))).unwrap_or_default();
+            let moderator = role == "moderator";
+            let admin = matches!(affiliation.as_str(), "admin" | "owner");
+            (Some(serde_json::json!({ "canKick": moderator, "canMute": moderator, "canOp": moderator, "canBan": admin })), None)
+        }
+
         "xmppRoomAction" | "xmppRoomConfig" | "xmppSetRoomConfig" | "xmppInvite" | "xmppSetSubject" | "xmppSetNick" | "xmppAffiliations" | "xmppDestroyRoom" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "channel") else {
                 return (None, Some(format!("{method} needs a room's \"bufferId\"")));

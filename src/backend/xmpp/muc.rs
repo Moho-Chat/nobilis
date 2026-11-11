@@ -58,6 +58,8 @@ pub struct Room {
     pub own_occupant_id: Option<String>,
     /// The first subject has been seen (what comes with the history is the room's state, not a change).
     pub subject_seen: bool,
+    /// What the room is like has been said in its conversation, once.
+    pub announced: bool,
 }
 
 impl Room {
@@ -311,8 +313,10 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         }
         state.runtime.set_buffer_read_only(state, &buffer.id, None);
         // Who can see whom: said once, on coming in, since it decides what anybody should write here.
-        let hidden = handle.session().rooms.get(&room).is_some_and(|r| r.anonymous());
-        card(state, handle, &buffer, "system", if hidden { "This room does not show people's addresses" } else { "This room shows everyone's address to everyone in it" });
+        let (hidden, said) = handle.session().rooms.get_mut(&room).map(|r| (r.anonymous(), std::mem::replace(&mut r.announced, true))).unwrap_or((true, true));
+        if !said {
+            card(state, handle, &buffer, "system", if hidden { "This room does not show people's addresses" } else { "This room shows everyone's address to everyone in it" });
+        }
         if codes.contains(&201) {
             // A room that did not exist is created locked, and is opened with its default settings, which the owner
             // can change from the room's settings afterwards.
