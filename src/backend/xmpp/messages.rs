@@ -332,7 +332,8 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
     if replay {
         state.runtime.set_replaying(&buffer.id, true);
     }
-    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, "chat", reply, Some(local.clone()), conv.mentioned, None, Vec::new(), attachments, Some(conv.sender_id.clone()), sent_at, None, None);
+    let embeds = link_cards(&p.links, &text);
+    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, "chat", reply, Some(local.clone()), conv.mentioned, None, embeds, attachments, Some(conv.sender_id.clone()), sent_at, None, None);
     if replay {
         state.runtime.set_replaying(&buffer.id, false);
     }
@@ -518,5 +519,82 @@ mod tests {
         assert!(readable(&p, p.body.as_deref().unwrap()).contains("encrypted with OMEMO"));
         let r = Parsed { body: Some("> hi\nyes".into()), fallbacks: vec![incoming::Fallback { for_ns: ns::REPLY.into(), start: 0, end: 5 }], ..Default::default() };
         assert_eq!(readable(&r, "> hi\nyes"), "yes");
+    }
+}
+
+/// The sender's descriptions of links (XEP-0511) as cards: only for a link that is in the message (a card for an address it
+/// does not show would put words in a page's mouth), only http(s), and the picture only when it came inside the message -
+/// at most 512 KiB, and a picture by its own first bytes (an SVG is not one). Nothing is fetched.
+pub fn link_cards(links: &[incoming::LinkMeta], text: &str) -> Vec<crate::model::Embed> {
+    let mut out: Vec<crate::model::Embed> = Vec::new();
+    for l in links {
+        let scheme_ok = l.about.starts_with("https://") || l.about.starts_with("http://");
+        if !scheme_ok || !text.contains(&l.about) || out.iter().any(|e| e.url.as_deref() == Some(l.about.as_str())) {
+            continue;
+        }
+        let image = l.image_data.as_deref().and_then(store_data_image);
+        if l.title.is_none() && l.description.is_none() && image.is_none() {
+            continue;
+        }
+        let host = url::Url::parse(&l.about).ok().and_then(|u| u.host_str().map(str::to_string));
+        out.push(crate::model::Embed {
+            title: l.title.clone(),
+            description: l.description.clone(),
+            url: Some(l.about.clone()),
+            image_url: image,
+            // Who serves it, as the address says - not as the sender says (the site name is theirs to make up).
+            provider: host.map(|h| match &l.site_name {
+                Some(name) if !name.eq_ignore_ascii_case(&h) => format!("{h} · \u{201c}{name}\u{201d}"),
+                _ => h,
+            }),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// A `data:` picture, decoded and kept in the media cache by its hash. `file://` path, or `None`.
+fn store_data_image(uri: &str) -> Option<String> {
+    use base64::Engine;
+    let (head, data) = uri.strip_prefix("data:")?.split_once(',')?;
+    if !head.ends_with(";base64") || data.len() > 700_000 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+    if bytes.len() > 512 * 1024 {
+        return None;
+    }
+    let kind = super::avatars::sniff(&bytes)?;
+    let ext = kind.rsplit('/').next().unwrap_or("png").replace("jpeg", "jpg");
+    let path = crate::media_cache::dir(super::media::MEDIA).join(format!("card-{}.{ext}", crate::backend::xmpp::transport::sha256_hex(&bytes)));
+    if !path.exists() {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::write(&path, &bytes).ok()?;
+    }
+    Some(format!("file://{}", path.display()))
+}
+
+#[cfg(test)]
+mod link_card_tests {
+    use super::*;
+
+    fn meta(about: &str) -> incoming::LinkMeta {
+        incoming::LinkMeta { about: about.into(), title: Some("T".into()), site_name: Some("Totally Your Bank".into()), ..Default::default() }
+    }
+
+    #[test]
+    fn a_card_is_only_for_a_link_the_message_shows() {
+        let cards = link_cards(&[meta("https://example.org/a"), meta("https://elsewhere.example/b"), meta("javascript:alert(1)")], "look https://example.org/a");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].url.as_deref(), Some("https://example.org/a"));
+        let provider = cards[0].provider.clone().unwrap_or_default();
+        assert!(provider.starts_with("example.org"), "the host comes first, whatever the sender calls it: {provider}");
+    }
+
+    #[test]
+    fn a_picture_inside_the_message_is_kept_and_anything_else_is_not() {
+        assert!(store_data_image("data:image/svg+xml;base64,PHN2Zy8+").is_none(), "an SVG is not a picture here");
+        assert!(store_data_image("data:image/png,notbase64").is_none());
+        assert!(store_data_image("https://example.org/x.png").is_none());
     }
 }

@@ -92,6 +92,41 @@ pub struct Parsed {
     pub mentions: Vec<String>,
     /// The whole message is a spoiler (XEP-0382), with the hint the sender gave (empty when there is none).
     pub spoiler: Option<String>,
+    /// What the sender says about links in the message (XEP-0511): one per described address.
+    pub links: Vec<LinkMeta>,
+}
+
+/// One link described by its sender (XEP-0511, OpenGraph in RDF/XML).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinkMeta {
+    /// The address described (`rdf:about`).
+    pub about: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    /// A picture that came inside the message (`data:`); a picture somewhere else is not fetched (the spec: nothing remote is
+    /// fetched without the person asking).
+    pub image_data: Option<String>,
+    pub image_alt: Option<String>,
+}
+
+pub const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const OG: &str = "https://ogp.me/ns#";
+const OG_IMAGE: &str = "https://ogp.me/ns#image:";
+
+/// Reads one `<rdf:Description>`. `None` without an address it describes.
+fn read_link_meta(e: &Element) -> Option<LinkMeta> {
+    let about = e.attr_ns(RDF, "about").or_else(|| e.attr("about")).map(str::to_string)?;
+    let og = |name: &str| e.children().find(|c| c.is(name, OG)).map(|c| c.text().trim().to_string()).filter(|t| !t.is_empty());
+    let image_data = e.children().filter(|c| c.is("image", OG)).map(|c| c.text().trim().to_string()).find(|t| t.starts_with("data:image/"));
+    Some(LinkMeta {
+        about,
+        title: og("title"),
+        description: og("description"),
+        site_name: og("site_name"),
+        image_data,
+        image_alt: e.children().find(|c| c.is("alt", OG_IMAGE)).map(|c| c.text().trim().to_string()).filter(|t| !t.is_empty()),
+    })
 }
 
 /// A file somebody shared: where it is and what it says it is.
@@ -159,6 +194,11 @@ fn read_payload(p: &mut Parsed, e: &Element) {
             }
         }
         ("spoiler", ns::SPOILER) => p.spoiler = Some(e.text().trim().to_string()),
+        ("Description", RDF) => {
+            if let Some(meta) = read_link_meta(e) {
+                p.links.push(meta);
+            }
+        }
         ("origin-id", ns::SID) => p.origin_id = e.attr("id").map(str::to_string),
         ("stanza-id", ns::SID) => {
             if let (Some(by), Some(id)) = (e.attr("by"), e.attr("id")) {
@@ -284,6 +324,22 @@ pub fn local_id(p: &Parsed) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_described_by_its_sender_is_read_and_only_a_picture_inside_the_message_is_kept() {
+        let xml = r#"<message xmlns='jabber:client' to='romeo@montague.lit' type='chat'><body>see https://the.link.example.com/x</body>
+            <rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:og="https://ogp.me/ns#" xmlns:ogi="https://ogp.me/ns#image:" rdf:about="https://the.link.example.com/x">
+              <og:title>The Best Webpage</og:title><og:description>Really</og:description><og:site_name>Example</og:site_name>
+              <og:image>https://link.to.example.com/image.png</og:image><og:image>data:image/png;base64,iVBORw0KGgo=</og:image><ogi:alt>Alt</ogi:alt>
+            </rdf:Description></message>"#;
+        let el: Element = xml.parse().unwrap();
+        let p = parse(&Message::try_from(el).unwrap());
+        assert_eq!(p.links.len(), 1);
+        let l = &p.links[0];
+        assert_eq!(l.about, "https://the.link.example.com/x");
+        assert_eq!((l.title.as_deref(), l.description.as_deref(), l.site_name.as_deref(), l.image_alt.as_deref()), (Some("The Best Webpage"), Some("Really"), Some("Example"), Some("Alt")));
+        assert_eq!(l.image_data.as_deref(), Some("data:image/png;base64,iVBORw0KGgo="), "the remote picture is not taken");
+    }
     use std::str::FromStr;
 
     fn msg(xml: &str) -> Message {
