@@ -88,6 +88,8 @@ pub struct Parsed {
     pub omemo: Option<super::omemo::Envelope>,
     /// The message carries a body that is only there for clients that cannot show what it points at.
     pub styling_disabled: bool,
+    /// Who the message names (XEP-0372 references of type `mention`): the `xmpp:` URIs.
+    pub mentions: Vec<String>,
     /// The whole message is a spoiler (XEP-0382), with the hint the sender gave (empty when there is none).
     pub spoiler: Option<String>,
 }
@@ -149,6 +151,13 @@ pub fn parse(message: &Message) -> Parsed {
 
 fn read_payload(p: &mut Parsed, e: &Element) {
     match (e.name(), e.ns().as_str()) {
+        ("reference", ns::REFERENCE) => {
+            if e.attr("type") == Some("mention") {
+                if let Some(uri) = e.attr("uri") {
+                    p.mentions.push(uri.to_string());
+                }
+            }
+        }
         ("spoiler", ns::SPOILER) => p.spoiler = Some(e.text().trim().to_string()),
         ("origin-id", ns::SID) => p.origin_id = e.attr("id").map(str::to_string),
         ("stanza-id", ns::SID) => {

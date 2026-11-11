@@ -145,6 +145,11 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         None => wire_body,
     };
     let encrypted = encrypting(&handle, &jid);
+    // Who a message to a room names is said in words and, besides, by reference (XEP-0372), as the clients that draw mentions send it.
+    if in_room(buffer) && !encrypted {
+        let skip = if reply_to.as_deref().is_some_and(|r| !r.is_empty()) { wire_body.chars().count().saturating_sub(body.chars().count()) } else { 0 };
+        m.payloads.extend(super::muc::mention_references(&handle, &jid, &wire_body, skip));
+    }
     if encrypted {
         m.payloads.extend(encrypt_for(&handle, &jid, &wire_body, in_room(buffer)).await?);
         m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());

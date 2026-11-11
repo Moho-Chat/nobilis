@@ -32,6 +32,7 @@ pub const PUBSUB_EVENT: &str = "http://jabber.org/protocol/pubsub#event";
 pub const HTTP_UPLOAD: &str = "urn:xmpp:http:upload:0";
 pub const SFS: &str = "urn:xmpp:sfs:0";
 pub const SPOILER: &str = "urn:xmpp:spoiler:0";
+pub const REFERENCE: &str = "urn:xmpp:reference:0";
 pub const FILE_METADATA: &str = "urn:xmpp:file:metadata:0";
 pub const URL_DATA: &str = "http://jabber.org/protocol/url-data";
 pub const HASHES: &str = "urn:xmpp:hashes:2";

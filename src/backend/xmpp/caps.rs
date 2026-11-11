@@ -35,6 +35,7 @@ pub const FEATURES: &[&str] = &[
     ns::SID,
     ns::SFS,
     ns::SPOILER,
+    ns::REFERENCE,
     "urn:xmpp:hats:0",
     "urn:xmpp:avatar:metadata+notify",
     "urn:xmpp:mds:displayed:0+notify",

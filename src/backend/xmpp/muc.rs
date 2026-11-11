@@ -469,16 +469,78 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
         }
     }
     let own_identity = handle.own().to_string();
-    let mentioned = !is_own && mentions(&p, &own_nick, &room);
+    let mentioned = !is_own && mentions(&p, &own_nick, &room, &handle.own());
     let real_jid = if is_own { Some(handle.own().to_string()) } else { handle.session().rooms.get(&room).and_then(|r| r.occupants.get(&nick)).and_then(|o| o.jid.as_ref()).map(|j| j.to_string()) };
     let conv = Conv { buffer, kind: "channel", from_name: if is_own { own_identity } else { nick.clone() }, sender_id, is_own, key: room.to_string(), mentioned, real_jid };
     messages::deliver(state, handle, &conv, p, origin).await;
 }
 
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The references (XEP-0372) for the people a message to a room names, by their nicknames as whole words: the address where the
+/// room shows it, else the nickname in the room. `skip` is how many characters at the start are not the sender's (a reply's quote).
+pub fn mention_references(handle: &Handle, room: &BareJid, body: &str, skip: usize) -> Vec<Element> {
+    let chars: Vec<char> = body.chars().collect();
+    let (own_nick, occupants): (String, Vec<(String, Option<BareJid>)>) = {
+        let s = handle.session();
+        let Some(r) = s.rooms.get(room) else { return Vec::new() };
+        (r.nick.clone(), r.occupants.iter().map(|(n, o)| (n.clone(), o.jid.clone())).collect())
+    };
+    let mut found: Vec<(usize, usize, String)> = Vec::new();
+    for (nick, jid) in occupants.into_iter().filter(|(n, _)| !n.is_empty() && *n != own_nick) {
+        let needle: Vec<char> = nick.chars().collect();
+        let mut i = skip;
+        while i + needle.len() <= chars.len() {
+            if chars[i..i + needle.len()] == needle[..] {
+                let edge = |c: Option<&char>| c.is_none_or(|c| !c.is_alphanumeric() && *c != '_');
+                let before = if i == 0 { None } else { chars.get(i - 1) };
+                if edge(before) && edge(chars.get(i + needle.len())) {
+                    let uri = match &jid {
+                        Some(j) => format!("xmpp:{j}"),
+                        None => format!("xmpp:{room}/{nick}"),
+                    };
+                    found.push((i, i + needle.len(), uri));
+                    i += needle.len();
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    found.sort();
+    found.into_iter().map(|(b, e, uri)| Element::builder("reference", ns::REFERENCE).at("type", "mention").at("begin", b.to_string()).at("end", e.to_string()).at("uri", uri).build()).collect()
+}
+
 /// Whether a message is addressed to this account in a room: it names the nickname, or answers one of its messages.
-pub fn mentions(p: &incoming::Parsed, nick: &str, room: &BareJid) -> bool {
+pub fn mentions(p: &incoming::Parsed, nick: &str, room: &BareJid, own: &BareJid) -> bool {
     if nick.is_empty() {
         return false;
+    }
+    // Named by a reference (XEP-0372): by the address of the account, or by the nickname in the room.
+    let by_nick = format!("xmpp:{room}/{nick}");
+    let by_jid = format!("xmpp:{own}");
+    if p.mentions.iter().any(|u| {
+        let u = u.split('?').next().unwrap_or(u);
+        let decoded = percent_decode(u);
+        decoded == by_nick || decoded.eq_ignore_ascii_case(&by_jid)
+    }) {
+        return true;
     }
     if p.reply.as_ref().and_then(|r| r.to.as_deref()).is_some_and(|to| to == format!("{room}/{nick}")) {
         return true;
@@ -565,14 +627,29 @@ mod tests {
     #[test]
     fn being_named_in_a_room_is_a_mention_only_as_a_whole_word() {
         let room: BareJid = "room@muc.example.org".parse().unwrap();
-        assert!(mentions(&parsed("hey Alice, look", None), "alice", &room));
-        assert!(mentions(&parsed("alice: look", None), "alice", &room));
-        assert!(mentions(&parsed("look @alice", None), "alice", &room));
-        assert!(mentions(&parsed("malice is not alice-like", None), "alice", &room));
-        assert!(!mentions(&parsed("malicetown", None), "alice", &room));
-        assert!(!mentions(&parsed("alices", None), "alice", &room));
-        assert!(mentions(&parsed("yes", Some("room@muc.example.org/alice")), "alice", &room), "an answer to one of our messages counts");
-        assert!(!mentions(&parsed("alice", None), "", &room));
+        let me: BareJid = "me@example.org".parse().unwrap();
+        assert!(mentions(&parsed("hey Alice, look", None), "alice", &room, &me));
+        assert!(mentions(&parsed("alice: look", None), "alice", &room, &me));
+        assert!(mentions(&parsed("look @alice", None), "alice", &room, &me));
+        assert!(mentions(&parsed("malice is not alice-like", None), "alice", &room, &me));
+        assert!(!mentions(&parsed("malicetown", None), "alice", &room, &me));
+        assert!(!mentions(&parsed("alices", None), "alice", &room, &me));
+        assert!(mentions(&parsed("yes", Some("room@muc.example.org/alice")), "alice", &room, &me), "an answer to one of our messages counts");
+        assert!(!mentions(&parsed("alice", None), "", &room, &me));
+    }
+
+    #[test]
+    fn a_reference_names_this_account_by_its_address_or_by_its_nickname_in_the_room() {
+        let room: BareJid = "room@muc.example.org".parse().unwrap();
+        let me: BareJid = "me@example.org".parse().unwrap();
+        let by = |uri: &str| incoming::Parsed { body: Some("hello everybody".into()), mentions: vec![uri.to_string()], ..Default::default() };
+        assert!(mentions(&by("xmpp:me@example.org"), "alice", &room, &me));
+        assert!(mentions(&by("xmpp:ME@example.org"), "alice", &room, &me));
+        assert!(mentions(&by("xmpp:room@muc.example.org/alice"), "alice", &room, &me));
+        assert!(mentions(&by("xmpp:room@muc.example.org/al%69ce"), "alice", &room, &me));
+        assert!(!mentions(&by("xmpp:other@example.org"), "alice", &room, &me));
+        assert!(!mentions(&by("xmpp:room@muc.example.org/bob"), "alice", &room, &me));
+        assert_eq!(percent_decode("a%2Fb%zz%"), "a/b%zz%");
     }
 
     #[test]
