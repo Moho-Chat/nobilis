@@ -205,7 +205,7 @@ async fn run(state: &AppState, account_id: &str) {
         Err(e) => return stopped(&Stop::Setup(e)),
     };
     let seen: SeenSlot = Default::default();
-    let settings = Settings { account_id: account_id.to_string(), host: config.host.clone(), port: config.port, direct: config.security == "direct", ca_pem: config.ca_pem.clone(), pin_sha256: config.pin_sha256.clone() };
+    let settings = Settings { account_id: account_id.to_string(), host: config.host.clone(), port: config.port, direct: config.security == "direct", websocket: config.security == "websocket", ca_pem: config.ca_pem.clone(), pin_sha256: config.pin_sha256.clone() };
     let connector = match Connector::new(settings, &seen) {
         Ok(c) => c,
         Err(e) => return stopped(&Stop::Setup(format!("{e:#}"))),

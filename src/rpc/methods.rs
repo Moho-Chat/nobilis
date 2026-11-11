@@ -5000,6 +5000,7 @@ pub async fn dispatch(
             };
             let security = match p_str(params, "security", "starttls") {
                 "direct" => "direct",
+                "websocket" => "websocket",
                 _ => "starttls",
             };
             let pin = p_str(params, "pinSha256", "");
@@ -5254,6 +5255,7 @@ pub async fn dispatch(
                 host: p_str(params, "host", "").trim().to_string(),
                 port: params.get("port").and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
                 direct: p_str(params, "security", "starttls") == "direct",
+                websocket: p_str(params, "security", "starttls") == "websocket",
                 ca_pem: p_str(params, "caPem", "").to_string(),
                 pin_sha256: backend::xmpp::transport::normalise_pin(p_str(params, "pinSha256", "")).unwrap_or_default(),
             };
@@ -5279,7 +5281,7 @@ pub async fn dispatch(
                 password: password.to_string(),
                 host: settings.host,
                 port: settings.port,
-                security: if settings.direct { "direct".into() } else { "starttls".into() },
+                security: if settings.websocket { "websocket".into() } else if settings.direct { "direct".into() } else { "starttls".into() },
                 ca_pem: settings.ca_pem,
                 pin_sha256: settings.pin_sha256,
                 ..Default::default()

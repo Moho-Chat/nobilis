@@ -85,6 +85,8 @@ pub struct Settings {
     pub port: u16,
     /// TLS from the first byte (XEP-0368) rather than STARTTLS.
     pub direct: bool,
+    /// XMPP over a WebSocket (RFC 7395): `host`, if it is a `wss://` address, is where; else the server's own host-meta says.
+    pub websocket: bool,
     /// Extra trusted certificates, PEM.
     pub ca_pem: String,
     /// One certificate trusted whatever signed it (SHA-256, hex); empty for none.
@@ -224,17 +226,49 @@ impl Connector {
     }
 }
 
-type Stream = BufStream<TlsStream<TcpOrSocks>>;
+type Stream = Box<dyn tokio_xmpp::connect::AsyncReadAndWrite>;
+
+/// Where an account's WebSocket is, as the server publishes it (XEP-0156: `host-meta` in JSON or XML).
+pub async fn discover_websocket(account_id: &str, ca_pem: &str, domain: &str) -> Result<String, String> {
+    let client = super::media::http_client(account_id, ca_pem);
+    if let Ok(r) = client.get(format!("https://{domain}/.well-known/host-meta.json")).send().await {
+        if let Ok(v) = r.json::<serde_json::Value>().await {
+            if let Some(href) = v["links"].as_array().into_iter().flatten().find(|l| l["rel"] == "urn:xmpp:alt-connections:websocket").and_then(|l| l["href"].as_str()) {
+                return Ok(href.to_string());
+            }
+        }
+    }
+    if let Ok(r) = client.get(format!("https://{domain}/.well-known/host-meta")).send().await {
+        if let Ok(text) = r.text().await {
+            if let Some(href) = websocket_in_xml(&text) {
+                return Ok(href);
+            }
+        }
+    }
+    Err(format!("{domain} does not say where its WebSocket is: give the address (wss://...) in the account's settings"))
+}
+
+/// The WebSocket address in a `host-meta` document.
+pub fn websocket_in_xml(text: &str) -> Option<String> {
+    let link = regex::Regex::new(r#"<Link\b[^>]*>"#).ok()?;
+    let href = regex::Regex::new(r#"href=['"]([^'"]+)['"]"#).ok()?;
+    let tag = link.find_iter(text).map(|m| m.as_str()).find(|t| t.contains("urn:xmpp:alt-connections:websocket"))?;
+    let found = href.captures(tag).map(|c| c[1].to_string());
+    found
+}
 
 impl ServerConnector for Connector {
     type Stream = Stream;
 
     async fn connect(&self, jid: &Jid, ns: &'static str, timeouts: Timeouts) -> Result<(PendingFeaturesRecv<Self::Stream>, sasl::common::ChannelBinding), Error> {
         let domain = jid.domain().as_str();
+        if self.settings.websocket {
+            return self.websocket(jid, ns, timeouts).await;
+        }
         let tcp = self.tcp(domain).await?;
         if self.settings.direct {
             let (tls, binding) = self.tls(tcp, domain).await?;
-            let pending = initiate_stream(BufStream::new(tls), ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: Some(Cow::Borrowed(jid.to_bare().as_str())), id: None }, timeouts).await?;
+            let pending = initiate_stream(Box::new(BufStream::new(tls)) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: Some(Cow::Borrowed(jid.to_bare().as_str())), id: None }, timeouts).await?;
             return Ok((pending, binding));
         }
         // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
@@ -257,7 +291,33 @@ impl ServerConnector for Connector {
         }
         let raw = plain.into_inner().into_inner();
         let (tls, binding) = self.tls(raw, domain).await?;
-        let pending = initiate_stream(BufStream::new(tls), ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        let pending = initiate_stream(Box::new(BufStream::new(tls)) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        Ok((pending, binding))
+    }
+}
+
+impl Connector {
+    /// The stream over a WebSocket: found (or named), connected through the account's route, TLS as for any connection, then the
+    /// translation of `websocket.rs` under the same stream library.
+    async fn websocket(&self, jid: &Jid, ns: &'static str, timeouts: Timeouts) -> Result<(PendingFeaturesRecv<Stream>, sasl::common::ChannelBinding), Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let io_err = |m: String| Error::Io(io::Error::other(m));
+        let domain = jid.domain().as_str();
+        let ca = self.settings.ca_pem.clone();
+        let address = if self.settings.host.starts_with("wss://") { self.settings.host.clone() } else { discover_websocket(&self.settings.account_id, &ca, domain).await.map_err(io_err)? };
+        let url = url::Url::parse(&address).map_err(|e| io_err(format!("{address:?} is not an address: {e}")))?;
+        if url.scheme() != "wss" {
+            return Err(io_err("only wss:// addresses are used: moho does not connect without encryption".to_string()));
+        }
+        let host = url.host_str().ok_or_else(|| io_err("the WebSocket address has no host".to_string()))?.to_string();
+        let port = url.port().unwrap_or(443);
+        let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, port).await.map_err(|e| io_err(format!("{e:#}")))?;
+        let (tls, binding) = self.tls(tcp, &host).await?;
+        let mut request = address.as_str().into_client_request().map_err(|e| io_err(e.to_string()))?;
+        request.headers_mut().insert("Sec-WebSocket-Protocol", "xmpp".parse().expect("a header value"));
+        let (ws, _) = tokio_tungstenite::client_async(request, tls).await.map_err(|e| io_err(format!("the WebSocket: {e}")))?;
+        let io: Stream = Box::new(BufStream::new(super::websocket::WsIo::new(ws)));
+        let pending = initiate_stream(io, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
         Ok((pending, binding))
     }
 }
@@ -265,6 +325,13 @@ impl ServerConnector for Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_websocket_address_is_found_in_host_meta() {
+        let xml = "<XRD xmlns='http://docs.oasis-open.org/ns/xri/xrd-1.0'><Link rel=\"urn:xmpp:alt-connections:xbosh\" href=\"https://e.org/bosh\"/><Link rel='urn:xmpp:alt-connections:websocket' href='wss://e.org:5443/ws'/></XRD>";
+        assert_eq!(websocket_in_xml(xml).as_deref(), Some("wss://e.org:5443/ws"));
+        assert_eq!(websocket_in_xml("<XRD/>"), None);
+    }
 
     #[test]
     fn a_pin_is_hex_whatever_way_it_was_written() {
@@ -284,7 +351,7 @@ mod tests {
     }
 
     fn settings(ca: &str, pin: &str) -> Settings {
-        Settings { account_id: "xmpp:a@example.org".into(), host: String::new(), port: 0, direct: false, ca_pem: ca.into(), pin_sha256: pin.into() }
+        Settings { account_id: "xmpp:a@example.org".into(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: ca.into(), pin_sha256: pin.into() }
     }
 
     #[test]

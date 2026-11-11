@@ -43,6 +43,7 @@ pub mod register;
 pub mod session;
 pub mod transport;
 pub mod upload;
+pub mod websocket;
 pub mod xml;
 
 pub use connect::spawn;
