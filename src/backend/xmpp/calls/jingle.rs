@@ -187,7 +187,8 @@ pub fn to_sdp(jingle: &Element, remote_initiator: bool) -> Sdp {
             proto: "UDP/TLS/RTP/SAVPF".into(),
             // Every client that calls multiplexes RTCP, and the browser will not take a description that does not.
             rtcp_mux: true,
-            direction: direction(c.attr("senders").unwrap_or("both"), !remote_initiator).to_string(),
+            // The description is the sender's: what it does is said from its side.
+            direction: direction(c.attr("senders").unwrap_or("both"), remote_initiator).to_string(),
             ..Default::default()
         };
         for p in d.children().filter(|p| p.is("payload-type", RTP)) {
@@ -309,6 +310,20 @@ mod tests {
         assert_eq!((direction("initiator", false), direction("initiator", true)), ("recvonly", "sendonly"));
         assert_eq!((direction("responder", false), direction("responder", true)), ("sendonly", "recvonly"));
         assert_eq!((direction("both", true), direction("none", false)), ("sendrecv", "inactive"));
+    }
+
+    #[test]
+    fn a_description_is_read_from_the_side_of_whoever_wrote_it() {
+        // The caller sends only: its offer says sendonly. The answerer that only receives says recvonly - both are "initiator".
+        let mut sdp = parse(SAMPLE);
+        sdp.media[0].direction = "sendonly".into();
+        sdp.media[1].direction = "inactive".into();
+        let as_offer = to_sdp(&jingle(&sdp, true), true);
+        assert_eq!((as_offer.media[0].direction.as_str(), as_offer.media[1].direction.as_str()), ("sendonly", "inactive"));
+        let mut answer = parse(SAMPLE);
+        answer.media[0].direction = "recvonly".into();
+        let as_answer = to_sdp(&jingle(&answer, false), false);
+        assert_eq!(as_answer.media[0].direction, "recvonly");
     }
 
     #[test]

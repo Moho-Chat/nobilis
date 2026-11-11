@@ -13,6 +13,7 @@
 //! comes next and is answered in the ordinary way.
 
 pub mod jingle;
+pub mod renegotiate;
 pub mod sdp;
 
 use super::session::Handle;
@@ -65,11 +66,19 @@ pub struct Call {
     pub held: Vec<(String, usize, Candidate)>,
     /// Whether the window has the other end's description, so a candidate for it is usable.
     pub ready: bool,
+    /// The last description each end gave, which a change to the call is read against.
+    pub local: Option<Sdp>,
+    pub remote: Option<Sdp>,
+    /// Our offer of a change, while the other end has not answered it; and theirs, while the window has not.
+    pub pending: Option<Sdp>,
+    pub peer_offer: Option<Sdp>,
+    /// Who made each section (`initiator` or `responder`), where it is not the initiator.
+    pub creators: Vec<(String, String)>,
 }
 
 impl Call {
     fn new(buffer_id: &str, peer: BareJid, full: Option<Jid>, outgoing: bool, phase: Phase) -> Self {
-        Self { buffer_id: buffer_id.to_string(), peer, full, outgoing, phase, offer: None, mids: Vec::new(), creds: Vec::new(), queued: Vec::new(), held: Vec::new(), ready: false }
+        Self { buffer_id: buffer_id.to_string(), peer, full, outgoing, phase, offer: None, mids: Vec::new(), creds: Vec::new(), queued: Vec::new(), held: Vec::new(), ready: false, local: None, remote: None, pending: None, peer_offer: None, creators: Vec::new() }
     }
 }
 
@@ -162,6 +171,7 @@ pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, eve
             let mut call = Call::new(&buffer.id, peer.clone(), None, true, Phase::Proposed);
             call.mids = offer.media.iter().map(|m| m.mid.clone()).collect();
             call.creds = offer.media.iter().map(|m| (m.mid.clone(), m.ufrag.clone(), m.pwd.clone())).collect();
+            call.local = Some(offer.clone());
             call.offer = Some(offer);
             handle.session().calls.insert(sid.clone(), call);
             handle.send_message(jmi_message(Jid::from(peer), "propose", &sid, &media)).await;
@@ -202,6 +212,7 @@ pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, eve
                 call.phase = Phase::Accepted;
                 call.ready = true;
                 call.creds = answer.media.iter().map(|m| (m.mid.clone(), m.ufrag.clone(), m.pwd.clone())).collect();
+                call.local = Some(answer.clone());
                 (call.full.clone().ok_or("nobody to answer")?, std::mem::take(&mut call.held), call.buffer_id.clone(), call.peer.clone())
             };
             let mut j = Element::builder("jingle", jingle::JINGLE).at("action", "session-accept").at("sid", sid.as_str()).at("responder", handle.bound.to_string()).build();
@@ -240,9 +251,141 @@ pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, eve
             }
             Ok(())
         }
-        "m.call.negotiate" => Err("changing a call that is up (adding the camera or a screen) is not supported over XMPP yet".into()),
+        "m.call.negotiate" => negotiate(state, handle, &sid, content).await,
         _ => Ok(()),
     }
+}
+
+/// Who made a section: the initiator unless it was added later by the other end.
+fn creator_of(call: &Call, mid: &str) -> String {
+    call.creators.iter().find(|(m, _)| m == mid).map(|(_, c)| c.clone()).unwrap_or_else(|| "initiator".into())
+}
+
+/// The window changing the call (it offers the whole call again, or answers the other end's offer of a change).
+async fn negotiate(state: &AppState, handle: &Handle, sid: &str, content: &Value) -> Result<(), String> {
+    let description = &content["description"];
+    let new = sdp::parse(description["sdp"].as_str().ok_or("a change with nothing in it")?);
+    match description["type"].as_str() {
+        Some("offer") => {
+            let (to, changes, ours, buffer_id, peer) = {
+                let mut s = handle.session();
+                let call = s.calls.get_mut(sid).filter(|c| c.phase == Phase::Accepted).ok_or("the call is not up yet")?;
+                if call.pending.is_some() {
+                    return Err("a change to the call is already under way".into());
+                }
+                let local = call.local.clone().ok_or("the call has no description yet")?;
+                let changes = renegotiate::changes(&local, &new);
+                call.pending = Some(new.clone());
+                let ours = if call.outgoing { "initiator" } else { "responder" };
+                for mid in &changes.added {
+                    call.creators.push((mid.clone(), ours.to_string()));
+                }
+                (call.full.clone().ok_or("nobody to tell")?, changes, ours, call.buffer_id.clone(), call.peer.clone())
+            };
+            let outgoing = ours == "initiator";
+            let mut waiting = None;
+            if !changes.added.is_empty() {
+                let mut j = jingle_el("content-add", sid);
+                let only: Sdp = Sdp { media: new.media.iter().filter(|m| changes.added.contains(&m.mid)).cloned().collect(), ..new.clone() };
+                for c in jingle::contents(&only, ours, outgoing) {
+                    j.append_child(c);
+                }
+                for g in jingle::groups(&new) {
+                    j.append_child(g);
+                }
+                waiting = Some(handle.fire(Some(to.clone()), j).await);
+            }
+            if !changes.modified.is_empty() {
+                let mut j = jingle_el("content-modify", sid);
+                {
+                    let s = handle.session();
+                    let call = s.calls.get(sid);
+                    for mid in &changes.modified {
+                        let Some(m) = new.media.iter().find(|m| m.mid == *mid) else { continue };
+                        let creator = call.map(|c| creator_of(c, mid)).unwrap_or_else(|| "initiator".into());
+                        j.append_child(Element::builder("content", jingle::JINGLE).at("creator", creator).at("name", mid.as_str()).at("senders", jingle::senders(&m.direction, outgoing)).build());
+                    }
+                }
+                let rx = handle.fire(Some(to.clone()), j).await;
+                // A modification is answered by the iq's result alone: that is the other end agreeing.
+                if changes.added.is_empty() {
+                    let (state, handle, sid) = (state.clone(), handle.clone(), sid.to_string());
+                    let (buffer_id, peer) = (buffer_id.clone(), peer.clone());
+                    tokio::spawn(async move {
+                        match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+                            Ok(Ok(Iq::Result { .. })) => answered(&state, &handle, &sid, &buffer_id, &peer, &Sdp::default()),
+                            _ => {
+                                if let Some(c) = handle.session().calls.get_mut(&sid) {
+                                    c.pending = None;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            if changes.added.is_empty() && changes.modified.is_empty() {
+                answered(state, handle, sid, &buffer_id, &peer, &Sdp::default());
+            }
+            // An addition the other end refuses outright is a section that is turned down.
+            if let Some(rx) = waiting {
+                let (state, handle, sid) = (state.clone(), handle.clone(), sid.to_string());
+                tokio::spawn(async move {
+                    if let Ok(Ok(Iq::Error { .. })) = tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                        answered(&state, &handle, &sid, &buffer_id, &peer, &Sdp::default());
+                    }
+                });
+            }
+            Ok(())
+        }
+        Some("answer") => {
+            let (to, offer, local, ours_is_initiator, creators) = {
+                let mut s = handle.session();
+                let call = s.calls.get_mut(sid).filter(|c| c.phase == Phase::Accepted).ok_or("the call is not up")?;
+                let offer = call.peer_offer.take().ok_or("there is nothing to answer")?;
+                let local = call.local.clone().ok_or("the call has no description yet")?;
+                (call.full.clone().ok_or("nobody to tell")?, offer, local, call.outgoing, call.creators.clone())
+            };
+            let changes = renegotiate::changes(&local, &new);
+            let their_role = if ours_is_initiator { "responder" } else { "initiator" };
+            let creator = |mid: &str| creators.iter().find(|(m, _)| m == mid).map(|(_, c)| c.clone()).unwrap_or_else(|| their_role.to_string());
+            let (taken, turned_down): (Vec<&String>, Vec<&String>) = changes.added.iter().partition(|mid| new.media.iter().any(|m| m.mid == **mid && m.port != 0));
+            if !taken.is_empty() {
+                let mut j = jingle_el("content-accept", sid);
+                let only: Sdp = Sdp { media: new.media.iter().filter(|m| taken.contains(&&m.mid)).cloned().collect(), ..new.clone() };
+                for c in jingle::contents(&only, &creator(&only.media[0].mid), ours_is_initiator) {
+                    j.append_child(c);
+                }
+                send_jingle(state, handle, sid, to.clone(), j, false).await;
+            }
+            if !turned_down.is_empty() {
+                let mut j = jingle_el("content-reject", sid);
+                for mid in turned_down {
+                    j.append_child(Element::builder("content", jingle::JINGLE).at("creator", creator(mid)).at("name", mid.as_str()).build());
+                }
+                send_jingle(state, handle, sid, to, j, false).await;
+            }
+            if let Some(c) = handle.session().calls.get_mut(sid) {
+                c.local = Some(new);
+                c.remote = Some(offer);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The other end has agreed to our offer of a change: the window gets the answer, built from what it said.
+fn answered(state: &AppState, handle: &Handle, sid: &str, buffer_id: &str, peer: &BareJid, accepted: &Sdp) {
+    let answer = {
+        let mut s = handle.session();
+        let Some(call) = s.calls.get_mut(sid) else { return };
+        let (Some(offer), Some(remote)) = (call.pending.take(), call.remote.clone()) else { return };
+        let answer = renegotiate::answer(&offer, &remote, accepted);
+        call.local = Some(offer);
+        call.remote = Some(answer.clone());
+        answer
+    };
+    emit(state, handle, buffer_id, "m.call.negotiate", sid, (peer.as_str(), false, peer.as_str()), json!({ "description": { "type": "answer", "sdp": sdp::write(&answer) } }));
 }
 
 async fn send_transport(state: &AppState, handle: &Handle, sid: &str, to: Jid, list: Vec<Candidate>, mids: Vec<Option<String>>) {
@@ -399,6 +542,7 @@ pub async fn jingle_iq(state: &AppState, handle: &Handle, from: Option<Jid>, id:
             }
             if let Some(c) = s.calls.get_mut(&sid) {
                 c.mids = offer.media.iter().map(|m| m.mid.clone()).collect();
+                c.remote = Some(offer.clone());
             }
         }
         emit(state, handle, &buffer.id, "m.call.invite", &sid, (peer.as_str(), false, &from.to_string()), json!({ "offer": { "type": "offer", "sdp": sdp::write(&offer) }, "lifetime": 60000 }));
@@ -418,6 +562,7 @@ pub async fn jingle_iq(state: &AppState, handle: &Handle, from: Option<Jid>, id:
                 c.phase = Phase::Accepted;
                 c.ready = true;
                 c.full = Some(from.clone());
+                c.remote = Some(answer.clone());
                 std::mem::take(&mut c.held)
             };
             emit(state, handle, &buffer_id, "m.call.answer", &sid, (peer.as_str(), false, &from.to_string()), json!({ "answer": { "type": "answer", "sdp": sdp::write(&answer) } }));
@@ -453,6 +598,43 @@ pub async fn jingle_iq(state: &AppState, handle: &Handle, from: Option<Jid>, id:
             let reason = j.children().find(|c| c.name() == "reason").and_then(|r| r.children().next()).map(|c| c.name().to_string()).unwrap_or_else(|| "success".into());
             let kind = if matches!(reason.as_str(), "decline" | "busy") { "m.call.reject" } else { "m.call.hangup" };
             emit(state, handle, &buffer_id, kind, &sid, (peer.as_str(), false, &from.to_string()), json!({ "reason": if reason == "busy" { "user_busy" } else { "user_hangup" } }));
+        }
+        // The other end changing the call: a picture added, a section used another way or put away.
+        "content-add" | "content-modify" | "content-remove" if phase == Phase::Accepted => {
+            handle.send(reply(handle, Some(from.clone()), id, None)).await;
+            let offer = {
+                let mut s = handle.session();
+                let Some(c) = s.calls.get_mut(&sid) else { return };
+                let Some(remote) = c.remote.clone() else { return };
+                let mut offer = remote.clone();
+                match action {
+                    "content-add" => {
+                        let added = jingle::to_sdp(j, !outgoing);
+                        for content in j.children().filter(|x| x.is("content", jingle::JINGLE)) {
+                            if let (Some(name), Some(creator)) = (content.attr("name"), content.attr("creator")) {
+                                c.creators.push((name.to_string(), creator.to_string()));
+                            }
+                        }
+                        offer = renegotiate::with_added(&remote, added);
+                    }
+                    _ => {
+                        for content in j.children().filter(|x| x.is("content", jingle::JINGLE)) {
+                            let Some(name) = content.attr("name") else { continue };
+                            let how = if action == "content-remove" { "inactive" } else { jingle::direction(content.attr("senders").unwrap_or("both"), !outgoing) };
+                            offer = renegotiate::with_direction(&offer, name, how);
+                        }
+                    }
+                }
+                c.peer_offer = Some(offer.clone());
+                offer
+            };
+            emit(state, handle, &buffer_id, "m.call.negotiate", &sid, (peer.as_str(), false, &from.to_string()), json!({ "description": { "type": "offer", "sdp": sdp::write(&offer) }, "lifetime": 30000 }));
+        }
+        // What the other end says to a change we offered.
+        "content-accept" | "content-reject" if phase == Phase::Accepted => {
+            handle.send(reply(handle, Some(from.clone()), id, None)).await;
+            let accepted = if action == "content-accept" { let mut a = jingle::to_sdp(j, !outgoing); renegotiate::inherit_transport(&mut a); a } else { Sdp::default() };
+            answered(state, handle, &sid, &buffer_id, &peer, &accepted);
         }
         // Somebody's phone saying it rings, or has been muted: nothing to do and nothing wrong.
         "session-info" => handle.send(reply(handle, Some(from), id, None)).await,
