@@ -44,7 +44,13 @@ pub async fn server_info(handle: &Handle) -> Result<Value, String> {
             }
         }
     }
+    // What belongs to the account itself (the archive, carbons, bookmarks on some servers) is advertised on its address, not on
+    // the server's.
+    if let Ok(Some(q)) = handle.request(Some(Jid::from(handle.own())), false, xml::empty("query", ns::DISCO_INFO)).await {
+        features.extend(q.children().filter(|c| c.name() == "feature").filter_map(|c| c.attr("var").map(str::to_string)));
+    }
     features.sort();
+    features.dedup();
     let named: Vec<Value> = features.iter().map(|f| json!({ "var": f, "xep": xep_of(f) })).collect();
     Ok(json!({ "software": name, "version": v, "contacts": contacts, "features": named }))
 }

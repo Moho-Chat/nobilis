@@ -187,12 +187,34 @@ impl Failure {
         Self { condition: format!("{:?}", error.defined_condition), text }
     }
 
-    /// In words.
+    /// In words: what the server said if it said anything, else what the condition means.
     pub fn words(&self) -> String {
-        if self.text.is_empty() {
-            self.condition.clone()
-        } else {
-            format!("{} ({})", self.text, self.condition)
+        if !self.text.is_empty() {
+            return format!("{} ({})", self.text, self.condition);
+        }
+        match self.condition.as_str() {
+            "ServiceUnavailable" | "FeatureNotImplemented" => "This server does not support that".to_string(),
+            "Forbidden" | "NotAllowed" => "The server does not allow that".to_string(),
+            "NotAuthorized" => "That needs a sign-in the server did not accept".to_string(),
+            "ItemNotFound" => "The server does not have that".to_string(),
+            "Conflict" => "That is already taken".to_string(),
+            "RemoteServerNotFound" => "The other server could not be found".to_string(),
+            "RemoteServerTimeout" | "remote-server-timeout" => "The server did not answer in time".to_string(),
+            "NotAcceptable" => "The server did not accept that".to_string(),
+            "BadRequest" => "The server did not understand the request".to_string(),
+            "ResourceConstraint" => "The server is out of room for that: try again later".to_string(),
+            "PolicyViolation" => "The server's rules do not allow that".to_string(),
+            other => {
+                // CamelCase to words.
+                let mut spaced = String::new();
+                for (i, c) in other.chars().enumerate() {
+                    if c.is_uppercase() && i > 0 {
+                        spaced.push(' ');
+                    }
+                    spaced.push(c.to_ascii_lowercase());
+                }
+                spaced
+            }
         }
     }
 }
