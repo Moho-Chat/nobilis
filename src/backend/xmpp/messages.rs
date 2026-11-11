@@ -80,6 +80,9 @@ pub async fn handle(state: &AppState, handle: &Handle, message: Message) {
     if invitation(state, handle, &message) {
         return;
     }
+    if super::calls::message(state, handle, &message, None) {
+        return;
+    }
     // An archive's answer to a query in progress: kept for whoever asked.
     if let Some(result) = payload(&message, "result", ns::MAM) {
         if let (Some(query), Some(archive_id), Some(forwarded)) = (result.attr("queryid"), result.attr("id"), xml::child(result, "forwarded", ns::FORWARD)) {
@@ -101,8 +104,9 @@ pub async fn handle(state: &AppState, handle: &Handle, message: Message) {
                 return;
             }
             if let Some((inner, _)) = xml::child(carbon, "forwarded", ns::FORWARD).and_then(forwarded_message) {
-                // The copy of a message this very resource sent is not news.
-                let _ = sent;
+                if super::calls::message(state, handle, &inner, Some(sent)) {
+                    return;
+                }
                 handle_one(state, handle, inner, Origin::Carbon).await;
             }
             return;

@@ -2263,6 +2263,14 @@ pub async fn dispatch(
             let Some(content) = params.get("content").filter(|c| c.is_object()).cloned() else {
                 return (None, Some("sendMatrixCallEvent requires \"content\"".to_string()));
             };
+            // An XMPP conversation speaks the same call vocabulary to the window and Jingle to the network.
+            if buffer.account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                return match backend::xmpp::calls::from_window(state, &handle, &buffer, event_type, &content).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             match backend::matrix::calls::send(state, &buffer.account_id, buffer_id, event_type, content).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2275,6 +2283,10 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("matrixTurnServers requires \"accountId\"".to_string()));
             };
+            if account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                return (Some(backend::xmpp::calls::turn_servers(&handle).await), None);
+            }
             match backend::matrix::calls::turn_servers(state, account_id).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),

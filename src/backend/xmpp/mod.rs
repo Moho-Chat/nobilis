@@ -22,6 +22,7 @@ pub mod archive_prefs;
 pub mod avatars;
 pub mod blocking;
 pub mod bookmarks;
+pub mod calls;
 pub mod caps;
 pub mod connect;
 pub mod dataform;

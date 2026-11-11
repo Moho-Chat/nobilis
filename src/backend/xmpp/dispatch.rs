@@ -64,6 +64,8 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
                 super::blocking::pushed(handle, payload);
                 handle.send(Stanza::Iq(Iq::Result { from: None, to: None, id: id.clone(), payload: None })).await;
             }
+            // Somebody calling.
+            Iq::Set { from, id, payload, .. } if payload.is("jingle", super::calls::jingle::JINGLE) => super::calls::jingle_iq(state, handle, from.clone(), id, payload).await,
             _ => {
                 if let Some(reply) = iq::answer(&request) {
                     handle.send(Stanza::Iq(reply)).await;

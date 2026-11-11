@@ -105,6 +105,8 @@ pub struct Session {
     pub csi: Option<(Arc<super::tap::Tap>, bool)>,
     /// The window is hidden: the server is asked to hold back what is not urgent.
     pub inactive: bool,
+    /// Calls in progress or being offered, by session id.
+    pub calls: HashMap<String, super::calls::Call>,
 }
 
 /// Somebody asked this account into a room.
@@ -184,6 +186,16 @@ impl Handle {
 
     pub async fn send_presence(&self, presence: Presence) {
         self.send(Stanza::Presence(presence)).await;
+    }
+
+    /// Sends an iq and hands back where its answer will arrive, without waiting: for a stream of requests whose order must be kept
+    /// (one `request` waits, and two spawned ones may be written in either order).
+    pub async fn fire(&self, to: Option<Jid>, payload: Element) -> oneshot::Receiver<Iq> {
+        let id = xml::new_id();
+        let (tx, rx) = oneshot::channel();
+        self.session().waiting.insert(id.clone(), tx);
+        self.send(Stanza::Iq(Iq::Set { from: None, to, id, payload })).await;
+        rx
     }
 
     /// Asks the server (or another entity) something and waits for the answer: the payload of the result, `None` for
