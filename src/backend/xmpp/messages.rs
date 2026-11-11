@@ -274,6 +274,10 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
         }
         if let Origin::Archive { id, .. } = &origin {
             s.aliases.insert(id.clone(), local.clone());
+            // The archive's id is the result's, which not every server also writes on the message: it is stamped by the account's
+            // own archive for a person, and by the room for a room.
+            let by = if conv.kind == "channel" { conv.key.clone() } else { handle.own().to_string() };
+            s.archive_ids.entry(local.clone()).or_insert((by, id.clone()));
         }
     }
 
