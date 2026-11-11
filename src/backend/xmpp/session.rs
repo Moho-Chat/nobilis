@@ -107,6 +107,8 @@ pub struct Session {
     pub inactive: bool,
     /// Calls in progress or being offered, by session id.
     pub calls: HashMap<String, super::calls::Call>,
+    /// What each contact publishes about themselves (nickname, mood, activity, tune, location), as it was last sent.
+    pub published: HashMap<BareJid, super::pep::Published>,
 }
 
 /// Somebody asked this account into a room.
@@ -291,6 +293,11 @@ impl Session {
     }
 
     /// What to call a person: their name on the roster, or their address.
+    /// The roster name, else the nickname they publish (XEP-0172), else the address: what to call somebody in a list.
+    pub fn shown_name(&self, jid: &BareJid) -> String {
+        self.roster.get(jid).and_then(|c| c.name.clone()).filter(|n| !n.trim().is_empty()).or_else(|| self.published.get(jid).and_then(|p| p.nick.clone())).unwrap_or_else(|| jid.to_string())
+    }
+
     pub fn display_name(&self, jid: &BareJid) -> String {
         self.roster.get(jid).and_then(|c| c.name.clone()).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| jid.to_string())
     }

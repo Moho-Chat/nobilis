@@ -33,6 +33,10 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
                         o.store().save();
                     }
                 }
+                // A nickname, a mood, an activity, a tune, a place.
+                if let Some(from) = &from {
+                    super::pep::event(state, handle, from, event);
+                }
                 if let (Some(from), Some(items)) = (from, event.children().find(|c| c.name() == "items" && c.attr("node") == Some(ns::AVATAR_METADATA))) {
                     handle.session().avatar_source.insert(from.clone(), "pep".into());
                     let (s, h, items) = (state.clone(), handle.clone(), items.clone());

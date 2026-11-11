@@ -124,13 +124,15 @@ fn entry(handle: &Handle, jid: &BareJid) -> Value {
     let present = s.best_presence(jid);
     let status = present.map(|p| status_word(&p.show)).unwrap_or("offline");
     let text = present.map(|p| p.status.clone()).filter(|t| !t.is_empty());
+    // Their own words first; else what they publish - a tune, a mood, an activity.
+    let activity = text.map(|t| json!({ "kind": "custom", "text": t })).or_else(|| s.published.get(jid).and_then(|p| p.line())).unwrap_or(Value::Null);
     json!({
-        "nick": s.display_name(jid),
+        "nick": s.shown_name(jid),
         "userId": jid.to_string(),
         "prefix": "",
         "away": status == "offline",
         "status": status,
-        "activity": text.map(|t| json!({ "kind": "custom", "text": t })).unwrap_or(Value::Null),
+        "activity": activity,
         "bot": false,
         "relationship": s.roster.get(jid).map(|c| c.subscription.clone()).unwrap_or_default(),
         "avatarUrl": s.avatars.get(jid).cloned().map(Value::String).unwrap_or(Value::Null),

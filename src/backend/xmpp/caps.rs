@@ -50,6 +50,7 @@ pub const FEATURES: &[&str] = &[
 fn sorted_features() -> Vec<&'static str> {
     let mut f = FEATURES.to_vec();
     f.extend_from_slice(super::calls::FEATURES);
+    f.extend_from_slice(super::pep::NOTIFY);
     f.sort_unstable();
     f.dedup();
     f

@@ -1354,6 +1354,7 @@ pub async fn dispatch(
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -5245,6 +5246,26 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused, "details": details, "pinned": pinned, "changed": changed })), None)
                 }
                 None => (Some(serde_json::json!({})), None),
+            }
+        }
+
+        // The account's own profile (its vCard and nickname), as it can be edited, and the edit.
+        "xmppGetProfile" | "xmppSetProfile" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppGetProfile" {
+                return (Some(backend::xmpp::pep::own(&handle).await), None);
+            }
+            let own = backend::xmpp::pep::Own {
+                full_name: p_str(params, "fullName", "").to_string(),
+                nickname: p_str(params, "nickname", "").to_string(),
+                email: p_str(params, "email", "").to_string(),
+                url: p_str(params, "url", "").to_string(),
+                note: p_str(params, "note", "").to_string(),
+            };
+            match backend::xmpp::pep::set_own(&handle, &own).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
             }
         }
 
