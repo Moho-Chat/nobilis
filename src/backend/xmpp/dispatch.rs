@@ -19,6 +19,12 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
                     let (s, h, e) = (state.clone(), handle.clone(), event.clone());
                     tokio::spawn(async move { super::bookmarks::notified(&s, &h, &e).await });
                 }
+                // What another device of this account has read.
+                if from.as_ref() == Some(&handle.own()) {
+                    if let Some(item) = event.children().find(|c| c.name() == "items" && c.attr("node") == Some(super::mds::NODE)).and_then(|i| i.children().find(|c| c.name() == "item")) {
+                        super::mds::apply(state, handle, item);
+                    }
+                }
                 // Somebody's OMEMO devices changed.
                 if let (Some(from), Some(list)) = (from.clone(), event.children().find(|c| c.name() == "items" && c.attr("node") == Some(super::omemo::DEVICELIST_NODE)).and_then(|i| i.children().find(|c| c.name() == "item")).and_then(|i| i.children().next())) {
                     let omemo = handle.session().omemo.clone();

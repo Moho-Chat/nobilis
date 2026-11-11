@@ -372,6 +372,16 @@ pub async fn typing(state: &AppState, buffer: &Buffer, composing: bool) -> Resul
 /// Tells the other side the last message they sent has been read (XEP-0333).
 pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     let (handle, jid) = target(state, buffer)?;
+    // The account's other devices are told, whoever the conversation is with: it is about this account, not about them.
+    let stamped = {
+        let s = handle.session();
+        s.last_incoming.get(jid.as_str()).and_then(|l| s.archive_ids.get(l)).cloned()
+    };
+    if let Some((by, id)) = stamped {
+        let h = handle.clone();
+        let conversation = jid.to_string();
+        tokio::spawn(async move { super::mds::publish(&h, &conversation, &by, &id).await });
+    }
     if !trusted(&handle, &jid) {
         return Ok(());
     }

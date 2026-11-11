@@ -35,6 +35,7 @@ pub const FEATURES: &[&str] = &[
     ns::SID,
     ns::SFS,
     "urn:xmpp:avatar:metadata+notify",
+    "urn:xmpp:mds:displayed:0+notify",
     "eu.siacs.conversations.axolotl.devicelist+notify",
     "eu.siacs.conversations.axolotl",
     "urn:xmpp:bookmarks:1+notify",

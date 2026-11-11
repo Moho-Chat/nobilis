@@ -30,6 +30,7 @@ pub async fn run(state: &AppState, handle: &Handle) {
     roster::set_own(handle, &show, &status).await;
     super::bookmarks::load(state, handle).await;
     mam::catch_up(state, handle).await;
+    super::mds::load(state, handle).await;
     let _ = caps::NAME;
 }
 

@@ -270,6 +270,7 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
         }
         for sid in &p.stanza_ids {
             s.aliases.insert(sid.id.clone(), local.clone());
+            s.archive_ids.entry(local.clone()).or_insert((sid.by.clone(), sid.id.clone()));
         }
         if let Origin::Archive { id, .. } = &origin {
             s.aliases.insert(id.clone(), local.clone());

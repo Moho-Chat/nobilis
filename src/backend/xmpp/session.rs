@@ -99,6 +99,8 @@ pub struct Session {
     pub blocked: HashSet<String>,
     /// This device's OMEMO keys and sessions, once opened.
     pub omemo: Option<Arc<super::omemo::Omemo>>,
+    /// The archive's id (and who stamped it) for each message, by the id it is kept under: what a read marker names.
+    pub archive_ids: HashMap<String, (String, String)>,
 }
 
 /// Somebody asked this account into a room.

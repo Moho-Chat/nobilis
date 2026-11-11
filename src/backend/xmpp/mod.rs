@@ -29,6 +29,7 @@ pub mod incoming;
 pub mod init;
 pub mod iq;
 pub mod mam;
+pub mod mds;
 pub mod media;
 pub mod messages;
 pub mod muc;
