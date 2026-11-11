@@ -5028,6 +5028,8 @@ pub async fn dispatch(
                 ca_pem: p_str(params, "caPem", "").to_string(),
                 pin_sha256: backend::xmpp::transport::normalise_pin(pin).unwrap_or_default(),
                 resource: p_str(params, "resource", "").trim().to_string(),
+                // The form's Tor switch: without it the account was made unrouted and connected directly.
+                use_tor: p_bool(params, "useTor", false),
                 ..Default::default()
             };
             if !config.resource.is_empty() && tokio_xmpp::jid::BareJid::new(&config.jid).ok().and_then(|b| b.with_resource_str(&config.resource).ok()).is_none() {
@@ -5393,6 +5395,7 @@ pub async fn dispatch(
                 security: if settings.websocket { "websocket".into() } else if settings.direct { "direct".into() } else { "starttls".into() },
                 ca_pem: settings.ca_pem,
                 pin_sha256: settings.pin_sha256,
+                use_tor: params.get("useTor").and_then(|v| v.as_bool()).unwrap_or(false),
                 ..Default::default()
             };
             match state.accounts.add_xmpp(config) {
