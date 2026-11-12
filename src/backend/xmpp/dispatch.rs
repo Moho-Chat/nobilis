@@ -68,6 +68,9 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
                 super::blocking::pushed(handle, payload);
                 handle.send(Stanza::Iq(Iq::Result { from: None, to: None, id: id.clone(), payload: None })).await;
             }
+            // A file sent device to device (XEP-0234), and the blocks it comes in (XEP-0047).
+            Iq::Set { from: Some(from), id, payload, .. } if payload.is("jingle", super::calls::jingle::JINGLE) && super::filetransfer::is_ours(handle, payload) => super::filetransfer::jingle_iq(state, handle, from.clone(), id, payload).await,
+            Iq::Set { from: Some(from), id, payload, .. } if payload.ns() == super::filetransfer::IBB => super::filetransfer::ibb_iq(state, handle, from.clone(), id, payload).await,
             // Somebody calling.
             Iq::Set { from, id, payload, .. } if payload.is("jingle", super::calls::jingle::JINGLE) => super::calls::jingle_iq(state, handle, from.clone(), id, payload).await,
             _ => {

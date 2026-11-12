@@ -29,6 +29,7 @@ pub mod connect;
 pub mod contacts;
 pub mod dataform;
 pub mod dispatch;
+pub mod filetransfer;
 pub mod incoming;
 pub mod init;
 pub mod invites;

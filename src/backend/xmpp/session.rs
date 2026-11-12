@@ -109,6 +109,8 @@ pub struct Session {
     pub calls: HashMap<String, super::calls::Call>,
     /// What each contact publishes about themselves (nickname, mood, activity, tune, location), as it was last sent.
     pub published: HashMap<BareJid, super::pep::Published>,
+    /// Files on their way from one device to another (XEP-0234), by Jingle session id.
+    pub transfers: HashMap<String, super::filetransfer::Transfer>,
     /// What a requester's server says about their account (XEP-0489), in words, for the Invitations tile.
     pub request_info: HashMap<BareJid, String>,
     /// What other servers say they do (disco#info features), asked once per session.

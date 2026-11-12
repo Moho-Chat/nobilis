@@ -5275,6 +5275,31 @@ pub async fn dispatch(
             }
         }
 
+        // Files sent device to device (XEP-0234): the offers waiting, an answer to one, and one sent directly by choice.
+        "xmppFileOffers" | "xmppAnswerFile" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppFileOffers" {
+                return (Some(serde_json::json!(backend::xmpp::filetransfer::offers_json(&handle))), None);
+            }
+            match backend::xmpp::filetransfer::answer(state, &handle, p_str(params, "sid", ""), p_bool(params, "accept", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "xmppSendDirect" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "dm") else { return (None, Some("xmppSendDirect needs a conversation with a person".to_string())) };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let peer = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok());
+            match peer {
+                Some(peer) if backend::xmpp::filetransfer::device_for(&handle, &peer).await.is_some() => {
+                    backend::xmpp::filetransfer::send_later(state, &handle, &buffer, p_str(params, "path", ""));
+                    (Some(serde_json::json!({ "started": true })), None)
+                }
+                _ => (None, Some("No device of theirs that is online takes files sent directly".to_string())),
+            }
+        }
+
         // The contact list to a file, and from one (roster XML, a XEP-0227 export, or addresses one a line).
         "xmppExportContacts" | "xmppImportContacts" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };

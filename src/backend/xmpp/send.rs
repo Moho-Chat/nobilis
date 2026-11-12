@@ -187,7 +187,23 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
     }
     let (handle, jid) = target(state, buffer)?;
     let encrypted = encrypting(&handle, &jid);
-    let (service, most) = super::upload::service(&handle).await?;
+    let (service, most) = match super::upload::service(&handle).await {
+        Ok(found) => found,
+        // A server with no HTTP Upload: a person's file goes to their device directly (XEP-0234), if one takes it.
+        Err(no_upload) if !in_room(buffer) && !encrypted && voice.is_none() => {
+            if !caption.trim().is_empty() {
+                send(state, buffer, caption, reply_to.map(str::to_string)).await?;
+            }
+            if super::filetransfer::device_for(&handle, &jid).await.is_none() {
+                return Err(format!("This server has no file upload ({no_upload}), and no device of {jid} that is online takes files sent directly"));
+            }
+            for (path, _) in files {
+                super::filetransfer::send_later(state, &handle, buffer, path);
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let ca = state.accounts.get_xmpp(&buffer.account_id).map(|c| c.ca_pem).unwrap_or_default();
     let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
     if let Some(p) = progress {
