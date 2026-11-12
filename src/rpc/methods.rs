@@ -5275,6 +5275,29 @@ pub async fn dispatch(
             }
         }
 
+        // The contact list to a file, and from one (roster XML, a XEP-0227 export, or addresses one a line).
+        "xmppExportContacts" | "xmppImportContacts" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(path) = p_str_opt(params, "path").filter(|p| !p.is_empty()) else { return (None, Some(format!("{method} requires \"path\""))) };
+            if method == "xmppExportContacts" {
+                let text = backend::xmpp::contacts::export(&handle);
+                let count = handle.session().roster.len();
+                return match std::fs::write(path, text) {
+                    Ok(()) => (Some(serde_json::json!({ "exported": count })), None),
+                    Err(e) => (None, Some(format!("{path}: {e}"))),
+                };
+            }
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => return (None, Some(format!("{path}: {e}"))),
+            };
+            match backend::xmpp::contacts::parse(&text) {
+                Ok(entries) => (Some(serde_json::to_value(backend::xmpp::contacts::import(&handle, &entries, p_bool(params, "ask", true)).await).unwrap_or_default()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // What the account publishes (PEP nodes): listed, who may read each changed, emptied, deleted.
         "xmppNodes" | "xmppNodeAccess" | "xmppNodeRemove" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };

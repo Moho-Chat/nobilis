@@ -26,6 +26,7 @@ pub mod bookmarks;
 pub mod calls;
 pub mod caps;
 pub mod connect;
+pub mod contacts;
 pub mod dataform;
 pub mod dispatch;
 pub mod incoming;
