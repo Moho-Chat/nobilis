@@ -5704,13 +5704,14 @@ pub async fn dispatch(
                     };
                     for person in &people {
                         for device in backend::xmpp::omemo::devices_of(&handle, &omemo, person, true).await {
+                            let omemo2 = backend::xmpp::omemo::speaks_v2(&omemo, person.as_str(), device);
                             let store = omemo.store();
                             let key = backend::xmpp::omemo::store::key(person.as_str(), device);
                             let identity = store.state.identities.get(&key).cloned().unwrap_or_default();
                             out.push(serde_json::json!({
                                 "jid": person.to_string(), "device": device, "own": device == store.state.device_id && *person == me,
                                 "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&identity), "known": !identity.is_empty(),
-                                "trust": store.trust_of(person.as_str(), device),
+                                "trust": store.trust_of(person.as_str(), device), "omemo2": omemo2,
                             }));
                         }
                     }

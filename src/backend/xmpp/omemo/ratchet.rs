@@ -70,7 +70,7 @@ pub enum Error {
     UnknownPreKey,
 }
 
-mod hexarr {
+pub(super) mod hexarr {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer, const N: usize>(v: &[u8; N], s: S) -> Result<S::Ok, S::Error> {

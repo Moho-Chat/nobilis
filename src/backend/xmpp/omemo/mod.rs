@@ -1,6 +1,6 @@
-//! OMEMO (XEP-0384), in the form every client speaks: the older namespace `eu.siacs.conversations.axolotl`, which is the Signal
-//! protocol carried in XMPP. (The newer one, `urn:xmpp:omemo:2`, is a different protocol with a different wire form and is not
-//! built.)
+//! OMEMO (XEP-0384), in both namespaces: the older `eu.siacs.conversations.axolotl`, which is the Signal protocol carried in XMPP
+//! and the one every client speaks, and OMEMO 2 (`urn:xmpp:omemo:2`, `v2.rs`), a different wire form under the same identity. A
+//! device that publishes OMEMO 2 is written to in it; the rest in the older namespace, in the same message when a person has both.
 //!
 //! A message is encrypted once, under a random key, with AES-128-GCM; that key (and the GCM tag) is then encrypted separately
 //! to every device of every person it is for - each of the recipient's devices and each of this account's other devices - with
@@ -12,6 +12,7 @@
 pub mod curve;
 pub mod ratchet;
 pub mod store;
+pub mod v2;
 
 use super::session::Handle;
 use super::xml::Attr;
@@ -88,6 +89,8 @@ pub fn parse_bundle(b: &Element) -> Option<Bundle> {
 /// What decrypting a message told us beyond its text.
 pub struct Decrypted {
     pub text: Option<String>,
+    /// OMEMO 2: everything the message held (a body and whatever else was encrypted with it).
+    pub content: Vec<Element>,
     /// A pre-key was used up or a device is new: the bundle should be published again.
     pub republish: bool,
     pub seen: Seen,
@@ -107,6 +110,10 @@ pub enum Error {
     BadKey,
     #[error("the message cannot be decrypted")]
     Payload,
+    #[error(transparent)]
+    V2(#[from] v2::Error),
+    #[error("the message says it is from somebody other than who sent it")]
+    WrongSender,
 }
 
 pub struct Omemo {
@@ -220,7 +227,7 @@ impl Omemo {
         if blob.len() < 32 {
             return Err(Error::BadKey);
         }
-        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, republish, seen }) };
+        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), republish, seen }) };
         let (k, tag) = blob.split_at(16);
         let mut data = payload.clone();
         let ok = match env.iv.len() {
@@ -231,7 +238,83 @@ impl Omemo {
         if !ok {
             return Err(Error::Payload);
         }
-        Ok(Decrypted { text: Some(String::from_utf8_lossy(&data).to_string()), republish, seen })
+        Ok(Decrypted { text: Some(String::from_utf8_lossy(&data).to_string()), content: Vec::new(), republish, seen })
+    }
+
+    /// This device's OMEMO 2 bundle.
+    pub fn bundle_element_v2(&self) -> Element {
+        let s = self.store();
+        let identity = s.identity();
+        let signed = s.state.v2.signed_pre_key.as_ref().expect("a device has an OMEMO 2 signed pre-key");
+        let signature = curve::unhex(&signed.signature).unwrap_or_default();
+        v2::bundle_element(&v2::ed_public(&identity.private), signed.id, &signed.pair.public, &signature, s.state.v2.pre_keys.iter().map(|(id, p)| (*id, p.public)))
+    }
+
+    /// Encrypts a message's words to the given devices: an OMEMO 2 element for those that speak it, an element in the older
+    /// namespace for the rest. `own` is this account's bare address, which an OMEMO 2 message says it is from.
+    pub fn encrypt_all(&self, targets: &[Target], text: &str, own: &str) -> Result<Vec<Element>, Error> {
+        let mut out = Vec::new();
+        if targets.iter().any(|t| t.v2) {
+            let sce = v2::sce_envelope(vec![v2::body_element(text)], own);
+            let (cipher, material) = v2::encrypt_payload(&sce);
+            let mut store = self.store();
+            let mut keys = Vec::new();
+            for t in targets.iter().filter(|t| t.v2) {
+                if let Some(session) = store.state.v2.sessions.get_mut(&store::key(&t.jid, t.device)) {
+                    let (data, kex) = session.encrypt(&material);
+                    keys.push(v2::Key { jid: t.jid.clone(), rid: t.device, kex, data });
+                }
+            }
+            store.save();
+            out.push(v2::envelope_element(store.state.device_id, &keys, Some(&cipher)));
+        }
+        let old: Vec<(String, u32)> = targets.iter().filter(|t| !t.v2).map(|t| (t.jid.clone(), t.device)).collect();
+        if !old.is_empty() {
+            out.push(self.encrypt(&old, text.as_bytes())?);
+        }
+        Ok(out)
+    }
+
+    /// Reads an OMEMO 2 message from `from` (a bare address) to `own` (this account's).
+    pub fn decrypt_v2(&self, from: &str, own: &str, env: &v2::Envelope) -> Result<Decrypted, Error> {
+        let mut store = self.store();
+        let ours = store.state.device_id;
+        let key = env.keys.iter().find(|k| k.rid == ours && (k.jid.is_empty() || k.jid.eq_ignore_ascii_case(own))).ok_or(Error::NotForUs)?;
+        let session_key = store::key(from, env.sid);
+        let mut republish = false;
+        let mut seen = Seen::Known;
+        let material = if key.kex {
+            let (kex, inner) = v2::parse_key_exchange(&key.data)?;
+            // The same exchange again (the sender has had no answer yet): the session it started reads it.
+            match store.state.v2.sessions.get_mut(&session_key).filter(|s| s.started_by == Some(kex.ek)) {
+                Some(session) => session.decrypt(&inner)?,
+                None => {
+                    let identity = v2::ed_to_montgomery(&kex.ik).ok_or(v2::Error::Malformed)?;
+                    seen = store.see_identity(from, env.sid, &identity);
+                    let signed = store.state.v2.signed_pre_key.clone().filter(|s| s.id == kex.spk_id).ok_or(v2::Error::UnknownPreKey)?;
+                    let pk = curve::KeyPair::from(store.state.v2.pre_keys.get(&kex.pk_id).ok_or(v2::Error::UnknownPreKey)?);
+                    let (session, plain) = v2::Session::accept(&store.identity(), &curve::KeyPair::from(&signed.pair), &pk, &kex, &inner)?;
+                    store.state.v2.sessions.insert(session_key, session);
+                    store.state.v2.pre_keys.remove(&kex.pk_id);
+                    republish = store.top_up_v2();
+                    plain
+                }
+            }
+        } else {
+            let session = store.state.v2.sessions.get_mut(&session_key).ok_or(Error::NoSession)?;
+            session.decrypt(&key.data)?
+        };
+        store.save();
+        drop(store);
+        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), republish, seen }) };
+        let opened = v2::open_sce(&v2::decrypt_payload(payload, &material)?)?;
+        if let Some(said) = &opened.from {
+            let said = said.split('/').next().unwrap_or_default();
+            if !said.eq_ignore_ascii_case(from) {
+                return Err(Error::WrongSender);
+            }
+        }
+        Ok(Decrypted { text: v2::body_of(&opened.content), content: opened.content, republish, seen })
     }
 }
 
@@ -293,30 +376,60 @@ pub fn decrypt_file(fetched: &[u8], iv: &[u8], key: &[u8; 32]) -> Result<Vec<u8>
 
 // --- talking to the server ---------------------------------------------------------------------------------------------
 
-fn publish_options() -> Element {
+fn data_form(form_type: &str, fields: &[(&str, &str)]) -> Element {
     let mut x = Element::builder("x", ns::DATA).at("type", "submit").build();
-    for (var, value) in [("FORM_TYPE", "http://jabber.org/protocol/pubsub#publish-options"), ("pubsub#persist_items", "true"), ("pubsub#access_model", "open")] {
-        let mut f = Element::builder("field", ns::DATA).at("var", var).build();
-        f.append_child(Element::builder("value", ns::DATA).append(value).build());
+    for (var, value) in std::iter::once(&("FORM_TYPE", form_type)).chain(fields) {
+        let mut f = Element::builder("field", ns::DATA).at("var", *var).build();
+        f.append_child(Element::builder("value", ns::DATA).append(*value).build());
         x.append_child(f);
     }
-    Element::builder("publish-options", ns::PUBSUB).append(x).build()
+    x
+}
+
+/// Publishes an item with the options the node needs. A node made earlier with other options refuses (precondition-not-met, a
+/// conflict): it is configured and the item published again. A server that does not take an option it can live without
+/// (`max_items` = `max`) gets the publish without it.
+async fn publish_item(handle: &Handle, node: &str, id: &str, item: Element, options: &[(&str, &str)]) -> Result<(), String> {
+    let request = |fields: &[(&str, &str)]| {
+        let item = Element::builder("item", ns::PUBSUB).at("id", id).append(item.clone()).build();
+        let publish = Element::builder("publish", ns::PUBSUB).at("node", node).append(item).build();
+        let form = data_form("http://jabber.org/protocol/pubsub#publish-options", fields);
+        Element::builder("pubsub", ns::PUBSUB).append(publish).append(Element::builder("publish-options", ns::PUBSUB).append(form).build()).build()
+    };
+    let all: Vec<(&str, &str)> = [("pubsub#persist_items", "true"), ("pubsub#access_model", "open")].into_iter().chain(options.iter().copied()).collect();
+    let Err(e) = handle.request(None, true, request(&all)).await else { return Ok(()) };
+    if e.condition == "conflict" {
+        let configure = Element::builder("configure", super::nodes::OWNER).at("node", node).append(data_form("http://jabber.org/protocol/pubsub#node_config", &all)).build();
+        let _ = handle.request(None, true, Element::builder("pubsub", super::nodes::OWNER).append(configure).build()).await;
+        if handle.request(None, true, request(&all)).await.is_ok() {
+            return Ok(());
+        }
+    }
+    let without: Vec<(&str, &str)> = all.into_iter().filter(|(k, _)| *k != "pubsub#max_items").collect();
+    handle.request(None, true, request(&without)).await.map(|_| ()).map_err(|e| e.words())
 }
 
 async fn publish(handle: &Handle, node: &str, item: Element) -> Result<(), String> {
-    let item = Element::builder("item", ns::PUBSUB).at("id", "current").append(item).build();
-    let publish = Element::builder("publish", ns::PUBSUB).at("node", node).append(item).build();
-    let q = Element::builder("pubsub", ns::PUBSUB).append(publish).append(publish_options()).build();
-    handle.request(None, true, q).await.map(|_| ()).map_err(|e| e.words())
+    publish_item(handle, node, "current", item, &[]).await
 }
 
 async fn items(handle: &Handle, to: Option<Jid>, node: &str) -> Option<Element> {
-    let q = Element::builder("pubsub", ns::PUBSUB).append(Element::builder("items", ns::PUBSUB).at("node", node).build()).build();
-    let answer = handle.request(to, false, q).await.ok()??;
-    answer.children().find(|c| c.name() == "items").and_then(|i| i.children().find(|c| c.name() == "item").and_then(|item| item.children().next().cloned()))
+    item(handle, to, node, None).await
 }
 
-/// Makes this device known: in its owner's device list, with its bundle published. Done after signing in and when keys were used up.
+/// The payload of an item of a node: the one with `id`, or the first.
+async fn item(handle: &Handle, to: Option<Jid>, node: &str, id: Option<&str>) -> Option<Element> {
+    let mut items = Element::builder("items", ns::PUBSUB).at("node", node).build();
+    if let Some(id) = id {
+        items.append_child(Element::builder("item", ns::PUBSUB).at("id", id).build());
+    }
+    let q = Element::builder("pubsub", ns::PUBSUB).append(items).build();
+    let answer = handle.request(to, false, q).await.ok()??;
+    answer.children().find(|c| c.name() == "items").and_then(|i| i.children().find(|c| c.name() == "item" && id.is_none_or(|id| c.attr("id") == Some(id))).and_then(|item| item.children().next().cloned()))
+}
+
+/// Makes this device known under both namespaces: in its owner's device lists, with its bundles published. Done after signing
+/// in and when keys were used up.
 pub async fn publish_device(handle: &Handle, omemo: &Omemo) {
     let ours = omemo.device_id();
     let mut ids = match items(handle, None, DEVICELIST_NODE).await {
@@ -334,10 +447,27 @@ pub async fn publish_device(handle: &Handle, omemo: &Omemo) {
     if let Err(e) = publish(handle, &format!("{BUNDLES_NODE_PREFIX}{ours}"), omemo.bundle_element()).await {
         tracing::warn!("xmpp[{}]: OMEMO bundle: {e}", handle.account_id);
     }
+    // OMEMO 2: the bundle first, so a device in the list always has one.
+    if let Err(e) = publish_item(handle, v2::BUNDLES_NODE, &ours.to_string(), omemo.bundle_element_v2(), &[("pubsub#max_items", "max")]).await {
+        tracing::warn!("xmpp[{}]: OMEMO 2 bundle: {e}", handle.account_id);
+        return;
+    }
+    let mut ids2 = match items(handle, None, v2::DEVICES_NODE).await {
+        Some(list) => v2::parse_devices(&list),
+        None => Vec::new(),
+    };
+    if !ids2.contains(&ours) {
+        ids2.push(ours);
+        if let Err(e) = publish(handle, v2::DEVICES_NODE, v2::devices_element(&ids2)).await {
+            tracing::warn!("xmpp[{}]: OMEMO 2 device list: {e}", handle.account_id);
+            return;
+        }
+    }
+    omemo.store().state.v2.devices.insert(handle.own().to_string(), ids2);
 }
 
-/// The devices a person has: what is known, or what their device list says now.
-pub async fn devices_of(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: bool) -> Vec<u32> {
+/// The devices a person has under the older namespace: what is known, or what their device list says now.
+async fn devices_old(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: bool) -> Vec<u32> {
     if !refresh {
         if let Some(known) = omemo.store().state.devices.get(jid.as_str()) {
             return known.clone();
@@ -351,12 +481,81 @@ pub async fn devices_of(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: 
     list
 }
 
-/// Starts sessions with the devices of `jid` that have none, and returns the devices a message to them can be encrypted to.
-pub async fn usable_devices(handle: &Handle, omemo: &Omemo, jid: &BareJid, skip_own_device: bool) -> Vec<(String, u32)> {
+/// The devices a person lists under OMEMO 2.
+async fn devices_new(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: bool) -> Vec<u32> {
+    if !refresh {
+        if let Some(known) = omemo.store().state.v2.devices.get(jid.as_str()) {
+            return known.clone();
+        }
+    }
+    let list = match items(handle, Some(Jid::from(jid.clone())), v2::DEVICES_NODE).await {
+        Some(l) => v2::parse_devices(&l),
+        None => Vec::new(),
+    };
+    omemo.store().state.v2.devices.insert(jid.to_string(), list.clone());
+    list
+}
+
+/// Every device a person has, under either namespace.
+pub async fn devices_of(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: bool) -> Vec<u32> {
+    let mut all = devices_new(handle, omemo, jid, refresh).await;
+    for d in devices_old(handle, omemo, jid, refresh).await {
+        if !all.contains(&d) {
+            all.push(d);
+        }
+    }
+    all
+}
+
+/// Whether a device of a person speaks OMEMO 2 (it is in their OMEMO 2 device list).
+pub fn speaks_v2(omemo: &Omemo, jid: &str, device: u32) -> bool {
+    omemo.store().state.v2.devices.get(jid).is_some_and(|l| l.contains(&device))
+}
+
+/// A device a message can be encrypted to, and in which namespace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub jid: String,
+    pub device: u32,
+    pub v2: bool,
+}
+
+/// Starts sessions with the devices of `jid` that have none, and returns the devices a message to them can be encrypted to: in
+/// OMEMO 2 where the device publishes it, in the older namespace otherwise.
+pub async fn usable_devices(handle: &Handle, omemo: &Omemo, jid: &BareJid, skip_own_device: bool) -> Vec<Target> {
     let ours = omemo.device_id();
     let mut out = Vec::new();
-    for device in devices_of(handle, omemo, jid, true).await {
-        if skip_own_device && device == ours {
+    let own_list = *jid == handle.own();
+    for device in devices_new(handle, omemo, jid, true).await {
+        if own_list && skip_own_device && device == ours {
+            continue;
+        }
+        let key = store::key(jid.as_str(), device);
+        if !omemo.store().state.v2.sessions.contains_key(&key) {
+            let Some(bundle) = item(handle, Some(Jid::from(jid.clone())), v2::BUNDLES_NODE, Some(&device.to_string())).await.as_ref().and_then(v2::parse_bundle) else { continue };
+            let Some(identity) = v2::ed_to_montgomery(&bundle.ik) else { continue };
+            let mut store = omemo.store();
+            let seen = store.see_identity(jid.as_str(), device, &identity);
+            if seen == Seen::Changed || !store.trust_of(jid.as_str(), device).encrypts() {
+                continue;
+            }
+            match v2::Session::initiate(&store.identity(), &bundle) {
+                Ok(session) => {
+                    store.state.v2.sessions.insert(key.clone(), session);
+                    store.save();
+                }
+                Err(e) => {
+                    tracing::debug!("xmpp: no OMEMO 2 session with {jid}/{device}: {e}");
+                    continue;
+                }
+            }
+        }
+        if omemo.store().trust_of(jid.as_str(), device).encrypts() {
+            out.push(Target { jid: jid.to_string(), device, v2: true });
+        }
+    }
+    for device in devices_old(handle, omemo, jid, true).await {
+        if (own_list && skip_own_device && device == ours) || out.iter().any(|t| t.device == device) {
             continue;
         }
         let key = store::key(jid.as_str(), device);
@@ -381,7 +580,7 @@ pub async fn usable_devices(handle: &Handle, omemo: &Omemo, jid: &BareJid, skip_
             }
         }
         if omemo.store().trust_of(jid.as_str(), device).encrypts() {
-            out.push((jid.to_string(), device));
+            out.push(Target { jid: jid.to_string(), device, v2: false });
         }
     }
     out
@@ -506,5 +705,73 @@ mod tests {
         let mut env = parse_envelope(&sent).unwrap();
         env.payload = None;
         assert_eq!(bob.decrypt("alice@example.org", &env).unwrap().text, None);
+    }
+
+    fn session_v2(from: &Omemo, to: &Omemo, to_jid: &str) {
+        let bundle = v2::parse_bundle(&Element::from_str(&String::from(&to.bundle_element_v2())).unwrap()).unwrap();
+        let identity = from.store().identity();
+        let session = v2::Session::initiate(&identity, &bundle).unwrap();
+        from.store().state.v2.sessions.insert(store::key(to_jid, to.device_id()), session);
+    }
+
+    #[test]
+    fn omemo_2_goes_from_one_device_to_another_and_its_fingerprint_is_the_older_namespaces() {
+        let (alice, bob) = two();
+        session_v2(&alice, &bob, "bob@example.org");
+        let to_bob = vec![Target { jid: "bob@example.org".into(), device: bob.device_id(), v2: true }];
+        let sent = alice.encrypt_all(&to_bob, "a <secret> & more", "alice@example.org").unwrap();
+        assert_eq!(sent.len(), 1, "nothing in the older namespace when every device speaks OMEMO 2");
+        let env = v2::parse_envelope(&Element::from_str(&String::from(&sent[0])).unwrap()).unwrap();
+        assert!(env.keys[0].kex);
+        let done = bob.decrypt_v2("alice@example.org", "bob@example.org", &env).unwrap();
+        assert_eq!(done.text.as_deref(), Some("a <secret> & more"));
+        assert_eq!(done.seen, Seen::New);
+        let shown = bob.store().state.identities.get(&store::key("alice@example.org", alice.device_id())).cloned();
+        assert_eq!(shown, Some(curve::hex(&alice.store().identity().public)), "one device, one fingerprint, whichever namespace");
+        // Alice has had no answer: the exchange comes again, and the session it started reads it.
+        let again = alice.encrypt_all(&to_bob, "again", "alice@example.org").unwrap();
+        let env = v2::parse_envelope(&again[0]).unwrap();
+        assert!(env.keys[0].kex);
+        assert_eq!(bob.decrypt_v2("alice@example.org", "bob@example.org", &env).unwrap().text.as_deref(), Some("again"));
+        // Bob answers; from then on Alice's messages are ordinary ones.
+        let to_alice = vec![Target { jid: "alice@example.org".into(), device: alice.device_id(), v2: true }];
+        let reply = bob.encrypt_all(&to_alice, "hello", "bob@example.org").unwrap();
+        let env = v2::parse_envelope(&reply[0]).unwrap();
+        assert!(!env.keys[0].kex);
+        assert_eq!(alice.decrypt_v2("bob@example.org", "alice@example.org", &env).unwrap().text.as_deref(), Some("hello"));
+        let third = alice.encrypt_all(&to_bob, "three", "alice@example.org").unwrap();
+        let env = v2::parse_envelope(&third[0]).unwrap();
+        assert!(!env.keys[0].kex);
+        assert_eq!(bob.decrypt_v2("alice@example.org", "bob@example.org", &env).unwrap().text.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn an_omemo_2_message_that_says_it_is_from_somebody_else_is_not_read() {
+        let (alice, bob) = two();
+        session_v2(&alice, &bob, "bob@example.org");
+        let to_bob = vec![Target { jid: "bob@example.org".into(), device: bob.device_id(), v2: true }];
+        let sent = alice.encrypt_all(&to_bob, "it is me, carol", "carol@example.org").unwrap();
+        let env = v2::parse_envelope(&sent[0]).unwrap();
+        assert!(matches!(bob.decrypt_v2("alice@example.org", "bob@example.org", &env), Err(Error::WrongSender)));
+    }
+
+    #[test]
+    fn devices_that_speak_only_the_older_namespace_get_it_in_the_same_message() {
+        let (alice, bob) = two();
+        let carol = Omemo::open(None);
+        session_v2(&alice, &bob, "bob@example.org");
+        let carol_bundle = parse_bundle(&carol.bundle_element()).unwrap();
+        let identity = alice.store().identity();
+        let registration = alice.device_id();
+        let session = Session::initiate(&identity, registration, &carol_bundle).unwrap();
+        alice.store().state.sessions.insert(store::key("carol@example.org", carol.device_id()), session);
+        let targets = vec![
+            Target { jid: "bob@example.org".into(), device: bob.device_id(), v2: true },
+            Target { jid: "carol@example.org".into(), device: carol.device_id(), v2: false },
+        ];
+        let sent = alice.encrypt_all(&targets, "to you both", "alice@example.org").unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(bob.decrypt_v2("alice@example.org", "bob@example.org", &v2::parse_envelope(&sent[0]).unwrap()).unwrap().text.as_deref(), Some("to you both"));
+        assert_eq!(carol.decrypt("alice@example.org", &parse_envelope(&sent[1]).unwrap()).unwrap().text.as_deref(), Some("to you both"));
     }
 }

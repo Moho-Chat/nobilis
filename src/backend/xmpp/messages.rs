@@ -361,11 +361,23 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
 /// An OMEMO message becomes the message it holds. One that cannot be read says so and why, rather than showing nothing or the
 /// words every client puts in for clients that cannot read it.
 async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mut Parsed) {
-    let Some(envelope) = p.omemo.clone() else { return };
+    if p.omemo.is_none() && p.omemo2.is_none() {
+        return;
+    }
     let omemo = handle.session().omemo.clone();
+    let own = handle.own().to_string();
     let result = match &omemo {
         Some(o) => match &conv.real_jid {
-            Some(jid) => o.decrypt(jid, &envelope),
+            // OMEMO 2 first when the message has a key for this device in it; the older namespace otherwise.
+            Some(jid) => match (&p.omemo2, &p.omemo) {
+                (Some(new), Some(old)) => match o.decrypt_v2(jid, &own, new) {
+                    Err(super::omemo::Error::NotForUs) => o.decrypt(jid, old),
+                    other => other,
+                },
+                (Some(new), None) => o.decrypt_v2(jid, &own, new),
+                (None, Some(old)) => o.decrypt(jid, old),
+                (None, None) => unreachable!("checked above"),
+            },
             None => Err(super::omemo::Error::NoRealJid),
         },
         None => Err(super::omemo::Error::NoSession),
@@ -378,6 +390,7 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
                 // A key sent to set a session up: there is nothing to show.
                 None => p.body = None,
             }
+            incoming::read_encrypted_content(p, &done.content);
             state.runtime.set_buffer_encrypted(state, &conv.buffer.id, true);
             if done.seen == super::omemo::store::Seen::Changed {
                 state.runtime.record_message_at(state, &handle.account_id, &conv.buffer.name, conv.kind, "*", &format!("The encryption key of a device of {} changed. Messages to it are held until you decide whether to trust it", conv.key), false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
@@ -395,6 +408,7 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
                 super::omemo::Error::NotForUs => "it was not encrypted for this device".to_string(),
                 super::omemo::Error::NoSession => "there is no session with the device that sent it yet".to_string(),
                 super::omemo::Error::NoRealJid => "this room does not show who sent it".to_string(),
+                super::omemo::Error::WrongSender => "it says it is from somebody other than who sent it".to_string(),
                 other => other.to_string(),
             };
             p.body = Some(format!("This message is encrypted with OMEMO and could not be read here: {why}"));

@@ -107,9 +107,12 @@ async fn encrypt_for(handle: &Handle, jid: &BareJid, plaintext: &str, room: bool
         }
     }
     targets.extend(super::omemo::usable_devices(handle, &omemo, &handle.own(), true).await);
-    let encrypted = omemo.encrypt(&targets, plaintext.as_bytes()).map_err(|e| e.to_string())?;
-    let note = Element::builder("encryption", ns::EME).at("namespace", super::omemo::NS).at("name", "OMEMO").build();
-    Ok(vec![encrypted, note, xml::empty("store", ns::HINTS)])
+    let mut out = omemo.encrypt_all(&targets, plaintext, handle.own().as_str()).map_err(|e| e.to_string())?;
+    // The note names the namespace most of the recipients read; a client that reads either finds its own element.
+    let namespace = if targets.iter().all(|t| t.v2) { super::omemo::v2::NS } else { super::omemo::NS };
+    out.push(Element::builder("encryption", ns::EME).at("namespace", namespace).at("name", "OMEMO").build());
+    out.push(xml::empty("store", ns::HINTS));
+    Ok(out)
 }
 
 /// Sends a message.

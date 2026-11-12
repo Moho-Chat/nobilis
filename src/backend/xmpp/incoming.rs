@@ -86,6 +86,8 @@ pub struct Parsed {
     pub encrypted: Option<String>,
     /// An OMEMO message, to be decrypted.
     pub omemo: Option<super::omemo::Envelope>,
+    /// An OMEMO 2 message, to be decrypted.
+    pub omemo2: Option<super::omemo::v2::Envelope>,
     /// The message carries a body that is only there for clients that cannot show what it points at.
     pub styling_disabled: bool,
     /// Who the message names (XEP-0372 references of type `mention`): the `xmpp:` URIs.
@@ -182,6 +184,20 @@ pub fn parse(message: &Message) -> Parsed {
         read_payload(&mut p, e);
     }
     p
+}
+
+/// What an OMEMO 2 message held (XEP-0420): its body, and the elements that came encrypted with it, read as if they had come in
+/// the clear. Encryption inside encryption, and what only the outer message can say, are not taken from inside.
+pub fn read_encrypted_content(p: &mut Parsed, content: &[Element]) {
+    if let Some(body) = super::omemo::v2::body_of(content) {
+        p.body = Some(body);
+    }
+    for e in content {
+        if e.name() == "body" || matches!((e.name(), e.ns().as_str()), ("encrypted", _) | ("encryption", ns::EME)) {
+            continue;
+        }
+        read_payload(p, e);
+    }
 }
 
 fn read_payload(p: &mut Parsed, e: &Element) {
@@ -293,7 +309,12 @@ fn read_payload(p: &mut Parsed, e: &Element) {
                 p.encrypted = Some("OMEMO".to_string());
             }
         }
-        ("encrypted", "urn:xmpp:omemo:2") if p.encrypted.is_none() => p.encrypted = Some("OMEMO 2".to_string()),
+        ("encrypted", super::omemo::v2::NS) => {
+            p.omemo2 = super::omemo::v2::parse_envelope(e);
+            if p.encrypted.is_none() {
+                p.encrypted = Some("OMEMO".to_string());
+            }
+        }
         _ => {}
     }
 }

@@ -55,6 +55,21 @@ pub struct State {
     pub devices: BTreeMap<String, Vec<u32>>,
     /// Conversations (by address) that are encrypted.
     pub enabled: BTreeSet<String>,
+    /// OMEMO 2's own keys and sessions (the identity and the device id are the ones above).
+    #[serde(default)]
+    pub v2: V2State,
+}
+
+/// What OMEMO 2 keeps beside the older namespace's state.
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct V2State {
+    pub signed_pre_key: Option<SignedPreKey>,
+    pub pre_keys: BTreeMap<u32, Pair>,
+    pub next_pre_key_id: u32,
+    /// Sessions, by `jid/device`.
+    pub sessions: BTreeMap<String, super::v2::Session>,
+    /// The devices each person lists under OMEMO 2.
+    pub devices: BTreeMap<String, Vec<u32>>,
 }
 
 pub struct Store {
@@ -73,6 +88,11 @@ impl Store {
         let mut store = Store { path, state: state.unwrap_or_default() };
         if store.state.identity.is_none() {
             store.make_device();
+        }
+        if store.state.v2.signed_pre_key.is_none() {
+            store.new_signed_pre_key_v2();
+            store.top_up_v2();
+            store.save();
         }
         store
     }
@@ -100,6 +120,30 @@ impl Store {
         let id = self.state.signed_pre_key.as_ref().map(|s| s.id + 1).unwrap_or(1);
         let signature = curve::sign(&identity.private, &pair.public_serialized());
         self.state.signed_pre_key = Some(SignedPreKey { id, pair: (&pair).into(), signature: curve::hex(&signature) });
+    }
+
+    /// OMEMO 2's signed pre-key: an Ed25519 signature, by the identity key, over the bare 32 bytes.
+    pub fn new_signed_pre_key_v2(&mut self) {
+        let identity = self.identity();
+        let pair = KeyPair::generate();
+        let id = self.state.v2.signed_pre_key.as_ref().map(|s| s.id + 1).unwrap_or(1);
+        let signature = super::v2::ed_sign(&identity.private, &pair.public);
+        self.state.v2.signed_pre_key = Some(SignedPreKey { id, pair: (&pair).into(), signature: curve::hex(&signature) });
+    }
+
+    /// OMEMO 2's one-time pre-keys, made until there are enough. Returns whether it made any.
+    pub fn top_up_v2(&mut self) -> bool {
+        let mut made = false;
+        if self.state.v2.next_pre_key_id == 0 {
+            self.state.v2.next_pre_key_id = 1;
+        }
+        while (self.state.v2.pre_keys.len() as u32) < PRE_KEYS {
+            let id = self.state.v2.next_pre_key_id;
+            self.state.v2.next_pre_key_id += 1;
+            self.state.v2.pre_keys.insert(id, (&KeyPair::generate()).into());
+            made = true;
+        }
+        made
     }
 
     /// Makes one-time pre-keys until there are enough. Returns whether it made any.
@@ -143,6 +187,7 @@ impl Store {
                 self.state.identities.insert(k.clone(), hex);
                 self.state.trust.insert(k.clone(), Trust::Untrusted);
                 self.state.sessions.remove(&k);
+                self.state.v2.sessions.remove(&k);
                 self.save();
                 Seen::Changed
             }
@@ -220,6 +265,15 @@ mod tests {
         let again = Store::open(Some(path));
         assert_eq!((again.state.device_id, again.identity().public), (id, s.identity().public));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn omemo_2_has_its_own_signed_pre_key_under_the_same_identity() {
+        let s = Store::open(None);
+        let signed = s.state.v2.signed_pre_key.as_ref().unwrap();
+        let sig: [u8; 64] = curve::unhex(&signed.signature).unwrap().try_into().unwrap();
+        assert!(super::super::v2::ed_verify(&super::super::v2::ed_public(&s.identity().private), &signed.pair.public, &sig));
+        assert_eq!(s.state.v2.pre_keys.len() as u32, PRE_KEYS);
     }
 
     #[test]
