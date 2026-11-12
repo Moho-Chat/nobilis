@@ -492,11 +492,15 @@ pub fn publish_occupants(state: &AppState, handle: &Handle, room: &BareJid) {
         r.occupants
             .iter()
             .map(|(nick, o)| {
+                // The room's own words, highest standing first: a lasting
+                // affiliation outranks the role of this visit. A participant -
+                // the ordinary occupant with voice - is given nothing, and a
+                // visitor is somebody the room will not let speak.
                 let prefix = match (o.affiliation.as_str(), o.role.as_str()) {
-                    ("owner", _) => "~",
-                    ("admin", _) => "&",
-                    (_, "moderator") => "@",
-                    (_, "participant") => "+",
+                    ("owner", _) => "owner",
+                    ("admin", _) => "admin",
+                    (_, "moderator") => "moderator",
+                    (_, "visitor") => "visitor",
                     _ => "",
                 };
                 let status = roster::status_word(&o.show);
