@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn the_nodes_clients_keep_are_named_and_moho_s_own_are_marked() {
         assert_eq!(describe("urn:xmpp:bookmarks:1"), ("Your rooms (bookmarks)", true));
-        assert_eq!(describe("eu.siacs.conversations.axolotl.bundles:12345").1, true);
+        assert!(describe("eu.siacs.conversations.axolotl.bundles:12345").1);
         assert_eq!(describe("http://jabber.org/protocol/tune"), ("What you are listening to", false));
         assert_eq!(describe("something.else"), ("", false));
     }
