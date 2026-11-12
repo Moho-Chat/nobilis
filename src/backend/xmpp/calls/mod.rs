@@ -168,13 +168,23 @@ pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, eve
                 return Err("an offer with nothing in it".into());
             }
             let media = media_kinds(&offer);
-            let mut call = Call::new(&buffer.id, peer.clone(), None, true, Phase::Proposed);
+            let direct = direct_device(handle, &peer).await;
+            let mut call = Call::new(&buffer.id, peer.clone(), direct.clone(), true, if direct.is_some() { Phase::Initiated } else { Phase::Proposed });
             call.mids = offer.media.iter().map(|m| m.mid.clone()).collect();
             call.creds = offer.media.iter().map(|m| (m.mid.clone(), m.ufrag.clone(), m.pwd.clone())).collect();
             call.local = Some(offer.clone());
-            call.offer = Some(offer);
-            handle.session().calls.insert(sid.clone(), call);
-            handle.send_message(jmi_message(Jid::from(peer), "propose", &sid, &media)).await;
+            match direct {
+                // A device that takes Jingle calls but not the message exchange (an older client): the session goes to it.
+                Some(full) => {
+                    handle.session().calls.insert(sid.clone(), call);
+                    send_jingle(state, handle, &sid, full, session_initiate(handle, &sid, &offer), true).await;
+                }
+                None => {
+                    call.offer = Some(offer);
+                    handle.session().calls.insert(sid.clone(), call);
+                    handle.send_message(jmi_message(Jid::from(peer), "propose", &sid, &media)).await;
+                }
+            }
             Ok(())
         }
         "m.call.proceed" => {
@@ -254,6 +264,34 @@ pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, eve
         "m.call.negotiate" => negotiate(state, handle, &sid, content).await,
         _ => Ok(()),
     }
+}
+
+fn session_initiate(handle: &Handle, sid: &str, offer: &Sdp) -> Element {
+    let mut j = Element::builder("jingle", jingle::JINGLE).at("action", "session-initiate").at("sid", sid).at("initiator", handle.bound.to_string()).build();
+    for g in jingle::groups(offer) {
+        j.append_child(g);
+    }
+    for c in jingle::contents(offer, "initiator", true) {
+        j.append_child(c);
+    }
+    j
+}
+
+/// The device to send a call's session to directly: when none of the person's online devices speaks Jingle Message Initiation
+/// but one takes Jingle calls (older clients, which ring on the session itself). `None` to propose, as every newer client expects.
+async fn direct_device(handle: &Handle, peer: &BareJid) -> Option<Jid> {
+    let resources: Vec<String> = handle.session().presence.get(peer).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    let asks = resources.into_iter().filter_map(|r| peer.with_resource_str(&r).ok()).map(|full| async move {
+        let q = xml::empty("query", super::ns::DISCO_INFO);
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(4), handle.request(Some(Jid::from(full.clone())), false, q)).await.ok()?.ok()??;
+        let features: Vec<String> = answer.children().filter(|c| c.name() == "feature").filter_map(|f| f.attr("var").map(str::to_string)).collect();
+        Some((full, features))
+    });
+    let found: Vec<_> = futures::future::join_all(asks).await.into_iter().flatten().collect();
+    if found.is_empty() || found.iter().any(|(_, f)| f.iter().any(|x| x == JMI)) {
+        return None;
+    }
+    found.into_iter().find(|(_, f)| f.iter().any(|x| x == jingle::RTP)).map(|(j, _)| Jid::from(j))
 }
 
 /// Who made a section: the initiator unless it was added later by the other end.
@@ -471,13 +509,7 @@ pub fn message(state: &AppState, handle: &Handle, message: &Message, carbon: Opt
                 (call.offer.take(), call.buffer_id.clone())
             };
             let Some(offer) = offer else { return true };
-            let mut j = Element::builder("jingle", jingle::JINGLE).at("action", "session-initiate").at("sid", sid.as_str()).at("initiator", handle.bound.to_string()).build();
-            for g in jingle::groups(&offer) {
-                j.append_child(g);
-            }
-            for c in jingle::contents(&offer, "initiator", true) {
-                j.append_child(c);
-            }
+            let j = session_initiate(handle, &sid, &offer);
             let (state, handle, queued) = (state.clone(), handle.clone(), std::mem::take(&mut handle.session().calls.get_mut(&sid).map(|c| std::mem::take(&mut c.queued)).unwrap_or_default()));
             let _ = buffer_id;
             tokio::spawn(async move {
