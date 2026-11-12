@@ -43,6 +43,8 @@ const WAKE_TICK: Duration = Duration::from_secs(5);
 const WAKE_DRIFT: Duration = Duration::from_secs(10);
 /// How long a connection has, after a wake, to answer a ping before it is taken for dead.
 const WAKE_PING: Duration = Duration::from_secs(10);
+/// How often the account asks its rooms whether it is still in them (XEP-0410).
+const ROOM_CHECK: Duration = Duration::from_secs(15 * 60);
 
 /// Why an account stopped trying.
 #[derive(Debug, PartialEq, Clone)]
@@ -396,9 +398,18 @@ async fn run(state: &AppState, account_id: &str) {
     // and a connection that was up before is asked at once whether it still is - rather than in the 45 seconds the timers
     // above would take.
     let mut wake_tick = tokio::time::interval(WAKE_TICK);
+    // Every so often, and after a wake: is the account still in its rooms (XEP-0410)?
+    let mut room_check = tokio::time::interval(ROOM_CHECK);
+    room_check.tick().await;
     let mut last_tick = (std::time::Instant::now(), std::time::SystemTime::now());
     loop {
         tokio::select! {
+            _ = room_check.tick() => {
+                if let Some(handle) = current.clone() {
+                    let state = state.clone();
+                    tokio::spawn(async move { super::muc::self_ping_all(&state, &handle).await });
+                }
+            }
             _ = wake_tick.tick() => {
                 let (mono, wall) = (std::time::Instant::now(), std::time::SystemTime::now());
                 let slept = wall.duration_since(last_tick.1).unwrap_or_default().saturating_sub(mono.duration_since(last_tick.0));
@@ -408,6 +419,7 @@ async fn run(state: &AppState, account_id: &str) {
                         tracing::info!("xmpp[{account_id}]: the computer slept for {} s; checking the connection", slept.as_secs());
                         let observed = observed.clone();
                         let account_id = account_id.to_string();
+                        let state = state.clone();
                         tokio::spawn(async move {
                             let domain = handle.own().domain().as_str().parse::<Jid>().ok();
                             let ping = handle.request(domain, false, super::xml::empty("ping", "urn:xmpp:ping"));
@@ -420,6 +432,9 @@ async fn run(state: &AppState, account_id: &str) {
                             if !alive {
                                 tracing::info!("xmpp[{account_id}]: the connection did not survive the sleep; reconnecting");
                                 super::wire::cut(&observed);
+                            } else {
+                                // The connection held; the rooms may not have.
+                                super::muc::self_ping_all(&state, &handle).await;
                             }
                         });
                     }
@@ -473,7 +488,12 @@ async fn run(state: &AppState, account_id: &str) {
                     }
                     Event::Stream(StreamEvent::Resumed) => {
                         tracing::info!("xmpp[{account_id}]: the session was resumed, nothing lost");
-                        state.runtime.set_conn_state(state, account_id, ConnState::Connected, None)
+                        state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
+                        // Rooms may have let the account go while it was away, without a word (XEP-0410).
+                        if let Some(handle) = current.clone() {
+                            let state = state.clone();
+                            tokio::spawn(async move { super::muc::self_ping_all(&state, &handle).await });
+                        }
                     }
                     Event::Stanza(stanza) => {
                         if let Some(handle) = &current {

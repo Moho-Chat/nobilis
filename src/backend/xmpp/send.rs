@@ -171,7 +171,8 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     handle.session().sent.insert(id.clone());
     let own = handle.own().to_string();
     let kind = if in_room(buffer) { "channel" } else { "dm" };
-    state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, kind, &own, body, false, "chat", preview, Some(id), false, None, Vec::new(), Vec::new(), Some(own.clone()), None, None, None);
+    let (is_action, shown) = super::messages::action(body);
+    state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, kind, &own, &shown, is_action, "chat", preview, Some(id), false, None, Vec::new(), Vec::new(), Some(own.clone()), None, None, None);
     handle.send_message(m).await;
     Ok(())
 }

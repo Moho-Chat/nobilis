@@ -253,6 +253,39 @@ pub async fn join(state: &AppState, handle: &Handle, room: &BareJid, nick: Optio
     Ok(())
 }
 
+/// MUC self-ping (XEP-0410): is the account still in its rooms? A room can drop somebody silently (it restarted; the server
+/// lost the link to it while the connection was resumed). Each joined room is asked by pinging the account's own occupant
+/// address; one that answers the account is not there (`not-acceptable`) is rejoined. Answers that say nothing of it (the room
+/// does not answer pings for its occupants, or is not reachable for now) change nothing.
+pub async fn self_ping_all(state: &AppState, handle: &Handle) {
+    let rooms: Vec<(BareJid, String)> = handle.session().rooms.iter().filter(|(_, r)| r.joined && !r.nick.is_empty()).map(|(j, r)| (j.clone(), r.nick.clone())).collect();
+    tracing::debug!("xmpp[{}]: self-ping of {} rooms (of {})", handle.account_id, rooms.len(), handle.session().rooms.len());
+    for (room, nick) in rooms {
+        let Ok(me) = format!("{room}/{nick}").parse::<Jid>() else { continue };
+        let answer = handle.request(Some(me), false, super::xml::empty("ping", "urn:xmpp:ping")).await;
+        tracing::debug!("xmpp[{}]: self-ping of {room}: {:?}", handle.account_id, answer.as_ref().map(|_| ()).map_err(|f| &f.condition));
+        if let Some(why) = still_there(&answer) {
+            tracing::info!("xmpp[{}]: no longer in {room} ({why}); joining again", handle.account_id);
+            if let Some(r) = handle.session().rooms.get_mut(&room) {
+                r.joined = false;
+            }
+            let _ = join(state, handle, &room, Some(&nick), None).await;
+        }
+    }
+}
+
+/// Whether a self-ping's answer says the account has left the room: `Some(why)` when it should rejoin.
+pub fn still_there(answer: &Result<Option<Element>, super::session::Failure>) -> Option<String> {
+    match answer {
+        Ok(_) => None,
+        Err(f) => {
+            let c = f.condition.to_ascii_lowercase().replace(['-', '_'], "");
+            // not-acceptable: not an occupant. item-not-found: the nickname is not there (some rooms say this).
+            (c == "notacceptable" || c == "itemnotfound").then(|| f.condition.clone())
+        }
+    }
+}
+
 /// Leaves a room. The conversation stays, with what was said in it.
 pub async fn leave(state: &AppState, handle: &Handle, room: &BareJid) {
     let nick = handle.session().rooms.get(room).map(|r| r.nick.clone()).unwrap_or_default();
@@ -349,6 +382,21 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
             if let Some(r) = handle.session().rooms.get_mut(&room) {
                 r.joined = false;
                 r.occupants.clear();
+            }
+            // A room whose service is restarting (332) is gone for a moment, not for good: it is joined again when the service
+            // is back - tried a few times, a little longer apart each time. A kick or a ban is not undone this way.
+            if codes.contains(&332) {
+                let (s, h, r, n) = (state.clone(), handle.clone(), room.clone(), nick.clone());
+                tokio::spawn(async move {
+                    for wait in [5u64, 15, 30, 60] {
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        if h.session().rooms.get(&r).is_none_or(|x| x.joined) {
+                            return;
+                        }
+                        tracing::info!("xmpp[{}]: joining {r} again after its service restarted", h.account_id);
+                        let _ = join(&s, &h, &r, Some(&n), None).await;
+                    }
+                });
             }
             state.runtime.set_buffer_read_only(state, &buffer.id, Some(&words));
             card(state, handle, &buffer, if codes.contains(&307) || codes.contains(&301) { "kick" } else { "part" }, &words);
@@ -772,6 +820,18 @@ mod tests {
 #[cfg(test)]
 mod card_tests {
     use super::*;
+
+    #[test]
+    fn a_self_ping_rejoins_only_when_the_room_says_the_account_is_gone() {
+        use super::super::session::Failure;
+        let f = |c: &str| Err(Failure { condition: c.into(), text: String::new() });
+        assert!(still_there(&Ok(None)).is_none());
+        assert!(still_there(&f("NotAcceptable")).is_some());
+        assert!(still_there(&f("ItemNotFound")).is_some());
+        assert!(still_there(&f("ServiceUnavailable")).is_none(), "a room that does not answer pings: still there");
+        assert!(still_there(&f("FeatureNotImplemented")).is_none());
+        assert!(still_there(&f("remote-server-timeout")).is_none(), "cannot tell: nothing done");
+    }
 
     #[test]
     fn a_change_of_standing_is_said_in_words() {

@@ -336,7 +336,8 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
     // What a server or a component says (an address with no user part: an announcement, a gateway's notice) is a card, not
     // somebody speaking.
     let line_kind = if conv.kind == "dm" && !conv.is_own && !conv.key.contains('@') { "system" } else { "chat" };
-    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, line_kind, reply, Some(local.clone()), conv.mentioned, None, embeds, attachments, Some(conv.sender_id.clone()), sent_at, None, None);
+    let (is_action, text) = action(&text);
+    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, is_action, line_kind, reply, Some(local.clone()), conv.mentioned, None, embeds, attachments, Some(conv.sender_id.clone()), sent_at, None, None);
     if replay {
         state.runtime.set_replaying(&buffer.id, false);
     }
@@ -599,5 +600,24 @@ mod link_card_tests {
         assert!(store_data_image("data:image/svg+xml;base64,PHN2Zy8+").is_none(), "an SVG is not a picture here");
         assert!(store_data_image("data:image/png,notbase64").is_none());
         assert!(store_data_image("https://example.org/x.png").is_none());
+    }
+}
+
+/// XEP-0245: a body that begins `/me ` is an action ("* pat waves"), drawn as one; the words are what follows it.
+pub fn action(text: &str) -> (bool, String) {
+    match text.strip_prefix("/me ") {
+        Some(rest) if !rest.trim().is_empty() => (true, rest.to_string()),
+        _ => (false, text.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    #[test]
+    fn a_me_line_is_an_action() {
+        assert_eq!(super::action("/me waves"), (true, "waves".to_string()));
+        assert_eq!(super::action("/meh"), (false, "/meh".to_string()));
+        assert_eq!(super::action("say /me waves"), (false, "say /me waves".to_string()));
+        assert_eq!(super::action("/me "), (false, "/me ".to_string()));
     }
 }
