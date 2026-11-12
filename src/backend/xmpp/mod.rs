@@ -29,6 +29,7 @@ pub mod dataform;
 pub mod dispatch;
 pub mod incoming;
 pub mod init;
+pub mod invites;
 pub mod login;
 pub mod iq;
 pub mod mam;

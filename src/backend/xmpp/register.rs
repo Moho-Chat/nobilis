@@ -76,7 +76,7 @@ pub fn submission(form: &Form, answers: &serde_json::Value) -> Element {
 }
 
 /// Opens a stream to the server and asks one thing of it.
-async fn ask(settings: Settings, domain: &str, set: bool, payload: Element) -> Result<Element, String> {
+async fn ask(settings: Settings, domain: &str, set: bool, payload: Element, preauth: &str) -> Result<Element, String> {
     let seen: SeenSlot = Default::default();
     let connector = Connector::new(settings, &seen).map_err(|e| format!("{e:#}"))?;
     let jid: Jid = domain.parse().map_err(|_| format!("{domain:?} is not a server address"))?;
@@ -89,10 +89,26 @@ async fn ask(settings: Settings, domain: &str, set: bool, payload: Element) -> R
         }
     })?;
     let (_features, mut stream): (_, XmppStream<_>) = pending.recv_features().await.map_err(|e| format!("{e}"))?;
+    // An invitation's token is said first, on its own and on this same stream (XEP-0401 4.2): the server then lets this
+    // registration in, and links the new account to whoever invited it.
+    if !preauth.is_empty() {
+        let id = xml::new_id();
+        let said = Element::builder("preauth", "urn:xmpp:pars:0").at("token", preauth).build();
+        stream.send(&XmppStreamElement::Stanza(Stanza::Iq(Iq::Set { from: None, to: None, id: id.clone(), payload: said }))).await.map_err(|e| format!("{e}"))?;
+        answer(&mut stream, &id).await.map_err(|e| format!("The invitation was not accepted ({e}): it may have been used or have run out"))?;
+    }
     let id = xml::new_id();
     let iq = if set { Iq::Set { from: None, to: None, id: id.clone(), payload } } else { Iq::Get { from: None, to: None, id: id.clone(), payload } };
     stream.send(&XmppStreamElement::Stanza(Stanza::Iq(iq))).await.map_err(|e| format!("{e}"))?;
-    let outcome = loop {
+    let outcome = answer(&mut stream, &id).await;
+    // The connection is dropped, which ends it; a clean close is not needed for a stream that did one thing.
+    drop(stream);
+    outcome
+}
+
+/// The answer to the request `id`, over a stream that does nothing else.
+async fn answer<S: tokio::io::AsyncBufRead + tokio::io::AsyncWrite + Unpin>(stream: &mut XmppStream<S>, id: &str) -> Result<Element, String> {
+    loop {
         match tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await {
             Err(_) => break Err("The server did not answer".to_string()),
             Ok(None) | Ok(Some(Err(_))) => break Err("The connection ended".to_string()),
@@ -103,10 +119,7 @@ async fn ask(settings: Settings, domain: &str, set: bool, payload: Element) -> R
                 Err(_) => break Err("The connection ended".to_string()),
             },
         }
-    };
-    // The connection is dropped, which ends it; a clean close is not needed for a stream that did one thing.
-    drop(stream);
-    outcome
+    }
 }
 
 fn refusal(error: &tokio_xmpp::parsers::stanza_error::StanzaError) -> String {
@@ -127,23 +140,16 @@ fn refusal(error: &tokio_xmpp::parsers::stanza_error::StanzaError) -> String {
     }
 }
 
-/// An invitation's token (XEP-0401), put in the request so the server knows who let this registration in.
-fn with_preauth(mut query: Element, token: &str) -> Element {
-    if !token.is_empty() {
-        query.append_child(Element::builder("preauth", "urn:xmpp:pars:0").at("token", token).build());
-    }
-    query
-}
-
-/// What the server needs to make an account.
+/// What the server needs to make an account (with an invitation's token, what it needs of somebody invited).
 pub async fn form(settings: Settings, domain: &str, preauth: &str) -> Result<Registration, String> {
-    let query = ask(settings, domain, false, with_preauth(xml::empty("query", REGISTER), preauth)).await?;
+    let query = ask(settings, domain, false, xml::empty("query", REGISTER), preauth).await?;
     read_query(&query)
 }
 
-/// Sends the answers. `Ok` when the server made the account.
+/// Sends the answers. `Ok` when the server made the account. The token, if there is one, is said again on this stream: the
+/// form and the answers are asked on connections of their own.
 pub async fn submit(settings: Settings, domain: &str, form: &Form, answers: &serde_json::Value, preauth: &str) -> Result<(), String> {
-    ask(settings, domain, true, with_preauth(submission(form, answers), preauth)).await.map(|_| ())
+    ask(settings, domain, true, submission(form, answers), preauth).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -186,13 +192,6 @@ mod tests {
         let w = Element::from_str("<query xmlns='jabber:iq:register'><instructions>Use the page</instructions><x xmlns='jabber:x:oob'><url>https://example.org/signup</url></x></query>").unwrap();
         let r = read_query(&w).unwrap();
         assert_eq!((r.form.is_none(), r.web.as_deref()), (true, Some("https://example.org/signup")));
-    }
-
-    #[test]
-    fn an_invitations_token_rides_in_the_request_and_nothing_is_added_without_one() {
-        let with = with_preauth(xml::empty("query", REGISTER), "abc");
-        assert_eq!(with.children().find(|c| c.name() == "preauth").and_then(|p| p.attr("token")), Some("abc"));
-        assert_eq!(with_preauth(xml::empty("query", REGISTER), "").children().count(), 0);
     }
 
     #[test]

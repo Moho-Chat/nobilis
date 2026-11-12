@@ -5237,7 +5237,7 @@ pub async fn dispatch(
                 return (Some(serde_json::json!({ "bufferId": buffer.id })), None);
             }
             let result = match method {
-                "xmppAddContact" => backend::xmpp::roster::add_contact(&handle, &jid, name, p_str_opt(params, "group").map(str::trim).filter(|g| !g.is_empty())).await,
+                "xmppAddContact" => backend::xmpp::roster::add_contact(&handle, &jid, name, p_str_opt(params, "group").map(str::trim).filter(|g| !g.is_empty()), p_str_opt(params, "preauth").map(str::trim)).await,
                 "xmppRemoveContact" => backend::xmpp::roster::remove_contact(&handle, &jid).await,
                 "xmppSetContact" => {
                     let groups = params.get("groups").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|g| g.as_str().map(str::to_string)).collect::<Vec<_>>());
@@ -5272,6 +5272,19 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused, "details": details, "pinned": pinned, "changed": changed })), None)
                 }
                 None => (Some(serde_json::json!({})), None),
+            }
+        }
+
+        // Invitations (XEP-0401): which kinds the account's server makes, and one made.
+        "xmppInviteKinds" | "xmppCreateInvite" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppInviteKinds" {
+                return (Some(serde_json::json!({ "kinds": backend::xmpp::invites::offered(&handle).await })), None);
+            }
+            match backend::xmpp::invites::create(&handle, p_str(params, "kind", "contact")).await {
+                Ok(invite) => (Some(serde_json::to_value(invite).unwrap_or_default()), None),
+                Err(e) => (None, Some(e)),
             }
         }
 
@@ -5470,6 +5483,24 @@ pub async fn dispatch(
                 Ok(config) => {
                     let account_id = config.account_id();
                     backend::xmpp::spawn(state.clone(), config);
+                    // An invitation that named who sent it (`xmpp:them?roster;preauth=…`): the new account asks them, with the
+                    // same token, as soon as it is in - which is what links the two on a server that does not do it itself.
+                    let inviter = p_str(params, "inviter", "").trim().to_string();
+                    let preauth = p_str(params, "preauth", "").trim().to_string();
+                    if let (Ok(inviter), false) = (backend::xmpp::connect::normalise_jid(&inviter), preauth.is_empty()) {
+                        let (state, id) = (state.clone(), account_id.clone());
+                        tokio::spawn(async move {
+                            for _ in 0..120 {
+                                if let Some(handle) = state.runtime.xmpp_handle(&id) {
+                                    if let Err(e) = backend::xmpp::roster::add_contact(&handle, &inviter, None, None, Some(&preauth)).await {
+                                        tracing::info!("xmpp[{id}]: adding {inviter}, who sent the invitation: {e}");
+                                    }
+                                    return;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        });
+                    }
                     (Some(serde_json::json!({ "registered": true, "accountId": account_id })), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),

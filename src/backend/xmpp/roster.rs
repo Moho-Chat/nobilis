@@ -235,9 +235,14 @@ pub fn announce_requests(state: &AppState, handle: &Handle) {
 }
 
 /// Asks to see somebody's presence, putting them on the roster if they are not there. `name` and `group` are ours.
-pub async fn add_contact(handle: &Handle, jid: &BareJid, name: Option<&str>, group: Option<&str>) -> Result<(), String> {
+/// `preauth`: the token of an invitation they gave (XEP-0379), so their server approves the request without asking them.
+pub async fn add_contact(handle: &Handle, jid: &BareJid, name: Option<&str>, group: Option<&str>, preauth: Option<&str>) -> Result<(), String> {
     set_item(handle, jid, name, group.map(|g| vec![g.to_string()])).await?;
-    handle.send_presence(Presence::new(PresenceType::Subscribe).with_to(Jid::from(jid.clone()))).await;
+    let mut p = Presence::new(PresenceType::Subscribe).with_to(Jid::from(jid.clone()));
+    if let Some(token) = preauth.filter(|t| !t.is_empty()) {
+        p.payloads.push(Element::builder("preauth", super::invites::PARS).attr(tokio_xmpp::minidom::rxml::NcName::try_from("token".to_string()).expect("a name"), token).build());
+    }
+    handle.send_presence(p).await;
     Ok(())
 }
 
