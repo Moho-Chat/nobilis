@@ -35,6 +35,8 @@ const CLIENT: &str = "jabber:client";
 /// How many message keys may be skipped in one go, and kept, per session (the reference implementation's numbers).
 const MAX_SKIP: u32 = 1000;
 const MAC_LENGTH: usize = 16;
+/// How long a receiving chain may grow before this side answers with a heartbeat (XEP-0384's number).
+const STALE: u32 = 53;
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -313,6 +315,10 @@ pub struct Session {
     /// The other device's identity key (Ed25519).
     #[serde(with = "hexarr")]
     pub their_identity: [u8; 32],
+    /// More than 53 messages were read on the other side's current ratchet key without this side sending anything: an empty
+    /// message (a heartbeat) moves the ratchet on, as the reference implementation does.
+    #[serde(skip)]
+    pub heartbeat_due: bool,
 }
 
 mod opt_hex {
@@ -378,6 +384,7 @@ impl Session {
             pending: Some(KeyExchange { pk_id, spk_id: bundle.spk_id, ik: own_ik, ek: public_of(&ek) }),
             started_by: None,
             their_identity: bundle.ik,
+            heartbeat_due: false,
         };
         s.send = s.root_step();
         Ok(s)
@@ -409,6 +416,7 @@ impl Session {
             pending: None,
             started_by: Some(kex.ek),
             their_identity: kex.ik,
+            heartbeat_due: false,
         };
         s.recv = Some(s.root_step());
         s.own_ratchet = random32();
@@ -430,6 +438,12 @@ impl Session {
             Some(kex) => (key_exchange_bytes(kex, &out), true),
             None => (out, false),
         }
+    }
+
+    /// An empty message's key material: 32 zero bytes, encrypted with the session itself (it carries no payload; it moves the
+    /// session on, or completes it).
+    pub fn empty(&mut self) -> (Vec<u8>, bool) {
+        self.encrypt(&[0u8; 32])
     }
 
     /// Decrypts an `OMEMOAuthenticatedMessage`. Nothing changes unless it was genuine.
@@ -454,6 +468,7 @@ impl Session {
         next.skipped.drain(..excess);
         // An answer: the other side has the session, so the exchange need not be sent again.
         next.pending = None;
+        next.heartbeat_due = next.recv.as_ref().is_some_and(|r| r.n > STALE);
         *self = next;
         Ok(plain)
     }
@@ -696,6 +711,28 @@ mod tests {
         let before = b.clone();
         assert!(b.decrypt(&forged).is_err());
         assert_eq!(b, before);
+    }
+
+    #[test]
+    fn many_messages_unanswered_ask_for_a_heartbeat_and_one_answer_resets_the_count() {
+        let (alice, bob) = (device(), device());
+        let mut a = Session::initiate(&alice.identity, &bundle(&bob)).unwrap();
+        let (first, _) = a.encrypt(b"0");
+        let (kx, inner) = parse_key_exchange(&first).unwrap();
+        let (mut b, _) = Session::accept(&bob.identity, &bob.spk, &bob.pk, &kx, &inner).unwrap();
+        let (answer, kex) = b.empty();
+        assert!(!kex);
+        assert_eq!(a.decrypt(&answer).unwrap(), [0u8; 32]);
+        for i in 1..=STALE {
+            b.decrypt(&a.encrypt(format!("{i}").as_bytes()).0).unwrap();
+            assert!(!b.heartbeat_due, "{i}");
+        }
+        b.decrypt(&a.encrypt(b"one too many").0).unwrap();
+        assert!(b.heartbeat_due);
+        let (beat, _) = b.empty();
+        a.decrypt(&beat).unwrap();
+        b.decrypt(&a.encrypt(b"after").0).unwrap();
+        assert!(!b.heartbeat_due, "the heartbeat moved the ratchet on: a new chain");
     }
 
     #[test]

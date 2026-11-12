@@ -5650,7 +5650,7 @@ pub async fn dispatch(
 
         // OMEMO: a conversation encrypted or not, and who is trusted. A fingerprint is the identity key a device showed; trusting
         // one is the person's call after comparing it with the other person.
-        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" => {
+        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" | "xmppOmemoReset" => {
             let (account_id, buffer) = match method {
                 "xmppSetEncryption" => {
                     let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && (b.kind == "dm" || b.kind == "channel")) else {
@@ -5718,6 +5718,14 @@ pub async fn dispatch(
                     let store = omemo.store();
                     let own = backend::xmpp::omemo::curve::hex(&store.identity().public);
                     (Some(serde_json::json!({ "deviceId": store.state.device_id, "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&own), "devices": out })), None)
+                }
+                // A broken session is replaced by hand (XEP-0384: never on its own): every session with the person's devices.
+                "xmppOmemoReset" => {
+                    let Some(Ok(jid)) = p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) else { return (None, Some("xmppOmemoReset requires \"jid\"".to_string())) };
+                    match backend::xmpp::send::omemo_reset(&handle, &jid).await {
+                        Ok(n) => (Some(serde_json::json!({ "devices": n })), None),
+                        Err(e) => (None, Some(e)),
+                    }
                 }
                 _ => {
                     let (Some(jid), Some(device), Some(trust)) = (p_str_opt(params, "jid"), params.get("device").and_then(|v| v.as_u64()), p_str_opt(params, "trust")) else {

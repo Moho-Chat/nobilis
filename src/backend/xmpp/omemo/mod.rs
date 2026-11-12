@@ -91,6 +91,9 @@ pub struct Decrypted {
     pub text: Option<String>,
     /// OMEMO 2: everything the message held (a body and whatever else was encrypted with it).
     pub content: Vec<Element>,
+    /// The sending device should be sent an empty message: it started a session that this one accepted (the empty message
+    /// completes it), or it has sent many without hearing back. The device, and whether it is OMEMO 2.
+    pub answer: Option<(u32, bool)>,
     /// A pre-key was used up or a device is new: the bundle should be published again.
     pub republish: bool,
     pub seen: Seen,
@@ -197,6 +200,7 @@ impl Omemo {
         let session_key = store::key(from, env.sid);
         let mut republish = false;
         let mut seen = Seen::Known;
+        let answer = key.prekey.then_some((env.sid, false));
         let blob = if key.prekey {
             let message = ratchet::parse_pre_key(&key.data)?;
             let identity = curve::parse_public(message.identity_key.as_deref().unwrap_or_default()).ok_or(SessionError::Malformed)?;
@@ -227,7 +231,7 @@ impl Omemo {
         if blob.len() < 32 {
             return Err(Error::BadKey);
         }
-        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), republish, seen }) };
+        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), answer, republish, seen }) };
         let (k, tag) = blob.split_at(16);
         let mut data = payload.clone();
         let ok = match env.iv.len() {
@@ -238,7 +242,7 @@ impl Omemo {
         if !ok {
             return Err(Error::Payload);
         }
-        Ok(Decrypted { text: Some(String::from_utf8_lossy(&data).to_string()), content: Vec::new(), republish, seen })
+        Ok(Decrypted { text: Some(String::from_utf8_lossy(&data).to_string()), content: Vec::new(), answer, republish, seen })
     }
 
     /// This device's OMEMO 2 bundle.
@@ -275,6 +279,48 @@ impl Omemo {
         Ok(out)
     }
 
+    /// An empty message to one device (key transport): no payload, only a key, which completes a session, moves a stale one on,
+    /// or starts one. `None` without a session with the device.
+    pub fn empty_message(&self, jid: &str, device: u32, v2: bool) -> Option<Element> {
+        use rand::RngCore;
+        let mut store = self.store();
+        let ours = store.state.device_id;
+        let k = store::key(jid, device);
+        let element = if v2 {
+            let (data, kex) = store.state.v2.sessions.get_mut(&k)?.empty();
+            v2::envelope_element(ours, &[v2::Key { jid: jid.to_string(), rid: device, kex, data }], None)
+        } else {
+            let session = store.state.sessions.get_mut(&k)?;
+            let prekey = session.pending.is_some();
+            let mut blob = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut blob);
+            let mut key = Element::builder("key", NS).at("rid", device.to_string());
+            if prekey {
+                key = key.at("prekey", "true");
+            }
+            let key = key.append(b64().encode(session.encrypt(&blob))).build();
+            let mut iv = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut iv);
+            let header = Element::builder("header", NS).at("sid", ours.to_string()).append(key).append(Element::builder("iv", NS).append(b64().encode(iv)).build()).build();
+            Element::builder("encrypted", NS).append(header).build()
+        };
+        store.save();
+        Some(element)
+    }
+
+    /// Forgets every session with a person's devices, in both namespaces (a broken session is replaced by hand, never on its own:
+    /// XEP-0384). Returns how many there were.
+    pub fn reset_sessions(&self, jid: &str) -> usize {
+        let mut store = self.store();
+        let prefix = format!("{jid}/");
+        let before = store.state.sessions.len() + store.state.v2.sessions.len();
+        store.state.sessions.retain(|k, _| !k.starts_with(&prefix));
+        store.state.v2.sessions.retain(|k, _| !k.starts_with(&prefix));
+        let gone = before - store.state.sessions.len() - store.state.v2.sessions.len();
+        store.save();
+        gone
+    }
+
     /// Reads an OMEMO 2 message from `from` (a bare address) to `own` (this account's).
     pub fn decrypt_v2(&self, from: &str, own: &str, env: &v2::Envelope) -> Result<Decrypted, Error> {
         let mut store = self.store();
@@ -283,6 +329,7 @@ impl Omemo {
         let session_key = store::key(from, env.sid);
         let mut republish = false;
         let mut seen = Seen::Known;
+        let mut answer = None;
         let material = if key.kex {
             let (kex, inner) = v2::parse_key_exchange(&key.data)?;
             // The same exchange again (the sender has had no answer yet): the session it started reads it.
@@ -294,8 +341,9 @@ impl Omemo {
                     let signed = store.state.v2.signed_pre_key.clone().filter(|s| s.id == kex.spk_id).ok_or(v2::Error::UnknownPreKey)?;
                     let pk = curve::KeyPair::from(store.state.v2.pre_keys.get(&kex.pk_id).ok_or(v2::Error::UnknownPreKey)?);
                     let (session, plain) = v2::Session::accept(&store.identity(), &curve::KeyPair::from(&signed.pair), &pk, &kex, &inner)?;
-                    store.state.v2.sessions.insert(session_key, session);
+                    store.state.v2.sessions.insert(session_key.clone(), session);
                     store.state.v2.pre_keys.remove(&kex.pk_id);
+                    answer = Some((env.sid, true));
                     republish = store.top_up_v2();
                     plain
                 }
@@ -304,9 +352,12 @@ impl Omemo {
             let session = store.state.v2.sessions.get_mut(&session_key).ok_or(Error::NoSession)?;
             session.decrypt(&key.data)?
         };
+        if store.state.v2.sessions.get(&session_key).is_some_and(|s| s.heartbeat_due) {
+            answer = Some((env.sid, true));
+        }
         store.save();
         drop(store);
-        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), republish, seen }) };
+        let Some(payload) = &env.payload else { return Ok(Decrypted { text: None, content: Vec::new(), answer, republish, seen }) };
         let opened = v2::open_sce(&v2::decrypt_payload(payload, &material)?)?;
         if let Some(said) = &opened.from {
             let said = said.split('/').next().unwrap_or_default();
@@ -314,7 +365,7 @@ impl Omemo {
                 return Err(Error::WrongSender);
             }
         }
-        Ok(Decrypted { text: v2::body_of(&opened.content), content: opened.content, republish, seen })
+        Ok(Decrypted { text: v2::body_of(&opened.content), content: opened.content, answer, republish, seen })
     }
 }
 
@@ -773,5 +824,33 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(bob.decrypt_v2("alice@example.org", "bob@example.org", &v2::parse_envelope(&sent[0]).unwrap()).unwrap().text.as_deref(), Some("to you both"));
         assert_eq!(carol.decrypt("alice@example.org", &parse_envelope(&sent[1]).unwrap()).unwrap().text.as_deref(), Some("to you both"));
+    }
+
+    #[test]
+    fn an_accepted_session_is_answered_with_an_empty_message_which_completes_it() {
+        let (alice, bob) = two();
+        session_v2(&alice, &bob, "bob@example.org");
+        let to_bob = vec![Target { jid: "bob@example.org".into(), device: bob.device_id(), v2: true }];
+        let sent = alice.encrypt_all(&to_bob, "hi", "alice@example.org").unwrap();
+        let done = bob.decrypt_v2("alice@example.org", "bob@example.org", &v2::parse_envelope(&sent[0]).unwrap()).unwrap();
+        assert_eq!(done.answer, Some((alice.device_id(), true)));
+        let empty = bob.empty_message("alice@example.org", alice.device_id(), true).unwrap();
+        let env = v2::parse_envelope(&empty).unwrap();
+        assert!(env.payload.is_none() && !env.keys[0].kex);
+        let read = alice.decrypt_v2("bob@example.org", "alice@example.org", &env).unwrap();
+        assert_eq!((read.text, read.answer), (None, None), "an empty message is not answered");
+        let next = alice.encrypt_all(&to_bob, "now an ordinary message", "alice@example.org").unwrap();
+        assert!(!v2::parse_envelope(&next[0]).unwrap().keys[0].kex);
+        // The older namespace the same way.
+        let carol = Omemo::open(None);
+        let carol_bundle = parse_bundle(&carol.bundle_element()).unwrap();
+        let identity = alice.store().identity();
+        let session = Session::initiate(&identity, alice.device_id(), &carol_bundle).unwrap();
+        alice.store().state.sessions.insert(store::key("carol@example.org", carol.device_id()), session);
+        let first = alice.empty_message("carol@example.org", carol.device_id(), false).unwrap();
+        let got = carol.decrypt("alice@example.org", &parse_envelope(&first).unwrap()).unwrap();
+        assert_eq!((got.text, got.answer), (None, Some((alice.device_id(), false))));
+        assert_eq!(alice.reset_sessions("carol@example.org"), 1);
+        assert_eq!(alice.reset_sessions("bob@example.org"), 1);
     }
 }

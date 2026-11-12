@@ -115,6 +115,34 @@ async fn encrypt_for(handle: &Handle, jid: &BareJid, plaintext: &str, room: bool
     Ok(out)
 }
 
+/// Sends one device an empty OMEMO message (key transport): it completes a session that device started, moves a stale one on,
+/// or starts a new one. Nothing is shown anywhere; `false` when there is no session with the device.
+pub async fn omemo_empty(handle: &Handle, jid: &BareJid, device: u32, v2: bool) -> bool {
+    let Some(omemo) = handle.session().omemo.clone() else { return false };
+    let Some(encrypted) = omemo.empty_message(jid.as_str(), device, v2) else { return false };
+    let mut m = Message::chat(Jid::from(jid.clone()));
+    m.id = Some(Id(xml::new_id()));
+    m.payloads.push(encrypted);
+    m.payloads.push(xml::empty("store", ns::HINTS));
+    handle.send_message(m).await;
+    true
+}
+
+/// Replaces every session with a person's devices: the old ones are forgotten, new ones made from their bundles, and each device
+/// sent an empty message so it has the new session before anything is said on it. Returns how many devices were reached.
+pub async fn omemo_reset(handle: &Handle, jid: &BareJid) -> Result<usize, String> {
+    let omemo = handle.session().omemo.clone().ok_or("OMEMO is not ready on this account yet")?;
+    omemo.reset_sessions(jid.as_str());
+    let skip_own = *jid == handle.own();
+    let mut reached = 0;
+    for t in super::omemo::usable_devices(handle, &omemo, jid, skip_own).await {
+        if omemo_empty(handle, jid, t.device, t.v2).await {
+            reached += 1;
+        }
+    }
+    Ok(reached)
+}
+
 /// Sends a message.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<String>) -> Result<(), String> {
     let (handle, jid) = target(state, buffer)?;

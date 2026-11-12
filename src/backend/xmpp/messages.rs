@@ -391,6 +391,12 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
                 None => p.body = None,
             }
             incoming::read_encrypted_content(p, &done.content);
+            if let (Some((device, v2)), Some(jid)) = (done.answer, conv.real_jid.as_deref().and_then(|j| j.parse::<BareJid>().ok())) {
+                let h = handle.clone();
+                tokio::spawn(async move {
+                    super::send::omemo_empty(&h, &jid, device, v2).await;
+                });
+            }
             state.runtime.set_buffer_encrypted(state, &conv.buffer.id, true);
             if done.seen == super::omemo::store::Seen::Changed {
                 state.runtime.record_message_at(state, &handle.account_id, &conv.buffer.name, conv.kind, "*", &format!("The encryption key of a device of {} changed. Messages to it are held until you decide whether to trust it", conv.key), false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
