@@ -5275,6 +5275,42 @@ pub async fn dispatch(
             }
         }
 
+        // What the account publishes (PEP nodes): listed, who may read each changed, emptied, deleted.
+        "xmppNodes" | "xmppNodeAccess" | "xmppNodeRemove" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let node = p_str(params, "node", "").to_string();
+            let result = match method {
+                "xmppNodes" => backend::xmpp::nodes::list(&handle).await.map(|n| serde_json::json!({ "nodes": n })),
+                "xmppNodeAccess" => backend::xmpp::nodes::set_access(&handle, &node, p_str(params, "access", "presence")).await.map(|_| serde_json::json!({})),
+                _ => backend::xmpp::nodes::remove(&handle, &node, p_bool(params, "delete", false)).await.map(|_| serde_json::json!({})),
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Privacy lists (XEP-0016): read, written whole, and chosen as default or active.
+        "xmppPrivacyLists" | "xmppPrivacyRules" | "xmppSetPrivacyList" | "xmppChoosePrivacyList" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let name = p_str(params, "name", "").to_string();
+            let result = match method {
+                "xmppPrivacyLists" => backend::xmpp::privacy::lists(&handle).await.map(|l| serde_json::to_value(l).unwrap_or_default()),
+                "xmppPrivacyRules" => backend::xmpp::privacy::rules(&handle, &name).await.map(|r| serde_json::json!({ "rules": r.iter().map(|x| serde_json::json!({ "rule": x, "words": backend::xmpp::privacy::words(x) })).collect::<Vec<_>>() })),
+                "xmppSetPrivacyList" => match serde_json::from_value::<Vec<backend::xmpp::privacy::Rule>>(params.get("rules").cloned().unwrap_or_default()) {
+                    Ok(rules) => backend::xmpp::privacy::set(&handle, &name, &rules).await.map(|_| serde_json::json!({})),
+                    Err(e) => Err(format!("the rules are not readable: {e}")),
+                },
+                _ => backend::xmpp::privacy::choose(&handle, p_str(params, "which", "default"), &name).await.map(|_| serde_json::json!({})),
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Invitations (XEP-0401): which kinds the account's server makes, and one made.
         "xmppInviteKinds" | "xmppCreateInvite" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
