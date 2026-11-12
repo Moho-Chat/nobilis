@@ -7361,6 +7361,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("xmpp:") {
+                return match state.runtime.xmpp_handle(&buffer.account_id) {
+                    Some(handle) => (Some(backend::xmpp::calls::muji::members(&handle, &buffer.id)), None),
+                    None => (Some(serde_json::json!([])), None),
+                };
+            }
             let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
                 return (Some(serde_json::json!([])), None);
             };
@@ -8061,6 +8067,18 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            // XMPP: the conversation's group call (XEP-0272), joined or left; see `backend/xmpp/calls/muji.rs`.
+            if buffer.account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                if !joined {
+                    backend::xmpp::calls::muji::leave(state, &handle, &buffer.id).await;
+                    return (Some(ok_node()), None);
+                }
+                return match backend::xmpp::calls::muji::join(state, &handle, &buffer).await {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(account) = state.accounts.get_matrix(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
@@ -8177,6 +8195,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("xmpp:") {
+                return match state.runtime.xmpp_handle(&buffer.account_id) {
+                    Some(handle) => (Some(backend::xmpp::calls::muji::members(&handle, &buffer.id)), None),
+                    None => (Some(serde_json::json!([])), None),
+                };
+            }
             let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
                 return (Some(serde_json::json!([])), None);
             };

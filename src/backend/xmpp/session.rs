@@ -107,6 +107,12 @@ pub struct Session {
     pub inactive: bool,
     /// Calls in progress or being offered, by session id.
     pub calls: HashMap<String, super::calls::Call>,
+    /// The group call this account is in (XEP-0272).
+    pub muji: Option<super::calls::muji::Muji>,
+    /// Group calls somebody rang this account into, by the conversation they came in.
+    pub call_invites: HashMap<String, super::calls::muji::Invite>,
+    /// The legs of the group call, by session id: the conference and the other participant's key, which the window's signals carry.
+    pub call_groups: HashMap<String, (String, String)>,
     /// What each contact publishes about themselves (nickname, mood, activity, tune, location), as it was last sent.
     pub published: HashMap<BareJid, super::pep::Published>,
     /// Files on their way from one device to another (XEP-0234), by Jingle session id.

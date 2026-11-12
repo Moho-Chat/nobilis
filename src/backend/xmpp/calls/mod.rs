@@ -13,6 +13,7 @@
 //! comes next and is answered in the ordinary way.
 
 pub mod jingle;
+pub mod muji;
 pub mod renegotiate;
 pub mod sdp;
 
@@ -89,6 +90,12 @@ fn emit(state: &AppState, handle: &Handle, buffer_id: &str, kind: &str, sid: &st
     content["call_id"] = json!(sid);
     content["party_id"] = json!(party);
     content["version"] = json!("1");
+    // A leg of a group call names the conference and both ends, as the window's mesh does.
+    if let Some((conf, theirs)) = handle.session().call_groups.get(sid).cloned() {
+        content["conf_id"] = json!(conf);
+        content["party_id"] = json!(theirs);
+        content["dest_session_id"] = json!(format!("{}|{}", handle.own(), handle.bound.resource().map(|r| r.to_string()).unwrap_or_default()));
+    }
     state.events.emit("matrixCall", json!({ "accountId": handle.account_id, "bufferId": buffer_id, "kind": kind, "callId": sid, "from": from, "own": own, "partyId": party, "content": content }));
 }
 
@@ -158,9 +165,30 @@ fn jingle_el(action: &str, sid: &str) -> Element {
 pub async fn from_window(state: &AppState, handle: &Handle, buffer: &Buffer, event_type: &str, content: &Value) -> Result<(), String> {
     let sid = content["call_id"].as_str().filter(|s| !s.is_empty()).ok_or("a call event with no call id")?.to_string();
     match event_type {
+        // A leg of a group call: a session straight to that participant, naming the call's room.
+        "m.call.invite" if content.get("conf_id").is_some_and(|c| c.is_string()) => {
+            let full = content["dest_session_id"].as_str().and_then(muji::parse_member_key).ok_or("a group call leg for nobody")?;
+            let conf = content["conf_id"].as_str().unwrap_or_default().to_string();
+            let room = muji::room_element(handle).ok_or("not in a group call")?;
+            let offer = sdp::parse(content["offer"]["sdp"].as_str().ok_or("an invitation with no offer")?);
+            let to = Jid::from(full.clone());
+            let mut call = Call::new(&buffer.id, full.to_bare(), Some(to.clone()), true, Phase::Initiated);
+            call.mids = offer.media.iter().map(|m| m.mid.clone()).collect();
+            call.creds = offer.media.iter().map(|m| (m.mid.clone(), m.ufrag.clone(), m.pwd.clone())).collect();
+            call.local = Some(offer.clone());
+            {
+                let mut s = handle.session();
+                s.calls.insert(sid.clone(), call);
+                s.call_groups.insert(sid.clone(), (conf, muji::member_key(&full)));
+            }
+            let mut j = session_initiate(handle, &sid, &offer);
+            j.append_child(room);
+            send_jingle(state, handle, &sid, to, j, true).await;
+            Ok(())
+        }
         "m.call.invite" => {
             if buffer.kind != "dm" {
-                return Err("calls on XMPP are between two people".into());
+                return Err("calls on XMPP are between two people, or a group call joined from the room".into());
             }
             let peer: BareJid = buffer.remote_id.as_deref().and_then(|j| j.parse().ok()).ok_or("this is not a conversation with a person")?;
             let offer = sdp::parse(content["offer"]["sdp"].as_str().ok_or("an invitation with no offer")?);
@@ -464,6 +492,9 @@ fn release(state: &AppState, handle: &Handle, sid: &str, buffer_id: &str, from: 
 /// Call messages (XEP-0353). Returns whether the message was one. `carbon` is `Some(true)` for a copy of what another of this
 /// account's devices sent.
 pub fn message(state: &AppState, handle: &Handle, message: &Message, carbon: Option<bool>) -> bool {
+    if carbon.is_none() && muji::message(state, handle, message) {
+        return true;
+    }
     let Some(e) = message.payloads.iter().find(|p| p.ns() == JMI) else { return false };
     let Some(sid) = e.attr("id").map(str::to_string) else { return true };
     let Some(from) = message.from.clone() else { return true };
@@ -545,6 +576,27 @@ pub async fn jingle_iq(state: &AppState, handle: &Handle, from: Option<Jid>, id:
     let Some(from) = from else { return };
     let peer = from.to_bare();
     let unknown = || Some((DefinedCondition::ItemNotFound, Some(xml::empty("unknown-session", UNKNOWN_SESSION))));
+    // A leg of the group call this account is in, from a participant (who need not be a contact).
+    let group_leg = child(j, "muji", muji::MUJI).and_then(|m| m.attr("room")).is_some_and(|room| muji::participant(handle, room, &from));
+    if action == "session-initiate" && group_leg {
+        let offer = jingle::to_sdp(j, true);
+        let (buffer_id, conf) = match handle.session().muji.as_ref() {
+            Some(m) => (m.buffer_id.clone(), m.conf_id()),
+            None => return,
+        };
+        let Ok(full) = tokio_xmpp::jid::FullJid::try_from(from.clone()) else { return };
+        handle.send(reply(handle, Some(from.clone()), id, None)).await;
+        {
+            let mut s = handle.session();
+            let mut c = Call::new(&buffer_id, peer.clone(), Some(from.clone()), false, Phase::Initiated);
+            c.mids = offer.media.iter().map(|m| m.mid.clone()).collect();
+            c.remote = Some(offer.clone());
+            s.calls.insert(sid.clone(), c);
+            s.call_groups.insert(sid.clone(), (conf, muji::member_key(&full)));
+        }
+        emit(state, handle, &buffer_id, "m.call.invite", &sid, (peer.as_str(), false, &from.to_string()), json!({ "offer": { "type": "offer", "sdp": sdp::write(&offer) }, "lifetime": 60000 }));
+        return;
+    }
     if action == "session-initiate" {
         if !known(handle, &peer) || peer == handle.own() {
             tracing::debug!("xmpp[{}]: a call from {from}, who is not a contact", handle.account_id);
