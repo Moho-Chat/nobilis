@@ -5275,6 +5275,21 @@ pub async fn dispatch(
             }
         }
 
+        // A room's picture (XEP-0486), set by an owner: a file, or "" to take it off.
+        "xmppSetRoomAvatar" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else { return (None, Some("xmppSetRoomAvatar requires a known \"bufferId\"".to_string())) };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(room) = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok()).filter(|_| buffer.kind == "channel") else { return (None, Some("that is not a room".to_string())) };
+            match backend::xmpp::avatars::set_room(&handle, &room, p_str(params, "path", "")).await {
+                Ok(()) => {
+                    // Shown at once rather than when the room says (some do not say).
+                    backend::xmpp::muc::refresh_avatar(state, &handle, &room).await;
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // The account's own profile (its vCard and nickname), as it can be edited, and the edit.
         "xmppGetProfile" | "xmppSetProfile" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };

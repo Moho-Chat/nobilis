@@ -66,7 +66,7 @@ fn encrypting(handle: &Handle, jid: &BareJid) -> bool {
 /// Who an encrypted message to a room is for: everybody in it whose address it shows, and its members who are not there. Only a room
 /// that shows addresses works: OMEMO needs to know whose devices to write to.
 pub async fn room_recipients(handle: &Handle, room: &BareJid) -> Result<Vec<BareJid>, String> {
-    super::muc::refresh(handle, room).await;
+    super::muc::refresh_features(handle, room).await;
     let (hidden, mut people): (bool, Vec<BareJid>) = {
         let s = handle.session();
         match s.rooms.get(room) {

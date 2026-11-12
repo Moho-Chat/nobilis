@@ -137,30 +137,48 @@ fn card(state: &AppState, handle: &Handle, buffer: &Buffer, kind: &str, text: &s
 // --- joining -------------------------------------------------------------------------------------------------------
 
 /// What a room says about itself: its name and what it supports.
-async fn disco(handle: &Handle, room: &BareJid) -> (Option<String>, HashSet<String>) {
+async fn disco(handle: &Handle, room: &BareJid) -> (Option<String>, HashSet<String>, Option<String>) {
     let to = Jid::from(room.clone());
     match handle.request(Some(to), false, Element::builder("query", ns::DISCO_INFO).build()).await {
         Ok(Some(q)) => {
             let name = q.children().find(|c| c.name() == "identity" && c.attr("category") == Some("conference")).and_then(|c| c.attr("name").map(str::to_string));
             let features = q.children().filter(|c| c.name() == "feature").filter_map(|c| c.attr("var").map(str::to_string)).collect();
-            (name, features)
+            (name, features, avatar_hash(&q))
         }
-        _ => (None, HashSet::new()),
+        _ => (None, HashSet::new(), None),
     }
 }
 
-/// Asks the room again what it supports and how it is set up: its settings change, and so does what it shows.
-pub async fn refresh(handle: &Handle, room: &BareJid) {
-    let (name, features) = disco(handle, room).await;
+/// The room's picture, as its disco#info gives it (XEP-0486: `muc#roominfo_avatarhash`, the SHA-1 of the picture in its vCard).
+pub fn avatar_hash(info: &Element) -> Option<String> {
+    info.children()
+        .filter(|c| c.is("x", ns::DATA))
+        .flat_map(|x| x.children())
+        .find(|f| f.name() == "field" && f.attr("var") == Some("muc#roominfo_avatarhash"))
+        .and_then(|f| f.children().find(|v| v.name() == "value"))
+        .map(|v| v.text().trim().to_string())
+        .filter(|h| !h.is_empty())
+}
+
+/// Asks the room again what it supports and how it is set up (not its picture: see [`refresh`]).
+pub async fn refresh_features(handle: &Handle, room: &BareJid) {
+    let (name, features, _) = disco(handle, room).await;
     if let Some(r) = handle.session().rooms.get_mut(room) {
         r.features = features;
         r.name = name.or(r.name.take());
     }
 }
 
+/// Asks the room again for its picture (XEP-0486), after it said its configuration changed. Only the picture: the name the
+/// room's conversation goes by is not changed under it.
+pub async fn refresh_avatar(state: &AppState, handle: &Handle, room: &BareJid) {
+    let (_, _, avatar) = disco(handle, room).await;
+    super::avatars::room(state, handle, room, avatar.as_deref()).await;
+}
+
 /// Joins a room (or rejoins it). The answer is the room's presences, handled as they arrive.
 pub async fn join(state: &AppState, handle: &Handle, room: &BareJid, nick: Option<&str>, password: Option<&str>) -> Result<(), String> {
-    let (name, features) = disco(handle, room).await;
+    let (name, features, avatar) = disco(handle, room).await;
     let nick = nick.map(str::to_string).or_else(|| handle.session().rooms.get(room).map(|r| r.nick.clone()).filter(|n| !n.is_empty())).unwrap_or_else(|| handle.own().node().map(|n| n.to_string()).unwrap_or_else(|| "moho".to_string()));
     {
         let mut s = handle.session();
@@ -172,6 +190,10 @@ pub async fn join(state: &AppState, handle: &Handle, room: &BareJid, nick: Optio
         entry.features = features.clone();
     }
     ensure_buffer(state, handle, room);
+    if let Some(hash) = avatar {
+        let (s, h, r) = (state.clone(), handle.clone(), room.clone());
+        tokio::spawn(async move { super::avatars::room(&s, &h, &r, Some(&hash)).await });
+    }
     let Ok(to) = format!("{room}/{nick}").parse::<Jid>() else { return Err(format!("{nick:?} is not a usable nickname")) };
     let mut x = Element::builder("x", MUC).build();
     if let Some(pw) = handle.session().rooms.get(room).and_then(|r| r.password.clone()) {
@@ -410,6 +432,15 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
         return;
     }
     let buffer = ensure_buffer(state, handle, &room);
+    // The room's configuration changed (status 104 from the room itself): asked again, its picture included (XEP-0486).
+    if nick.is_empty() && matches!(origin, Origin::Live) {
+        if let Some(x) = message.payloads.iter().find(|e| e.is("x", MUC_USER)) {
+            if status_codes(x).contains(&104) {
+                let (s, h, r) = (state.clone(), handle.clone(), room.clone());
+                tokio::spawn(async move { refresh_avatar(&s, &h, &r).await });
+            }
+        }
+    }
     let p = incoming::parse(&message);
     // The room's subject: who set it, and what it is.
     if message.bodies.is_empty() {
@@ -670,5 +701,18 @@ mod tests {
         assert!(!r.has_archive());
         r.features.insert(ns::MAM.into());
         assert!(r.has_archive());
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn a_rooms_picture_is_named_in_its_disco_info() {
+        let q = Element::from_str("<query xmlns='http://jabber.org/protocol/disco#info'><feature var='vcard-temp'/><x xmlns='jabber:x:data' type='result'><field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/muc#roominfo</value></field><field var='muc#roominfo_avatarhash' type='text-multi'><value>a31c4bd04de69663cfd7f424a8453f4674da37ff</value></field></x></query>").unwrap();
+        assert_eq!(avatar_hash(&q).as_deref(), Some("a31c4bd04de69663cfd7f424a8453f4674da37ff"));
+        assert_eq!(avatar_hash(&Element::from_str("<query xmlns='http://jabber.org/protocol/disco#info'/>").unwrap()), None);
     }
 }

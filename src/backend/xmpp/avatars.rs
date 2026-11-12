@@ -79,6 +79,51 @@ pub async fn ensure(state: &AppState, handle: &Handle, who: &BareJid, hash: &str
     if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() != 40 {
         return;
     }
+    let Some(url) = picture(handle, who, hash, node).await else { return };
+    handle.session().avatars.insert(who.clone(), url.clone());
+    if let Some(b) = roster::find_buffer(state, handle, who) {
+        state.runtime.set_buffer_avatar(state, &b.id, &url);
+    }
+    roster::publish_presence(state, handle, who);
+}
+
+/// A room's picture (XEP-0486): the hash its disco#info gives, the picture its vCard holds. `None` takes it off.
+pub async fn room(state: &AppState, handle: &Handle, room: &BareJid, hash: Option<&str>) {
+    let Some(buffer) = super::muc::find_buffer(state, handle, room) else { return };
+    let url = match hash {
+        Some(h) => match picture(handle, room, &h.to_ascii_lowercase(), ns::VCARD).await {
+            Some(u) => u,
+            None => return,
+        },
+        None => String::new(),
+    };
+    state.runtime.set_buffer_avatar(state, &buffer.id, &url);
+}
+
+/// Sets a room's picture (an owner's, XEP-0486): its vCard, with the picture or with none.
+pub async fn set_room(handle: &Handle, room: &BareJid, path: &str) -> Result<(), String> {
+    let mut vcard = Element::builder("vCard", ns::VCARD).build();
+    if !path.is_empty() {
+        let bytes = std::fs::read(path.trim_start_matches("file://")).map_err(|e| format!("{path}: {e}"))?;
+        if bytes.len() > MOST {
+            return Err("That picture is too large: use one under 4 MB".to_string());
+        }
+        let media_type = sniff(&bytes).ok_or("That is not a picture moho can use (PNG, JPEG, GIF or WebP)")?;
+        let photo = Element::builder("PHOTO", ns::VCARD)
+            .append(Element::builder("TYPE", ns::VCARD).append(media_type).build())
+            .append(Element::builder("BINVAL", ns::VCARD).append(base64::engine::general_purpose::STANDARD.encode(&bytes)).build())
+            .build();
+        vcard.append_child(photo);
+    }
+    handle.request(Some(Jid::from(room.clone())), true, vcard).await.map(|_| ()).map_err(|e| e.words())
+}
+
+/// The picture with this hash, kept on disk (fetched from `node`'s place if it is not yet): a `file://` address, or `None`
+/// when it cannot be had, does not match its hash, or is not a kind of picture moho shows.
+async fn picture(handle: &Handle, who: &BareJid, hash: &str, node: &str) -> Option<String> {
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() != 40 {
+        return None;
+    }
     let url = match kept(hash) {
         Some(url) => url,
         None => {
@@ -88,31 +133,27 @@ pub async fn ensure(state: &AppState, handle: &Handle, who: &BareJid, hash: &str
             };
             let Some(bytes) = bytes else {
                 tracing::debug!("xmpp[{}]: no picture could be read for {who}", handle.account_id);
-                return;
+                return None;
             };
             if sha1_hex(&bytes) != hash {
                 tracing::debug!("xmpp[{}]: the picture {who} has does not match its hash", handle.account_id);
-                return;
+                return None;
             }
             let Some(media_type) = sniff(&bytes) else {
                 tracing::debug!("xmpp[{}]: the picture of {who} is not a kind moho shows", handle.account_id);
-                return;
+                return None;
             };
             let path = path_for(hash, media_type);
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             if std::fs::write(&path, &bytes).is_err() {
-                return;
+                return None;
             }
             format!("file://{}", path.display())
         }
     };
-    handle.session().avatars.insert(who.clone(), url.clone());
-    if let Some(b) = roster::find_buffer(state, handle, who) {
-        state.runtime.set_buffer_avatar(state, &b.id, &url);
-    }
-    roster::publish_presence(state, handle, who);
+    Some(url)
 }
 
 async fn fetch_pep(handle: &Handle, who: &BareJid, hash: &str) -> Option<Vec<u8>> {
