@@ -612,9 +612,11 @@ pub fn sce_envelope(content: Vec<Element>, from: &str) -> Vec<u8> {
     }
     let pad_len = (rand::random::<u8>() % 32) as usize + 1;
     let pad: String = (0..pad_len).map(|_| char::from(b'a' + rand::random::<u8>() % 26)).collect();
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let envelope = Element::builder("envelope", SCE)
         .append(c)
         .append(Element::builder("rpad", SCE).append(pad).build())
+        .append(Element::builder("time", SCE).at("stamp", stamp).build())
         .append(Element::builder("from", SCE).at("jid", from).build())
         .build();
     String::from(&envelope).into_bytes()

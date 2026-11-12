@@ -9,6 +9,7 @@
 //!
 //! This device's keys, its sessions and who is trusted live in one private file per account (`store.rs`).
 
+pub mod atm;
 pub mod curve;
 pub mod ratchet;
 pub mod store;
@@ -259,18 +260,7 @@ impl Omemo {
     pub fn encrypt_all(&self, targets: &[Target], text: &str, own: &str) -> Result<Vec<Element>, Error> {
         let mut out = Vec::new();
         if targets.iter().any(|t| t.v2) {
-            let sce = v2::sce_envelope(vec![v2::body_element(text)], own);
-            let (cipher, material) = v2::encrypt_payload(&sce);
-            let mut store = self.store();
-            let mut keys = Vec::new();
-            for t in targets.iter().filter(|t| t.v2) {
-                if let Some(session) = store.state.v2.sessions.get_mut(&store::key(&t.jid, t.device)) {
-                    let (data, kex) = session.encrypt(&material);
-                    keys.push(v2::Key { jid: t.jid.clone(), rid: t.device, kex, data });
-                }
-            }
-            store.save();
-            out.push(v2::envelope_element(store.state.device_id, &keys, Some(&cipher)));
+            out.push(self.encrypt_content(targets, vec![v2::body_element(text)], own));
         }
         let old: Vec<(String, u32)> = targets.iter().filter(|t| !t.v2).map(|t| (t.jid.clone(), t.device)).collect();
         if !old.is_empty() {
@@ -319,6 +309,22 @@ impl Omemo {
         let gone = before - store.state.sessions.len() - store.state.v2.sessions.len();
         store.save();
         gone
+    }
+
+    /// Encrypts elements (an SCE envelope's content) in OMEMO 2 to the OMEMO 2 devices among `targets`.
+    pub fn encrypt_content(&self, targets: &[Target], content: Vec<Element>, own: &str) -> Element {
+        let sce = v2::sce_envelope(content, own);
+        let (cipher, material) = v2::encrypt_payload(&sce);
+        let mut store = self.store();
+        let mut keys = Vec::new();
+        for t in targets.iter().filter(|t| t.v2) {
+            if let Some(session) = store.state.v2.sessions.get_mut(&store::key(&t.jid, t.device)) {
+                let (data, kex) = session.encrypt(&material);
+                keys.push(v2::Key { jid: t.jid.clone(), rid: t.device, kex, data });
+            }
+        }
+        store.save();
+        v2::envelope_element(store.state.device_id, &keys, Some(&cipher))
     }
 
     /// Reads an OMEMO 2 message from `from` (a bare address) to `own` (this account's).
@@ -561,6 +567,28 @@ pub async fn devices_of(handle: &Handle, omemo: &Omemo, jid: &BareJid, refresh: 
 /// Whether a device of a person speaks OMEMO 2 (it is in their OMEMO 2 device list).
 pub fn speaks_v2(omemo: &Omemo, jid: &str, device: u32) -> bool {
     omemo.store().state.v2.devices.get(jid).is_some_and(|l| l.contains(&device))
+}
+
+/// Learns the identity keys of a person's devices that have not shown one yet, from their bundles (in either namespace), so a
+/// key that is verified or distrusted by a link or a trust message finds its device.
+pub async fn learn_identities(handle: &Handle, omemo: &Omemo, jid: &BareJid) {
+    let to = Some(Jid::from(jid.clone()));
+    for device in devices_new(handle, omemo, jid, true).await {
+        if omemo.store().state.identities.contains_key(&store::key(jid.as_str(), device)) {
+            continue;
+        }
+        if let Some(identity) = item(handle, to.clone(), v2::BUNDLES_NODE, Some(&device.to_string())).await.as_ref().and_then(v2::parse_bundle).and_then(|b| v2::ed_to_montgomery(&b.ik)) {
+            omemo.store().see_identity(jid.as_str(), device, &identity);
+        }
+    }
+    for device in devices_old(handle, omemo, jid, true).await {
+        if omemo.store().state.identities.contains_key(&store::key(jid.as_str(), device)) {
+            continue;
+        }
+        if let Some(bundle) = items(handle, to.clone(), &format!("{BUNDLES_NODE_PREFIX}{device}")).await.as_ref().and_then(parse_bundle) {
+            omemo.store().see_identity(jid.as_str(), device, &bundle.identity);
+        }
+    }
 }
 
 /// A device a message can be encrypted to, and in which namespace.

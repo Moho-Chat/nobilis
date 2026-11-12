@@ -5650,7 +5650,7 @@ pub async fn dispatch(
 
         // OMEMO: a conversation encrypted or not, and who is trusted. A fingerprint is the identity key a device showed; trusting
         // one is the person's call after comparing it with the other person.
-        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" | "xmppOmemoReset" => {
+        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" | "xmppOmemoReset" | "xmppOmemoVerifyUri" => {
             let (account_id, buffer) = match method {
                 "xmppSetEncryption" => {
                     let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && (b.kind == "dm" || b.kind == "channel")) else {
@@ -5716,8 +5716,39 @@ pub async fn dispatch(
                         }
                     }
                     let store = omemo.store();
-                    let own = backend::xmpp::omemo::curve::hex(&store.identity().public);
-                    (Some(serde_json::json!({ "deviceId": store.state.device_id, "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&own), "devices": out })), None)
+                    let own_key = store.identity().public;
+                    let own = backend::xmpp::omemo::curve::hex(&own_key);
+                    // This device's verification links (and their QR codes): the form most clients scan, and XEP-0434's, which
+                    // also vouches for this account's other verified devices.
+                    let others: Vec<[u8; 32]> = store.verified().into_iter().filter(|(j, ..)| *j == me.as_str()).map(|(.., k)| k).collect();
+                    let (uri, trust_uri) = backend::xmpp::omemo::atm::own_uris(me.as_str(), store.state.device_id, &own_key, &others);
+                    let qr = backend::xmpp::omemo::atm::qr_svg(&uri);
+                    let trust_qr = backend::xmpp::omemo::atm::qr_svg(&trust_uri);
+                    (Some(serde_json::json!({ "deviceId": store.state.device_id, "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&own), "devices": out, "uri": uri, "qr": qr, "trustUri": trust_uri, "trustQr": trust_qr })), None)
+                }
+                // A verification link (scanned or pasted): the keys it vouches for are verified (those it distrusts distrusted), now
+                // for devices already seen, when they are seen otherwise; then the devices that should know are told (ATM).
+                "xmppOmemoVerifyUri" => {
+                    let Some(uri) = p_str_opt(params, "uri") else { return (None, Some("xmppOmemoVerifyUri requires \"uri\"".to_string())) };
+                    let Some((owner, keys)) = backend::xmpp::omemo::atm::parse_uri(uri) else {
+                        return (None, Some("That is not an OMEMO verification link (xmpp:…?omemo-sid-…, or a trust-message link for OMEMO 2)".to_string()));
+                    };
+                    let Ok(owner_jid) = backend::xmpp::connect::normalise_jid(&owner) else { return (None, Some("the link's address is not valid".to_string())) };
+                    backend::xmpp::omemo::learn_identities(&handle, &omemo, &owner_jid).await;
+                    let (mut verified, mut distrusted, mut waiting) = (0, 0, 0);
+                    for (k, trust) in keys.trust.iter().map(|k| (*k, true)).chain(keys.distrust.iter().map(|k| (*k, false))) {
+                        let devices = omemo.store().decide_key(owner_jid.as_str(), &k, trust);
+                        match (devices.is_empty(), trust) {
+                            (true, _) => waiting += 1,
+                            (false, true) => verified += devices.len(),
+                            (false, false) => distrusted += devices.len(),
+                        }
+                        if !devices.is_empty() {
+                            let (h, o) = (handle.clone(), owner_jid.clone());
+                            tokio::spawn(async move { backend::xmpp::send::atm_announce(&h, &o, k, trust).await });
+                        }
+                    }
+                    (Some(serde_json::json!({ "jid": owner_jid.to_string(), "verified": verified, "distrusted": distrusted, "waiting": waiting })), None)
                 }
                 // A broken session is replaced by hand (XEP-0384: never on its own): every session with the person's devices.
                 "xmppOmemoReset" => {
@@ -5738,6 +5769,12 @@ pub async fn dispatch(
                         _ => return (None, Some("trust is trusted, verified or untrusted".to_string())),
                     };
                     omemo.store().set_trust(jid, device as u32, trust);
+                    // Verified or distrusted by hand: the devices that should know are told (ATM). Blind trust is not news.
+                    let identity = omemo.store().state.identities.get(&backend::xmpp::omemo::store::key(jid, device as u32)).and_then(|h| backend::xmpp::omemo::curve::unhex(h)).and_then(|b| <[u8; 32]>::try_from(b).ok());
+                    if let (Some(k), Ok(owner), true) = (identity, jid.parse::<tokio_xmpp::jid::BareJid>(), trust != backend::xmpp::omemo::store::Trust::Trusted) {
+                        let h = handle.clone();
+                        tokio::spawn(async move { backend::xmpp::send::atm_announce(&h, &owner, k, trust == backend::xmpp::omemo::store::Trust::Verified).await });
+                    }
                     (Some(ok_node()), None)
                 }
             }

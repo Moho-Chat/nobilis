@@ -143,6 +143,75 @@ pub async fn omemo_reset(handle: &Handle, jid: &BareJid) -> Result<usize, String
     Ok(reached)
 }
 
+/// Tells the devices that should know about a key this account just verified or distrusted by hand (XEP-0450), in trust
+/// messages encrypted (OMEMO 2) to verified devices only:
+/// - a contact's key verified: to this account's other verified devices, that key; to the contact's device, this account's
+///   verified keys;
+/// - one of this account's own keys verified: to every other verified device, that key; to that device, every verified key;
+/// - a key distrusted: to this account's other verified devices (and, for an own key, every verified device), that key.
+pub async fn atm_announce(handle: &Handle, owner: &BareJid, key: [u8; 32], trust: bool) {
+    use super::omemo::atm::Decisions;
+    let Some(omemo) = handle.session().omemo.clone() else { return };
+    let own = handle.own();
+    let own_key = omemo.store().identity().public;
+    let verified = omemo.store().verified();
+    let mut about = Decisions::default();
+    if trust {
+        about.owner(owner.as_str()).trust.push(key);
+    } else {
+        about.owner(owner.as_str()).distrust.push(key);
+    }
+    // (person, device) -> what they are told.
+    let mut plan: Vec<(String, u32, Decisions)> = Vec::new();
+    let others = verified.iter().filter(|(_, _, k)| *k != key);
+    if *owner == own {
+        for (jid, device, _) in others {
+            plan.push((jid.clone(), *device, about.clone()));
+        }
+    } else {
+        for (jid, device, _) in others.filter(|(j, ..)| *j == own.as_str()) {
+            plan.push((jid.clone(), *device, about.clone()));
+        }
+    }
+    if trust {
+        // The device just verified learns the keys it can now trust in turn.
+        let mut keys = Decisions::default();
+        keys.owner(own.as_str()).trust.push(own_key);
+        for (jid, _, k) in verified.iter().filter(|(_, _, k)| *k != key) {
+            if *owner == own || *jid == own.as_str() {
+                keys.owner(jid).trust.push(*k);
+            }
+        }
+        for (jid, device, _) in verified.iter().filter(|(j, _, k)| *j == owner.as_str() && *k == key) {
+            plan.push((jid.clone(), *device, keys.clone()));
+        }
+    }
+    let mut people: Vec<String> = plan.iter().map(|(j, ..)| j.clone()).collect();
+    people.sort();
+    people.dedup();
+    for person in people {
+        let Ok(jid) = person.parse::<BareJid>() else { continue };
+        let usable = super::omemo::usable_devices(handle, &omemo, &jid, jid == own).await;
+        // One message per distinct thing to say, to the devices it is for.
+        let mut groups: Vec<(Decisions, Vec<super::omemo::Target>)> = Vec::new();
+        for (_, device, d) in plan.iter().filter(|(j, ..)| *j == person) {
+            let Some(t) = usable.iter().find(|t| t.v2 && t.device == *device).cloned() else { continue };
+            match groups.iter_mut().find(|(g, _)| g == d) {
+                Some((_, ts)) => ts.push(t),
+                None => groups.push((d.clone(), vec![t])),
+            }
+        }
+        for (d, targets) in groups {
+            let encrypted = omemo.encrypt_content(&targets, vec![super::omemo::atm::element(&d)], own.as_str());
+            let mut m = Message::chat(Jid::from(jid.clone()));
+            m.id = Some(Id(xml::new_id()));
+            m.payloads.push(encrypted);
+            m.payloads.push(xml::empty("store", ns::HINTS));
+            handle.send_message(m).await;
+        }
+    }
+}
+
 /// Sends a message.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<String>) -> Result<(), String> {
     let (handle, jid) = target(state, buffer)?;

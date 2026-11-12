@@ -58,6 +58,23 @@ pub struct State {
     /// OMEMO 2's own keys and sessions (the identity and the device id are the ones above).
     #[serde(default)]
     pub v2: V2State,
+    /// Decisions about keys not seen yet (from a verification link or a trust message), applied when they are: by person, the key
+    /// (hex) and whether it is trusted.
+    #[serde(default)]
+    pub pending_keys: BTreeMap<String, BTreeMap<String, bool>>,
+    /// What devices that are not verified yet said in trust messages (XEP-0450): kept until they are, then applied.
+    #[serde(default)]
+    pub cached_trust: Vec<CachedTrust>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CachedTrust {
+    /// The device that said it, `jid/device`.
+    pub sender: String,
+    pub owner: String,
+    /// The key, hex.
+    pub key: String,
+    pub trust: bool,
 }
 
 /// What OMEMO 2 keeps beside the older namespace's state.
@@ -192,11 +209,21 @@ impl Store {
                 Seen::Changed
             }
             None => {
-                self.state.identities.insert(k.clone(), hex);
+                self.state.identities.insert(k.clone(), hex.clone());
                 // Blind trust before verification: a new device is trusted, unless this person has a device somebody
                 // checked by hand - then a new one is a question, not an answer.
                 let someone_verified = self.state.trust.iter().any(|(other, t)| other.starts_with(&format!("{jid}/")) && *t == Trust::Verified);
-                self.state.trust.insert(k, if someone_verified { Trust::Undecided } else { Trust::Trusted });
+                self.state.trust.insert(k.clone(), if someone_verified { Trust::Undecided } else { Trust::Trusted });
+                // A decision made before the key was seen (a link scanned, a trust message) is applied now.
+                let decided = self.state.pending_keys.get_mut(jid).and_then(|p| p.remove(&hex));
+                if self.state.pending_keys.get(jid).is_some_and(|p| p.is_empty()) {
+                    self.state.pending_keys.remove(jid);
+                }
+                match decided {
+                    Some(true) => self.set_trust(jid, device, Trust::Verified),
+                    Some(false) => self.set_trust(jid, device, Trust::Untrusted),
+                    None => {}
+                }
                 self.save();
                 Seen::New
             }
@@ -207,9 +234,79 @@ impl Store {
         self.state.trust.get(&key(jid, device)).copied().unwrap_or(Trust::Undecided)
     }
 
+    /// Sets how far a device is trusted. A device that is now verified has what it said in trust messages applied.
     pub fn set_trust(&mut self, jid: &str, device: u32, trust: Trust) {
         self.state.trust.insert(key(jid, device), trust);
+        if trust == Trust::Verified {
+            self.release_cached(&key(jid, device));
+        }
         self.save();
+    }
+
+    /// Trusts (verifies) or distrusts a person's key: the devices that showed it, or, if none has yet, the device that shows it
+    /// when one does. Returns the devices it changed.
+    pub fn decide_key(&mut self, owner: &str, key_bytes: &[u8; 32], trust: bool) -> Vec<u32> {
+        let hex = curve::hex(key_bytes);
+        let prefix = format!("{owner}/");
+        let devices: Vec<u32> = self.state.identities.iter().filter(|(k, v)| k.starts_with(&prefix) && **v == hex).filter_map(|(k, _)| k[prefix.len()..].parse().ok()).collect();
+        if devices.is_empty() {
+            self.state.pending_keys.entry(owner.to_string()).or_default().insert(hex, trust);
+            self.save();
+            return devices;
+        }
+        for d in &devices {
+            self.set_trust(owner, *d, if trust { Trust::Verified } else { Trust::Untrusted });
+        }
+        devices
+    }
+
+    /// A trust message from `sender_jid`/`sender_device`: applied if that device is verified, kept until it is otherwise. A
+    /// contact's device speaks only for its own account's keys; this account's devices speak for anyone's. Returns how many
+    /// decisions were applied now.
+    pub fn receive_trust(&mut self, sender_jid: &str, sender_device: u32, own_jid: &str, decisions: &super::atm::Decisions) -> usize {
+        let sender = key(sender_jid, sender_device);
+        let verified = self.trust_of(sender_jid, sender_device) == Trust::Verified;
+        let mut applied = 0;
+        for o in decisions.owners.iter().filter(|o| sender_jid == own_jid || o.jid == sender_jid) {
+            for (k, trust) in o.trust.iter().map(|k| (k, true)).chain(o.distrust.iter().map(|k| (k, false))) {
+                if verified {
+                    self.decide_key(&o.jid, k, trust);
+                    applied += 1;
+                } else {
+                    let c = CachedTrust { sender: sender.clone(), owner: o.jid.clone(), key: curve::hex(k), trust };
+                    if !self.state.cached_trust.contains(&c) {
+                        self.state.cached_trust.push(c);
+                    }
+                }
+            }
+        }
+        self.save();
+        applied
+    }
+
+    /// Applies what a device that is now verified said before it was.
+    fn release_cached(&mut self, sender: &str) {
+        let (mine, rest): (Vec<CachedTrust>, Vec<CachedTrust>) = std::mem::take(&mut self.state.cached_trust).into_iter().partition(|c| c.sender == sender);
+        self.state.cached_trust = rest;
+        for c in mine {
+            if let Some(k) = curve::unhex(&c.key).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                self.decide_key(&c.owner, &k, c.trust);
+            }
+        }
+    }
+
+    /// The verified devices, as `(jid, device, key)`.
+    pub fn verified(&self) -> Vec<(String, u32, [u8; 32])> {
+        self.state
+            .trust
+            .iter()
+            .filter(|(_, t)| **t == Trust::Verified)
+            .filter_map(|(k, _)| {
+                let (jid, device) = k.rsplit_once('/')?;
+                let identity = curve::unhex(self.state.identities.get(k)?)?.try_into().ok()?;
+                Some((jid.to_string(), device.parse().ok()?, identity))
+            })
+            .collect()
     }
 
     /// The readable form of a fingerprint: the identity key in lower-case hex, in groups of eight.
@@ -274,6 +371,33 @@ mod tests {
         let sig: [u8; 64] = curve::unhex(&signed.signature).unwrap().try_into().unwrap();
         assert!(super::super::v2::ed_verify(&super::super::v2::ed_public(&s.identity().private), &signed.pair.public, &sig));
         assert_eq!(s.state.v2.pre_keys.len() as u32, PRE_KEYS);
+    }
+
+    #[test]
+    fn trust_messages_wait_for_their_sender_to_be_verified_and_contacts_speak_only_for_themselves() {
+        use super::super::atm::Decisions;
+        let mut s = Store::open(None);
+        let (own2, bob1, bob2, carol1) = (KeyPair::generate().public, KeyPair::generate().public, KeyPair::generate().public, KeyPair::generate().public);
+        s.see_identity("me@example.org", 2, &own2);
+        s.see_identity("bob@example.org", 1, &bob1);
+        s.see_identity("carol@example.org", 1, &carol1);
+        // My other device says: trust Bob's second device (not seen yet) and Carol's.
+        let mut d = Decisions::default();
+        d.owner("bob@example.org").trust.push(bob2);
+        d.owner("carol@example.org").distrust.push(carol1);
+        assert_eq!(s.receive_trust("me@example.org", 2, "me@example.org", &d), 0, "not verified yet: kept");
+        assert_eq!(s.trust_of("carol@example.org", 1), Trust::Trusted);
+        s.set_trust("me@example.org", 2, Trust::Verified);
+        assert_eq!(s.trust_of("carol@example.org", 1), Trust::Untrusted, "applied once the sender is verified");
+        assert_eq!(s.see_identity("bob@example.org", 2, &bob2), Seen::New);
+        assert_eq!(s.trust_of("bob@example.org", 2), Trust::Verified, "a decision about a key waits for the key");
+        // Bob's verified device may speak for Bob, not for Carol.
+        s.set_trust("bob@example.org", 1, Trust::Verified);
+        let mut c = Decisions::default();
+        c.owner("carol@example.org").trust.push(carol1);
+        assert_eq!(s.receive_trust("bob@example.org", 1, "me@example.org", &c), 0);
+        assert_eq!(s.trust_of("carol@example.org", 1), Trust::Untrusted);
+        assert!(s.verified().iter().any(|(j, d, k)| j == "bob@example.org" && *d == 2 && *k == bob2));
     }
 
     #[test]

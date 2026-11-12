@@ -391,6 +391,13 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
                 None => p.body = None,
             }
             incoming::read_encrypted_content(p, &done.content);
+            // A trust message (XEP-0450): applied if its device is verified, kept until it is; never shown.
+            if let (Some(o), Some(sender), Some(env)) = (&omemo, conv.real_jid.as_deref(), &p.omemo2) {
+                for d in done.content.iter().filter_map(super::omemo::atm::parse) {
+                    let applied = o.store().receive_trust(sender, env.sid, handle.own().as_str(), &d);
+                    tracing::info!("xmpp[{}]: a trust message from {sender}/{}: {applied} decision(s) applied now", handle.account_id, env.sid);
+                }
+            }
             if let (Some((device, v2)), Some(jid)) = (done.answer, conv.real_jid.as_deref().and_then(|j| j.parse::<BareJid>().ok())) {
                 let h = handle.clone();
                 tokio::spawn(async move {
