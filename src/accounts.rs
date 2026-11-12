@@ -582,6 +582,89 @@ impl StoatAccountConfig {
     }
 }
 
+/// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
+/// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
+/// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct XmppAccountConfig {
+    /// The bare JID (`user@domain`), in the normalised form the rest of the daemon uses (lower case, no resource).
+    #[serde(default)]
+    pub jid: String,
+    #[serde(default)]
+    pub password: String,
+    /// The resource this client binds, made once and kept: a new one on every start would leave a ghost in every
+    /// contact's list and a pile of dead OMEMO devices.
+    #[serde(default)]
+    pub resource: String,
+    /// Where to connect when the domain's DNS does not say (an empty host means: ask DNS, as RFC 6120 does).
+    #[serde(default)]
+    pub host: String,
+    /// 0 means the port DNS or the mode names (5222 for STARTTLS, 5223 for direct TLS).
+    #[serde(default)]
+    pub port: u16,
+    /// `starttls` (the default, and what every server speaks) or `direct` (XEP-0368: TLS from the first byte).
+    #[serde(default)]
+    pub security: String,
+    /// Certificates (PEM) this account trusts beside the system's: the private CA of a server that has one.
+    #[serde(default)]
+    pub ca_pem: String,
+    /// The SHA-256 of one certificate (hex) this account trusts whatever signed it: a server with a self-signed
+    /// certificate, accepted once by the person after being shown it.
+    #[serde(default)]
+    pub pin_sha256: String,
+    /// What to call this account here. Local: the server is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub use_tor: bool,
+    #[serde(default)]
+    pub strict_route: bool,
+    /// The id this client gives the server for itself when signing in (XEP-0388's user agent): a random UUID, made once and
+    /// kept, so the server can give the same device the same resource and tie a sign-in token (FAST) to it.
+    #[serde(default)]
+    pub user_agent_id: String,
+    /// A sign-in token the server gave (FAST, XEP-0484), the mechanism it is for, and when it expires (as the server wrote
+    /// it). As secret as the password; dropped when the password changes or the server refuses it.
+    #[serde(default)]
+    pub fast_token: String,
+    #[serde(default)]
+    pub fast_mechanism: String,
+    #[serde(default)]
+    pub fast_expiry: String,
+    /// The strongest kind of sign-in this account has had (`scram`, or empty): a server that later offers only PLAIN is
+    /// refused rather than sent the password. Cleared with a new password.
+    #[serde(default)]
+    pub sasl_floor: String,
+    /// When the account last signed in (RFC 3339), for the account's card.
+    #[serde(default)]
+    pub last_connected: String,
+    /// How it last signed in, in words for the card (`SCRAM-SHA-512-PLUS over SASL2, with a FAST token`).
+    #[serde(default)]
+    pub last_mechanism: String,
+    /// What the pinned certificate was (subject, issuer, validity, names), kept when it is pinned so that a certificate that
+    /// later stops matching can be told apart from it in words.
+    #[serde(default)]
+    pub pin_info: String,
+    /// A client certificate and its private key (PEM), for a server that signs people in by certificate (SASL EXTERNAL).
+    #[serde(default)]
+    pub client_cert_pem: String,
+    /// No account at all: the server lets anybody in (SASL ANONYMOUS) and gives an address for the session. `jid` is the
+    /// domain alone.
+    #[serde(default)]
+    pub anonymous: bool,
+}
+
+impl XmppAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("xmpp:{}", self.jid)
+    }
+
+    /// Whether there is a sign-in behind this account: a password, a client certificate, or none needed.
+    pub fn is_signed_in(&self) -> bool {
+        !self.jid.is_empty() && (!self.password.is_empty() || !self.client_cert_pem.trim().is_empty() || self.anonymous)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -606,6 +689,8 @@ struct AccountsFile {
     telegram: Vec<TelegramAccountConfig>,
     #[serde(default, rename = "stoat_account")]
     stoat: Vec<StoatAccountConfig>,
+    #[serde(default, rename = "xmpp_account")]
+    xmpp: Vec<XmppAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -629,6 +714,8 @@ pub struct AccountStore {
     telegram: Mutex<HashMap<String, TelegramAccountConfig>>,
     /// And this one.
     stoat: Mutex<HashMap<String, StoatAccountConfig>>,
+    /// And this one.
+    xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
 }
 
 impl AccountStore {
@@ -639,7 +726,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -653,9 +740,10 @@ impl AccountStore {
             let twitch = file.twitch.into_iter().map(|a| (a.account_id(), a)).collect();
             let telegram = file.telegram.into_iter().map(|a| (a.account_id(), a)).collect();
             let stoat = file.stoat.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat)
+            let xmpp = file.xmpp.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -668,6 +756,7 @@ impl AccountStore {
             twitch: Mutex::new(twitch),
             telegram: Mutex::new(telegram),
             stoat: Mutex::new(stoat),
+            xmpp: Mutex::new(xmpp),
         })
     }
 
@@ -692,6 +781,7 @@ impl AccountStore {
             twitch: self.twitch.lock().unwrap().values().cloned().collect(),
             telegram: self.telegram.lock().unwrap().values().cloned().collect(),
             stoat: self.stoat.lock().unwrap().values().cloned().collect(),
+            xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -1013,6 +1103,66 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
+        self.xmpp.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_xmpp(&self) -> Vec<XmppAccountConfig> {
+        self.xmpp.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: adding the same JID again is how a changed password or server is entered. What the person set up on
+    /// the account - its route, its name here - and the resource it has been using stay.
+    pub fn add_xmpp(&self, mut config: XmppAccountConfig) -> Result<XmppAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut xmpp = self.xmpp.lock().unwrap();
+            if let Some(old) = xmpp.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+                if config.resource.is_empty() {
+                    config.resource = old.resource.clone();
+                }
+                if config.user_agent_id.is_empty() {
+                    config.user_agent_id = old.user_agent_id.clone();
+                }
+                if config.last_connected.is_empty() {
+                    config.last_connected = old.last_connected.clone();
+                }
+                // A password entered again starts the sign-in over: no token, no floor kept from the old one.
+                if config.password == old.password {
+                    if config.sasl_floor.is_empty() {
+                        config.sasl_floor = old.sasl_floor.clone();
+                    }
+                    if config.fast_token.is_empty() {
+                        (config.fast_token, config.fast_mechanism, config.fast_expiry) = (old.fast_token.clone(), old.fast_mechanism.clone(), old.fast_expiry.clone());
+                    }
+                }
+            }
+            xmpp.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one XMPP account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_xmpp(&self, account_id: &str, change: impl FnOnce(&mut XmppAccountConfig)) -> Result<bool> {
+        {
+            let mut xmpp = self.xmpp.lock().unwrap();
+            match xmpp.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
     pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
@@ -1163,6 +1313,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.xmpp.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -1197,6 +1351,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_stoat(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_xmpp(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1295,6 +1452,13 @@ impl AccountStore {
         }
         {
             let removed = self.stoat.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.xmpp.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1470,6 +1634,9 @@ impl AccountStore {
         if self.mutate_stoat(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_xmpp(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -1510,6 +1677,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.stoat.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.xmpp.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -1633,6 +1803,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1674,6 +1845,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1714,6 +1886,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1763,6 +1936,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1811,6 +1985,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1854,6 +2029,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: !a.web_token.is_empty(),
         moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
+        stop_reason: String::new(),
     }
 }
 
@@ -1898,6 +2074,7 @@ pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Accou
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1940,6 +2117,49 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
+    }
+}
+
+/// XMPP has none of IRC's concepts either. `has_password` says there is a sign-in behind the account.
+pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "xmpp".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| a.jid.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        stop_reason: if state == "auth_failed" { crate::backend::xmpp::connect::stop_reason(&a.account_id()) } else { String::new() },
     }
 }
 
@@ -1984,6 +2204,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         dehydration: a.dehydration_enabled,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -2307,5 +2528,59 @@ mod stoat_account_tests {
         assert_eq!(named.display_name, "Me");
         let signed_out = stoat_account_to_json(&StoatAccountConfig { token: String::new(), ..account("01C") }, "connected");
         assert!(!signed_out.has_password);
+    }
+}
+
+#[cfg(test)]
+mod xmpp_account_tests {
+    use super::*;
+
+    fn store(name: &str) -> (AccountStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("nobilis-xmpp-accounts-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        (AccountStore::open(path.clone()).unwrap(), path)
+    }
+
+    fn account(jid: &str) -> XmppAccountConfig {
+        XmppAccountConfig { jid: jid.into(), password: "hunter2".into(), host: "xmpp.example.org".into(), port: 5222, security: "starttls".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn an_xmpp_account_survives_a_restart_and_is_found_by_its_jid() {
+        let (s, path) = store("restart");
+        s.add_xmpp(XmppAccountConfig { ca_pem: "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n".into(), pin_sha256: "ab".repeat(32), ..account("alice@example.org") }).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[xmpp_account]]"), "{text}");
+        let got = AccountStore::open(path.clone()).unwrap().get_xmpp("xmpp:alice@example.org").expect("found");
+        assert_eq!((got.host.as_str(), got.port, got.security.as_str(), got.pin_sha256.len(), got.ca_pem.contains("BEGIN")), ("xmpp.example.org", 5222, "starttls", 64, true));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn adding_the_same_address_again_keeps_the_resource_the_route_and_the_name() {
+        let (s, path) = store("again");
+        s.add_xmpp(XmppAccountConfig { resource: "moho.abcd2345".into(), ..account("a@example.org") }).unwrap();
+        s.add_xmpp(account("b@example.org")).unwrap();
+        s.set_route_level("xmpp:a@example.org", "strict").unwrap();
+        s.set_display_name("xmpp:a@example.org", "Work").unwrap();
+        s.add_xmpp(XmppAccountConfig { password: "new password".into(), ..account("a@example.org") }).unwrap();
+        let got = s.get_xmpp("xmpp:a@example.org").unwrap();
+        assert_eq!((got.password.as_str(), got.resource.as_str(), got.display_name.as_deref(), got.strict_route), ("new password", "moho.abcd2345", Some("Work"), true));
+        assert_eq!(s.route_level_of("xmpp:a@example.org").as_deref(), Some("strict"));
+        assert_eq!(s.all_xmpp().len(), 2);
+        assert!(s.remove("xmpp:a@example.org").unwrap());
+        assert!(!s.remove("xmpp:a@example.org").unwrap());
+        assert!(AccountStore::open(path.clone()).unwrap().get_xmpp("xmpp:a@example.org").is_none(), "the file forgot too");
+        assert!(s.get_xmpp("xmpp:b@example.org").is_some());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn the_listing_names_the_service_and_the_account_and_says_there_is_a_sign_in() {
+        let listed = xmpp_account_to_json(&account("alice@example.org"), "connected");
+        assert_eq!((listed.service.as_str(), listed.id.as_str(), listed.display_name.as_str(), listed.has_password), ("xmpp", "xmpp:alice@example.org", "alice@example.org", true));
+        let named = xmpp_account_to_json(&XmppAccountConfig { display_name: Some("Me".into()), ..account("alice@example.org") }, "connected");
+        assert_eq!(named.display_name, "Me");
+        assert_eq!(crate::model::service_of("xmpp:alice@example.org"), "xmpp");
     }
 }

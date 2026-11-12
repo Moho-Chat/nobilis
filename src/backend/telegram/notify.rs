@@ -7,6 +7,7 @@
 use super::peers;
 use super::send::{explain, peer_for};
 use crate::model::Buffer;
+use crate::notify::NotifyLevel;
 use crate::state::AppState;
 use grammers_client::tl;
 use grammers_session::types::PeerId;
@@ -25,7 +26,8 @@ pub fn changed(state: &AppState, account_id: &str, update: &tl::types::UpdateNot
     let tl::enums::NotifyPeer::Peer(p) = &update.peer else { return };
     let remote = peers::remote_id(PeerId::from(p.peer.clone()));
     let Some(buffer) = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { return };
-    state.runtime.set_silenced(state, &buffer.id, silent(&update.notify_settings, chrono::Utc::now().timestamp()));
+    let level = level_of(silent(&update.notify_settings, chrono::Utc::now().timestamp()));
+    state.runtime.set_notify_level(state, &buffer.id, level, level);
 }
 
 /// Mutes a chat, or takes the mute off.
@@ -42,8 +44,19 @@ pub async fn set_muted(state: &AppState, buffer: &Buffer, muted: bool) -> Result
     };
     let peer = tl::enums::InputNotifyPeer::Peer(tl::types::InputNotifyPeer { peer: peer.into() });
     handle.client.invoke(&tl::functions::account::UpdateNotifySettings { peer, settings: settings.into() }).await.map_err(|e| explain(&e))?;
-    state.runtime.set_silenced(state, &buffer.id, muted);
+    let level = level_of(muted);
+    state.runtime.set_notify_level(state, &buffer.id, level, level);
     Ok(())
+}
+
+/// A chat's level. Telegram keeps only "mute until" for a chat, so there are
+/// two to read - what a timed mute comes to once it ends is the chat's own.
+pub fn level_of(silent: bool) -> NotifyLevel {
+    if silent {
+        NotifyLevel::Mute
+    } else {
+        NotifyLevel::Default
+    }
 }
 
 #[cfg(test)]

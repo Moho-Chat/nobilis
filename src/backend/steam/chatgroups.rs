@@ -22,6 +22,7 @@ use super::link::Link;
 use super::proto::*;
 use super::{presence, reactions, steamid};
 use crate::model::{Buffer, BufferGroup};
+use crate::notify::NotifyLevel;
 use crate::state::AppState;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -186,6 +187,25 @@ impl Group {
     /// marker: the row is then drawn quiet.
     pub fn silenced(&self) -> bool {
         self.notify == NOTIFY_NONE || self.muted
+    }
+
+    /// What a room of this group is set to, as a level.
+    ///
+    /// Steam has no "default" to leave a group on: told of everything is what
+    /// a group that was never changed does, and mentions only is what a
+    /// community group's chat does, so what it comes to is what is ticked.
+    /// Nothing, or the unread marker muted, is a mute - the Steam client's own
+    /// two switches for it are one thing to somebody choosing from a list.
+    pub fn notify_levels(&self) -> (NotifyLevel, NotifyLevel) {
+        let level = if self.silenced() {
+            NotifyLevel::Mute
+        } else {
+            match self.effective_notify() {
+                NOTIFY_MENTION_ME => NotifyLevel::Mentions,
+                _ => NotifyLevel::All,
+            }
+        };
+        (level, level)
     }
 
     /// What this group tells the account about, as the setting reads when it was never changed:
@@ -610,7 +630,8 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
             state.runtime.set_buffer_category(state, &buffer.id, None, i64::from(r.sort));
             state.runtime.set_buffer_topic(state, &buffer.id, &g.tagline);
             state.runtime.set_buffer_read_only(state, &buffer.id, (!g.may_speak()).then_some("You can read this group but not write in it."));
-            state.runtime.set_silenced(state, &buffer.id, g.silenced());
+            let (shown, applies) = g.notify_levels();
+            state.runtime.set_notify_level(state, &buffer.id, shown, applies);
             state.runtime.set_buffer_notice(state, &buffer.id, suspicious_notice(account_id, g, roster));
             if let Some(url) = &g.avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
@@ -1487,6 +1508,21 @@ pub async fn act(state: &AppState, account_id: &str, action: Action) -> Result<V
     done
 }
 
+/// Sets how much a group's rooms may interrupt, on the account.
+///
+/// Two of Steam's settings say it: how much to be told, and whether the unread
+/// marker shows. Being told of everything puts the marker back, and the default
+/// is what a group would be doing had nobody changed it.
+pub async fn set_level(state: &AppState, account_id: &str, group: u64, level: NotifyLevel) -> Result<(), String> {
+    let (told, muted) = match level {
+        NotifyLevel::Mute => (NOTIFY_NONE, true),
+        NotifyLevel::Mentions => (NOTIFY_MENTION_ME, false),
+        NotifyLevel::All => (NOTIFY_ALL, false),
+        NotifyLevel::Default => (with(account_id, |a| a.groups.get(&group).map(|g| if g.clan.is_some() { NOTIFY_MENTION_ME } else { NOTIFY_ALL })).unwrap_or(NOTIFY_ALL), false),
+    };
+    act(state, account_id, Action::Notify { group, level: Some(told), muted: Some(muted) }).await.map(|_| ())
+}
+
 async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Value, String> {
     let link = state.runtime.steam_link(account_id).ok_or("this Steam account is not connected")?;
     let own = with(account_id, |a| a.own);
@@ -2075,6 +2111,22 @@ mod tests {
         assert!(g.silenced(), "told of nothing is quiet whatever the marker does");
         g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_ALL), unread_indicator_muted: Some(false), ..Default::default() });
         assert!(!g.silenced());
+    }
+
+    #[test]
+    fn a_group_is_ticked_for_what_it_is_doing() {
+        let mut g = Group { id: 1, ..Default::default() };
+        assert_eq!(g.notify_levels(), (NotifyLevel::All, NotifyLevel::All), "never changed: told of everything");
+        g.clan = Some(1);
+        assert_eq!(g.notify_levels().0, NotifyLevel::Mentions, "a community group's chat is mentions by default");
+        g.clan = None;
+        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_MENTION_ME), unread_indicator_muted: Some(false), ..Default::default() });
+        assert_eq!(g.notify_levels().0, NotifyLevel::Mentions);
+        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_NONE), unread_indicator_muted: Some(false), ..Default::default() });
+        assert_eq!(g.notify_levels().0, NotifyLevel::Mute, "told of nothing");
+        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_ALL), unread_indicator_muted: Some(true), ..Default::default() });
+        assert_eq!(g.notify_levels().0, NotifyLevel::Mute, "the unread marker muted");
+
     }
 
     #[test]

@@ -42,4 +42,8 @@ pub struct AppState {
     /// People whose messages should not arrive, on the services with no
     /// server-side list of their own - see ignores.rs.
     pub ignores: Arc<crate::ignores::IgnoreStore>,
+    /// How much each conversation may interrupt, for the services with
+    /// nowhere on the account to keep it - see notify.rs. The others hold it
+    /// on the account and only tell the runtime.
+    pub notify_levels: Arc<crate::notify::NotifyStore>,
 }

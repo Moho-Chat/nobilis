@@ -55,6 +55,13 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
         }
         // Stoat has a real block too, told as well as recorded for the same reason: a blocked person's messages in a
         // server still arrive, and this client has to stop showing them.
+        // XMPP keeps the list on the account (XEP-0191): told to the server, which stops delivering what they send.
+        "xmpp" => {
+            let handle = state.runtime.xmpp_handle(account_id).ok_or_else(|| anyhow::anyhow!("that XMPP account is not connected"))?;
+            backend::xmpp::blocking::set(&handle, target, ignored).await.map_err(|e| anyhow::anyhow!(e))?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         "stoat" => {
             let handle = state.runtime.stoat_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Stoat account is not connected"))?;
             backend::stoat::people::block(state, &handle, target, ignored).await?;
@@ -94,6 +101,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_twitch(id) {
             backend::twitch::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("xmpp:") {
+        if let Some(cfg) = state.accounts.get_xmpp(id) {
+            backend::xmpp::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -122,6 +133,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addXmppAccount" => Some("xmpp"),
         _ => None,
     }
 }
@@ -438,6 +450,7 @@ pub async fn dispatch(
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "xmpp", "name": "XMPP", "available": true },
             ])),
             None,
         ),
@@ -524,6 +537,14 @@ pub async fn dispatch(
                             if let Err(e) = backend::stoat::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("stoat history: {e:#}");
                             }
+                        }
+                    }
+                    // XMPP's archive is read for the person, going back from the oldest message held; what it returns
+                    // overlaps what is stored and the store ignores ids it has.
+                    if buffer.account_id.starts_with("xmpp:") {
+                        if let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) {
+                            let oldest = if before > 0 { state.store.oldest_ts(buffer_id).ok().flatten().unwrap_or(0) } else { 0 };
+                            backend::xmpp::mam::scrollback(state, &handle, &buffer, oldest).await;
                         }
                     }
                     // Kick pages back through its own history endpoint,
@@ -782,6 +803,7 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                state.notify_levels.forget_account(id);
                 // And the Discord session kept for a restart to resume: a removed account must not leave its
                 // servers and friends in a file.
                 backend::discord::session_store::forget(id);
@@ -835,6 +857,7 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        backend::xmpp::transport::forget_refused(id);
                         if let Some(config) = telegram_account {
                             backend::telegram::folders::forget(&config.account_id());
                             let state = state.clone();
@@ -905,6 +928,14 @@ pub async fn dispatch(
                         match state.accounts.get_twitch(id) {
                             Some(cfg) => {
                                 backend::twitch::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("xmpp:") {
+                        match state.accounts.get_xmpp(id) {
+                            Some(cfg) => {
+                                backend::xmpp::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -1153,6 +1184,12 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    if let Err(e) = backend::xmpp::send::typing(state, &buffer, typing).await {
+                        tracing::debug!("sendTyping: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     // It lapses by itself, so only "typing" is said.
                     if typing {
@@ -1246,63 +1283,20 @@ pub async fn dispatch(
             }
         }
 
-        "setTelegramChatMuted" => {
-            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
-                return (None, Some("setTelegramChatMuted requires a Telegram \"bufferId\"".to_string()));
+        // How much a conversation may interrupt: default, all, mentions or mute.
+        // Set on the account where the service keeps it there (Matrix, Discord,
+        // Stoat, Steam, Telegram), so it is quiet on a phone as well and a
+        // change made on one arrives here - and kept by the daemon otherwise.
+        "setNotifyLevel" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some("setNotifyLevel requires a known \"bufferId\"".to_string()));
             };
-            match backend::telegram::notify::set_muted(state, &buffer, p_bool(params, "muted", true)).await {
+            let Some(level) = p_str_opt(params, "level").and_then(crate::notify::NotifyLevel::parse) else {
+                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions or mute".to_string()));
+            };
+            match crate::notify::set_level(state, &buffer, level).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
-            }
-        }
-
-        "setMatrixRoomMuted" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("setMatrixRoomMuted requires \"bufferId\"".to_string()));
-            };
-            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            if !buffer.account_id.starts_with("matrix:") {
-                return (Some(ok_node()), None);
-            }
-            match backend::matrix::set_room_muted(state, &buffer.account_id, buffer_id, muted).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        // The same for a Discord channel or direct message: set on the
-        // account, so it is quiet on a phone as well.
-        // The same for a Stoat conversation, set in the account's synced settings.
-        "setStoatChannelMuted" => {
-            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
-                return (None, Some("setStoatChannelMuted requires a Stoat \"bufferId\"".to_string()));
-            };
-            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
-                return (None, Some("that Stoat account is not connected".to_string()));
-            };
-            match backend::stoat::settings::set_muted(state, &handle, &buffer, p_bool(params, "muted", true)).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        "setDiscordChannelMuted" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("setDiscordChannelMuted requires \"bufferId\"".to_string()));
-            };
-            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            if !buffer.account_id.starts_with("discord:") {
-                return (Some(ok_node()), None);
-            }
-            match backend::discord::mutes::set_muted(state, &buffer.account_id, buffer_id, muted).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1360,6 +1354,7 @@ pub async fn dispatch(
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1438,6 +1433,13 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // XMPP tells the other side with a chat marker.
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    if let Err(e) = backend::xmpp::send::mark_read(state, &buffer).await {
+                        tracing::debug!("xmpp marker: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1612,6 +1614,10 @@ pub async fn dispatch(
                 .await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("xmpp:") {
+                // An Ogg Opus file over HTTP Upload that says how long it is: what XMPP clients play as a voice message.
+                let path = finished.path.to_string_lossy().to_string();
+                backend::xmpp::send::send_files(state, &buffer, "", &[(path, false)], None, None, Some(finished.duration_secs)).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
                 backend::matrix::send_voice_message(
                     state,
@@ -1881,6 +1887,15 @@ pub async fn dispatch(
             } else if state.accounts.get_steam(account_id).is_some() {
                 // A choice, as against stepping away: Steam keeps the two apart.
                 backend::steam::apply_status(state, account_id, status, true)
+            } else if let Some(handle) = state.runtime.xmpp_handle(account_id).filter(|_| account_id.starts_with("xmpp:")) {
+                let show = match status {
+                    "idle" => "away",
+                    "dnd" => "dnd",
+                    _ => "online",
+                };
+                let words = text.clone().unwrap_or_else(|| state.runtime.account_status_text(account_id));
+                backend::xmpp::roster::set_own(&handle, show, &words).await;
+                true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
@@ -2250,9 +2265,23 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            // Placing, taking or answering a call on an account routed through Tor would send its media around Tor.
+            if matches!(event_type, "m.call.invite" | "m.call.answer" | "m.call.proceed") {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
             let Some(content) = params.get("content").filter(|c| c.is_object()).cloned() else {
                 return (None, Some("sendMatrixCallEvent requires \"content\"".to_string()));
             };
+            // An XMPP conversation speaks the same call vocabulary to the window and Jingle to the network.
+            if buffer.account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                return match backend::xmpp::calls::from_window(state, &handle, &buffer, event_type, &content).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             match backend::matrix::calls::send(state, &buffer.account_id, buffer_id, event_type, content).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2265,6 +2294,10 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("matrixTurnServers requires \"accountId\"".to_string()));
             };
+            if account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                return (Some(backend::xmpp::calls::turn_servers(&handle).await), None);
+            }
             match backend::matrix::calls::turn_servers(state, account_id).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2752,6 +2785,9 @@ pub async fn dispatch(
                 (Some(a), Some(u)) => (a, u),
                 _ => return (None, Some("callDiscordUser requires \"accountId\" and \"userId\"".to_string())),
             };
+            if let Some(why) = crate::net::route::router().call_refusal(account_id) {
+                return (None, Some(why));
+            }
             match backend::discord::call_user(state, account_id, user_id).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2767,6 +2803,9 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                return (None, Some(why));
+            }
             let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
                 return (None, Some("that conversation has no Discord channel".to_string()));
             };
@@ -2786,6 +2825,11 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if method == "acceptCall" {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
             let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
                 return (None, Some("that conversation has no Discord channel".to_string()));
             };
@@ -3264,6 +3308,9 @@ pub async fn dispatch(
                 (Some(a), Some(c)) => (a, c),
                 _ => return (None, Some("joinVoiceChannel requires \"accountId\" and \"channelId\"".to_string())),
             };
+            if let Some(why) = crate::net::route::router().call_refusal(account_id) {
+                return (None, Some(why));
+            }
             let guild_id = p_str_opt(params, "guildId");
             // Both default to the cautious setting, so a caller that says
             // nothing gets an empty channel and a closed microphone.
@@ -3517,6 +3564,13 @@ pub async fn dispatch(
                                     return (Some(ok_node()), None);
                                 }
                             }
+                        } else if buffer.account_id.starts_with("xmpp:") && buffer.kind == "channel" {
+                            // Leaving a room leaves it for good: it is taken off the account's bookmarks, or it would be
+                            // opened again at the next sign-in, here and on every other client.
+                            if let (Some(handle), Some(room)) = (state.runtime.xmpp_handle(&buffer.account_id), buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok())) {
+                                backend::xmpp::muc::leave(state, &handle, &room).await;
+                                let _ = backend::xmpp::bookmarks::remove(&handle, room.as_str()).await;
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -3722,6 +3776,23 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let files: Vec<(String, bool)> = paths.into_iter().map(|p| (p, false)).collect();
+                    let sent = backend::xmpp::send::send_files(state, &buffer, body, &files, reply_to_id, progress, None).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -3960,6 +4031,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4008,6 +4083,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4041,6 +4120,10 @@ pub async fn dispatch(
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
+                },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -4885,6 +4968,9 @@ pub async fn dispatch(
             let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
                 return (None, Some("that Stoat account is not connected".to_string()));
             };
+            if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                return (None, Some(why));
+            }
             match backend::stoat::voice::join(&handle, &buffer).await {
                 Ok(joined) => (Some(joined), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -4898,7 +4984,7 @@ pub async fn dispatch(
             };
             let user = p_str_opt(params, "userId").unwrap_or("");
             let done = match method {
-                "stoatFriendRequests" => return (Some(serde_json::json!({ "incoming": backend::stoat::people::incoming(&handle) })), None),
+                "stoatFriendRequests" => return (Some(backend::stoat::people::page(&handle)), None),
                 "answerStoatFriendRequest" => backend::stoat::people::answer_friend(state, &handle, user, p_bool(params, "accept", true)).await,
                 "addStoatFriend" => backend::stoat::people::add_friend(&handle, p_str(params, "username", "")).await,
                 _ => backend::stoat::people::block(state, &handle, user, p_bool(params, "block", true)).await,
@@ -4939,6 +5025,834 @@ pub async fn dispatch(
                 backend::stoat::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // An XMPP account is its JID and password on a server of its own: no sign-in flow to wait on, so the account is
+        // made, kept and connected at once, and how the connection fares is the usual connection state. A server with its
+        // own certificate authority, or a self-signed certificate the person has looked at and pinned, is named here too.
+        "addXmppAccount" => {
+            // A password, a client certificate (SASL EXTERNAL), or neither for an anonymous session.
+            let anonymous = p_bool(params, "anonymous", false);
+            let client_cert_pem = p_str(params, "clientCertPem", "").trim().to_string();
+            let password = p_str(params, "password", "");
+            let Some(jid) = p_str_opt(params, "jid") else {
+                return (None, Some("addXmppAccount requires \"jid\"".to_string()));
+            };
+            if password.is_empty() && client_cert_pem.is_empty() && !anonymous {
+                return (None, Some("addXmppAccount requires \"password\" (or a client certificate, or an anonymous sign-in)".to_string()));
+            }
+            let jid = if anonymous {
+                // The server's address alone; a user part typed with it is not one's own (the server will choose).
+                match tokio_xmpp::jid::Jid::new(jid.trim().trim_start_matches('@')) {
+                    Ok(j) => j.domain().as_str().trim_end_matches('.').to_string(),
+                    Err(e) => return (None, Some(format!("{jid:?} is not a server's address: {e}"))),
+                }
+            } else {
+                match backend::xmpp::connect::normalise_jid(jid) {
+                    Ok(jid) => jid.to_string(),
+                    Err(e) => return (None, Some(e)),
+                }
+            };
+            let security = match p_str(params, "security", "starttls") {
+                "direct" => "direct",
+                "websocket" => "websocket",
+                _ => "starttls",
+            };
+            let pin = p_str(params, "pinSha256", "");
+            if !pin.trim().is_empty() && backend::xmpp::transport::normalise_pin(pin).is_none() {
+                return (None, Some("the pinned certificate must be a SHA-256 fingerprint (64 hex digits)".to_string()));
+            }
+            let config = crate::accounts::XmppAccountConfig {
+                jid,
+                password: password.to_string(),
+                host: p_str(params, "host", "").trim().to_string(),
+                port: params.get("port").and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
+                security: security.to_string(),
+                ca_pem: p_str(params, "caPem", "").to_string(),
+                pin_sha256: backend::xmpp::transport::normalise_pin(pin).unwrap_or_default(),
+                resource: p_str(params, "resource", "").trim().to_string(),
+                // The form's Tor switch: without it the account was made unrouted and connected directly.
+                use_tor: p_bool(params, "useTor", false),
+                client_cert_pem: client_cert_pem.clone(),
+                anonymous,
+                ..Default::default()
+            };
+            if !config.client_cert_pem.is_empty() {
+                let check = backend::xmpp::transport::Settings { account_id: String::new(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: String::new(), pin_sha256: String::new(), client_cert_pem: config.client_cert_pem.clone() };
+                if let Err(e) = backend::xmpp::transport::tls_config(&check, &Default::default()) {
+                    return (None, Some(format!("{e:#}")));
+                }
+            }
+            if !config.resource.is_empty() && tokio_xmpp::jid::BareJid::new(&config.jid).ok().and_then(|b| b.with_resource_str(&config.resource).ok()).is_none() {
+                return (None, Some(format!("{:?} cannot be a resource", config.resource)));
+            }
+            match state.accounts.add_xmpp(config) {
+                Ok(config) => {
+                    let account_id = config.account_id();
+                    backend::xmpp::spawn(state.clone(), config);
+                    (Some(serde_json::json!({ "accountId": account_id })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Rooms: joining one (and keeping it among the account's bookmarks), what the account's own server offers, who
+        // is invited, and what a room's owner and moderators do. A room is the buffer's `remoteId`.
+        "xmppJoinRoom" | "xmppListRooms" | "xmppInvites" | "xmppAnswerInvite" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            match method {
+                "xmppInvites" => (Some(serde_json::json!(backend::xmpp::messages::invites_json(&handle))), None),
+                "xmppListRooms" => {
+                    // The conference services of the account's own server, found by asking it what it hosts.
+                    let domain = handle.own().domain().as_str().to_string();
+                    let Ok(server) = domain.parse::<tokio_xmpp::jid::Jid>() else { return (None, Some("the server's address is not usable".to_string())) };
+                    let items = match handle.request(Some(server), false, tokio_xmpp::minidom::Element::builder("query", backend::xmpp::ns::DISCO_ITEMS).build()).await {
+                        Ok(q) => q.map(|q| q.children().filter_map(|c| c.attr("jid").map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default(),
+                        Err(e) => return (None, Some(e.words())),
+                    };
+                    let mut rooms = Vec::new();
+                    for service in items {
+                        let Ok(jid) = service.parse::<tokio_xmpp::jid::Jid>() else { continue };
+                        let info = handle.request(Some(jid.clone()), false, tokio_xmpp::minidom::Element::builder("query", backend::xmpp::ns::DISCO_INFO).build()).await.ok().flatten();
+                        if !info.is_some_and(|q| q.children().any(|c| c.name() == "identity" && c.attr("category") == Some("conference"))) {
+                            continue;
+                        }
+                        if let Ok(list) = backend::xmpp::muc::list_rooms(&handle, &jid).await {
+                            rooms.extend(list.into_iter().map(|(jid, name)| serde_json::json!({ "jid": jid, "name": name, "service": service })));
+                        }
+                    }
+                    (Some(serde_json::json!({ "rooms": rooms })), None)
+                }
+                "xmppAnswerInvite" => {
+                    let Some(room) = p_str_opt(params, "roomId") else { return (None, Some("xmppAnswerInvite requires \"roomId\"".to_string())) };
+                    let invite = {
+                        let mut s = handle.session();
+                        let at = s.room_invites.iter().position(|i| i.room == room);
+                        at.map(|at| s.room_invites.remove(at))
+                    };
+                    backend::xmpp::messages::announce_invites(state, &handle);
+                    let (Some(invite), Ok(jid)) = (invite, room.parse::<tokio_xmpp::jid::BareJid>()) else { return (None, Some("no such invitation".to_string())) };
+                    if p_bool(params, "accept", true) {
+                        if let Err(e) = backend::xmpp::muc::join(state, &handle, &jid, None, invite.password.as_deref()).await {
+                            return (None, Some(e));
+                        }
+                        let before = backend::xmpp::bookmarks::fetch(&handle, room).await.unwrap_or_default();
+                        let _ = backend::xmpp::bookmarks::save(&handle, &backend::xmpp::bookmarks::Bookmark { room: room.to_string(), autojoin: true, password: invite.password.or(before.password), name: before.name, nick: before.nick, extensions: before.extensions }).await;
+                    }
+                    (Some(ok_node()), None)
+                }
+                _ => {
+                    let jid = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                        Some(Ok(jid)) => jid,
+                        Some(Err(e)) => return (None, Some(e)),
+                        None => return (None, Some("xmppJoinRoom requires \"jid\"".to_string())),
+                    };
+                    let nick = p_str_opt(params, "nick").map(str::trim).filter(|n| !n.is_empty());
+                    let password = p_str_opt(params, "password").filter(|p| !p.is_empty());
+                    if let Err(e) = backend::xmpp::muc::join(state, &handle, &jid, nick, password).await {
+                        return (None, Some(e));
+                    }
+                    let nick_used = handle.session().rooms.get(&jid).map(|r| r.nick.clone());
+                    if p_bool(params, "bookmark", true) {
+                        // What is already bookmarked for the room (its name, what other clients keep with it) is kept.
+                        let before = backend::xmpp::bookmarks::fetch(&handle, jid.as_str()).await.unwrap_or_default();
+                        let b = backend::xmpp::bookmarks::Bookmark { room: jid.to_string(), autojoin: true, nick: nick_used.or(before.nick), password: password.map(str::to_string).or(before.password), name: before.name, extensions: before.extensions };
+                        if let Err(e) = backend::xmpp::bookmarks::save(&handle, &b).await {
+                            tracing::info!("xmpp: the room was joined but not bookmarked: {e}");
+                        }
+                    }
+                    let buffer = backend::xmpp::muc::find_buffer(state, &handle, &jid);
+                    (Some(serde_json::json!({ "bufferId": buffer.map(|b| b.id) })), None)
+                }
+            }
+        }
+
+        // What this account may do in a room, from its own role and standing there: advisory, since the room decides.
+        "getXmppPowers" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "channel") else {
+                return (Some(serde_json::json!({})), None);
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (Some(serde_json::json!({})), None) };
+            let room = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok());
+            let (role, affiliation) = room.and_then(|r| handle.session().rooms.get(&r).map(|room| (room.own_role.clone(), room.own_affiliation.clone()))).unwrap_or_default();
+            let moderator = role == "moderator";
+            let admin = matches!(affiliation.as_str(), "admin" | "owner");
+            (Some(serde_json::json!({ "canKick": moderator, "canMute": moderator, "canOp": moderator, "canBan": admin })), None)
+        }
+
+        "xmppRoomAction" | "xmppRoomConfig" | "xmppSetRoomConfig" | "xmppInvite" | "xmppSetSubject" | "xmppSetNick" | "xmppAffiliations" | "xmppDestroyRoom" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "channel") else {
+                return (None, Some(format!("{method} needs a room's \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(room) = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok()) else { return (None, Some("this is not a room".to_string())) };
+            let reason = p_str(params, "reason", "");
+            let result: Result<serde_json::Value, String> = match method {
+                "xmppSetSubject" => {
+                    backend::xmpp::muc_admin::set_subject(&handle, &room, p_str(params, "subject", "")).await;
+                    Ok(serde_json::json!({}))
+                }
+                "xmppSetNick" => backend::xmpp::muc_admin::change_nick(&handle, &room, p_str(params, "nick", "")).await.map(|_| serde_json::json!({})),
+                "xmppInvite" => match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                    Some(Ok(who)) => {
+                        backend::xmpp::muc_admin::invite(&handle, &room, &who, reason, None).await;
+                        Ok(serde_json::json!({}))
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err("xmppInvite requires \"jid\"".to_string()),
+                },
+                "xmppAffiliations" => backend::xmpp::muc_admin::affiliates(&handle, &room, p_str(params, "affiliation", "member")).await.map(|l| serde_json::json!({ "people": l.into_iter().map(|(jid, reason)| serde_json::json!({ "jid": jid, "reason": reason })).collect::<Vec<_>>() })),
+                "xmppRoomConfig" => backend::xmpp::muc_admin::config(&handle, &room).await.map(|f| serde_json::json!(f)),
+                "xmppSetRoomConfig" => match backend::xmpp::muc_admin::config(&handle, &room).await {
+                    Ok(form) => backend::xmpp::muc_admin::set_config(&handle, &room, &form, params.get("answers").unwrap_or(&serde_json::Value::Null)).await.map(|_| serde_json::json!({})),
+                    Err(e) => Err(e),
+                },
+                "xmppDestroyRoom" => backend::xmpp::muc_admin::destroy(&handle, &room, reason).await.map(|_| serde_json::json!({})),
+                _ => {
+                    // A person is removed, silenced, given voice, made a moderator, banned: each is a role or an
+                    // affiliation, and which one decides how the person is named (a role by nickname, an affiliation
+                    // by address).
+                    let action = p_str(params, "action", "");
+                    let nick = p_str(params, "nick", "");
+                    let jid = p_str_opt(params, "jid").and_then(|j| backend::xmpp::connect::normalise_jid(j).ok());
+                    let known = handle.session().rooms.get(&room).and_then(|r| r.occupants.get(nick).and_then(|o| o.jid.clone()));
+                    let address = jid.or(known);
+                    match (action, address.as_ref()) {
+                        ("kick", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "none", reason).await,
+                        ("mute", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "visitor", reason).await,
+                        ("voice", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "participant", reason).await,
+                        ("moderator", _) => backend::xmpp::muc_admin::set_role(&handle, &room, nick, "moderator", reason).await,
+                        ("ban", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, "outcast", reason).await,
+                        ("unban" | "unmember", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, "none", reason).await,
+                        ("member" | "admin" | "owner", Some(a)) => backend::xmpp::muc_admin::set_affiliation(&handle, &room, a, action, reason).await,
+                        (_, None) => Err("this room does not show that person's address, so it cannot be done by address".to_string()),
+                        _ => Err(format!("unknown room action {action:?}")),
+                    }
+                    .map(|_| serde_json::json!({}))
+                }
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The people on an XMPP account's roster, and what can be done with them. A request for somebody's presence is
+        // what a contact is, so adding one sends it; the other side answers on its own time, and the answer arrives as a
+        // roster push.
+        "xmppAddContact" | "xmppRemoveContact" | "xmppSetContact" | "xmppRequests" | "xmppAnswerRequest" | "xmppOpenChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppRequests" {
+                return (Some(serde_json::json!({ "requests": backend::xmpp::roster::requests(&handle) })), None);
+            }
+            let jid = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                Some(Ok(jid)) => jid,
+                Some(Err(e)) => return (None, Some(e)),
+                None => return (None, Some(format!("{method} requires \"jid\""))),
+            };
+            let name = p_str_opt(params, "name").map(str::trim).filter(|n| !n.is_empty());
+            if method == "xmppOpenChat" {
+                // A conversation with somebody who is not on the roster: nothing is asked of them, and nothing is told them
+                // until something is said.
+                let buffer = backend::xmpp::roster::ensure_buffer(state, &handle, &jid);
+                return (Some(serde_json::json!({ "bufferId": buffer.id })), None);
+            }
+            let result = match method {
+                "xmppAddContact" => backend::xmpp::roster::add_contact(&handle, &jid, name, p_str_opt(params, "group").map(str::trim).filter(|g| !g.is_empty()), p_str_opt(params, "preauth").map(str::trim)).await,
+                "xmppRemoveContact" => backend::xmpp::roster::remove_contact(&handle, &jid).await,
+                "xmppSetContact" => {
+                    let groups = params.get("groups").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|g| g.as_str().map(str::to_string)).collect::<Vec<_>>());
+                    backend::xmpp::roster::set_item(&handle, &jid, name, groups).await
+                }
+                _ => {
+                    if p_bool(params, "accept", true) {
+                        backend::xmpp::roster::accept_request(&handle, &jid).await;
+                    } else {
+                        backend::xmpp::roster::answer_subscription(&handle, &jid, false).await;
+                    }
+                    backend::xmpp::roster::announce_requests(state, &handle);
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The certificate an XMPP account's server showed and was refused for, for the person to look at. Nothing is
+        // trusted by being asked about: `trustXmppCertificate` pins exactly the fingerprint it is given if, and only if,
+        // it is the one the server last showed.
+        "getXmppCertificate" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("getXmppCertificate requires \"accountId\"".to_string())) };
+            match backend::xmpp::transport::refused_by(account_id) {
+                Some(seen) => {
+                    // What the certificate says, and - for one that replaced a pinned certificate - what is different.
+                    let details = backend::xmpp::transport::cert_details(&seen.der);
+                    let pinned: Option<backend::xmpp::transport::CertDetails> = state.accounts.get_xmpp(account_id).filter(|a| !a.pin_sha256.is_empty()).and_then(|a| serde_json::from_str(&a.pin_info).ok());
+                    let changed = match (&pinned, &details) {
+                        (Some(before), Some(now)) => backend::xmpp::transport::what_changed(before, now),
+                        _ => Vec::new(),
+                    };
+                    (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused, "details": details, "pinned": pinned, "changed": changed })), None)
+                }
+                None => (Some(serde_json::json!({})), None),
+            }
+        }
+
+        // Files sent device to device (XEP-0234): the offers waiting, an answer to one, and one sent directly by choice.
+        "xmppFileOffers" | "xmppAnswerFile" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppFileOffers" {
+                return (Some(serde_json::json!(backend::xmpp::filetransfer::offers_json(&handle))), None);
+            }
+            match backend::xmpp::filetransfer::answer(state, &handle, p_str(params, "sid", ""), p_bool(params, "accept", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "xmppSendDirect" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "dm") else { return (None, Some("xmppSendDirect needs a conversation with a person".to_string())) };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let peer = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok());
+            match peer {
+                Some(peer) if backend::xmpp::filetransfer::device_for(&handle, &peer).await.is_some() => {
+                    backend::xmpp::filetransfer::send_later(state, &handle, &buffer, p_str(params, "path", ""));
+                    (Some(serde_json::json!({ "started": true })), None)
+                }
+                _ => (None, Some("No device of theirs that is online takes files sent directly".to_string())),
+            }
+        }
+
+        // The contact list to a file, and from one (roster XML, a XEP-0227 export, or addresses one a line).
+        "xmppExportContacts" | "xmppImportContacts" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(path) = p_str_opt(params, "path").filter(|p| !p.is_empty()) else { return (None, Some(format!("{method} requires \"path\""))) };
+            if method == "xmppExportContacts" {
+                let text = backend::xmpp::contacts::export(&handle);
+                let count = handle.session().roster.len();
+                return match std::fs::write(path, text) {
+                    Ok(()) => (Some(serde_json::json!({ "exported": count })), None),
+                    Err(e) => (None, Some(format!("{path}: {e}"))),
+                };
+            }
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => return (None, Some(format!("{path}: {e}"))),
+            };
+            match backend::xmpp::contacts::parse(&text) {
+                Ok(entries) => (Some(serde_json::to_value(backend::xmpp::contacts::import(&handle, &entries, p_bool(params, "ask", true)).await).unwrap_or_default()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // What the account publishes (PEP nodes): listed, who may read each changed, emptied, deleted.
+        "xmppNodes" | "xmppNodeAccess" | "xmppNodeRemove" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let node = p_str(params, "node", "").to_string();
+            let result = match method {
+                "xmppNodes" => backend::xmpp::nodes::list(&handle).await.map(|n| serde_json::json!({ "nodes": n })),
+                "xmppNodeAccess" => backend::xmpp::nodes::set_access(&handle, &node, p_str(params, "access", "presence")).await.map(|_| serde_json::json!({})),
+                _ => backend::xmpp::nodes::remove(&handle, &node, p_bool(params, "delete", false)).await.map(|_| serde_json::json!({})),
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Privacy lists (XEP-0016): read, written whole, and chosen as default or active.
+        "xmppPrivacyLists" | "xmppPrivacyRules" | "xmppSetPrivacyList" | "xmppChoosePrivacyList" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let name = p_str(params, "name", "").to_string();
+            let result = match method {
+                "xmppPrivacyLists" => backend::xmpp::privacy::lists(&handle).await.map(|l| serde_json::to_value(l).unwrap_or_default()),
+                "xmppPrivacyRules" => backend::xmpp::privacy::rules(&handle, &name).await.map(|r| serde_json::json!({ "rules": r.iter().map(|x| serde_json::json!({ "rule": x, "words": backend::xmpp::privacy::words(x) })).collect::<Vec<_>>() })),
+                "xmppSetPrivacyList" => match serde_json::from_value::<Vec<backend::xmpp::privacy::Rule>>(params.get("rules").cloned().unwrap_or_default()) {
+                    Ok(rules) => backend::xmpp::privacy::set(&handle, &name, &rules).await.map(|_| serde_json::json!({})),
+                    Err(e) => Err(format!("the rules are not readable: {e}")),
+                },
+                _ => backend::xmpp::privacy::choose(&handle, p_str(params, "which", "default"), &name).await.map(|_| serde_json::json!({})),
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Invitations (XEP-0401): which kinds the account's server makes, and one made.
+        "xmppInviteKinds" | "xmppCreateInvite" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppInviteKinds" {
+                return (Some(serde_json::json!({ "kinds": backend::xmpp::invites::offered(&handle).await })), None);
+            }
+            match backend::xmpp::invites::create(&handle, p_str(params, "kind", "contact")).await {
+                Ok(invite) => (Some(serde_json::to_value(invite).unwrap_or_default()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A room's picture (XEP-0486), set by an owner: a file, or "" to take it off.
+        "xmppSetRoomAvatar" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else { return (None, Some("xmppSetRoomAvatar requires a known \"bufferId\"".to_string())) };
+            let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(room) = buffer.remote_id.as_deref().and_then(|r| r.parse::<tokio_xmpp::jid::BareJid>().ok()).filter(|_| buffer.kind == "channel") else { return (None, Some("that is not a room".to_string())) };
+            match backend::xmpp::avatars::set_room(&handle, &room, p_str(params, "path", "")).await {
+                Ok(()) => {
+                    // Shown at once rather than when the room says (some do not say).
+                    backend::xmpp::muc::refresh_avatar(state, &handle, &room).await;
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The account's own profile (its vCard and nickname), as it can be edited, and the edit.
+        "xmppGetProfile" | "xmppSetProfile" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppGetProfile" {
+                return (Some(backend::xmpp::pep::own(&handle).await), None);
+            }
+            let own = backend::xmpp::pep::Own {
+                full_name: p_str(params, "fullName", "").to_string(),
+                nickname: p_str(params, "nickname", "").to_string(),
+                email: p_str(params, "email", "").to_string(),
+                url: p_str(params, "url", "").to_string(),
+                note: p_str(params, "note", "").to_string(),
+            };
+            match backend::xmpp::pep::set_own(&handle, &own).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // An account's connection settings, as the card's Connection tab shows them, and how it last signed in.
+        "getXmppSettings" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("getXmppSettings requires \"accountId\"".to_string())) };
+            let Some(a) = state.accounts.get_xmpp(account_id) else { return (None, Some("no such account".to_string())) };
+            let pinned: Option<backend::xmpp::transport::CertDetails> = serde_json::from_str(&a.pin_info).ok();
+            (
+                Some(serde_json::json!({
+                    "jid": a.jid, "host": a.host, "port": a.port, "security": if a.security.is_empty() { "starttls" } else { a.security.as_str() },
+                    "caPem": a.ca_pem, "pinSha256": a.pin_sha256, "clientCertPem": a.client_cert_pem, "anonymous": a.anonymous, "pinned": pinned, "resource": a.resource,
+                    "lastConnected": a.last_connected, "lastMechanism": a.last_mechanism, "fastToken": !a.fast_token.is_empty(), "fastExpiry": a.fast_expiry,
+                    "scramOnly": a.sasl_floor == "scram",
+                })),
+                None,
+            )
+        }
+
+        // Changes how an account reaches its server, in place: the server and port, the security, the trusted authority, the
+        // pinned certificate, the resource. Checked before it is kept; the account connects again with it.
+        "editXmppAccount" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("editXmppAccount requires \"accountId\"".to_string())) };
+            let Some(current) = state.accounts.get_xmpp(account_id) else { return (None, Some("no such account".to_string())) };
+            let host = p_str(params, "host", &current.host).trim().to_string();
+            let port = match params.get("port") {
+                Some(v) => match v.as_u64().and_then(|v| u16::try_from(v).ok()) {
+                    Some(p) => p,
+                    None => return (None, Some("the port must be a number from 0 to 65535".to_string())),
+                },
+                None => current.port,
+            };
+            let security = match p_str(params, "security", &current.security) {
+                "direct" => "direct",
+                "websocket" => "websocket",
+                _ => "starttls",
+            }
+            .to_string();
+            if security == "websocket" && !host.is_empty() && !host.starts_with("wss://") {
+                return (None, Some("over a WebSocket the server is a wss:// address, or empty to look it up".to_string()));
+            }
+            let ca_pem = p_str(params, "caPem", &current.ca_pem).trim().to_string();
+            let pin_raw = p_str(params, "pinSha256", &current.pin_sha256).to_string();
+            let pin = if pin_raw.trim().is_empty() {
+                String::new()
+            } else {
+                match backend::xmpp::transport::normalise_pin(&pin_raw) {
+                    Some(p) => p,
+                    None => return (None, Some("the pinned certificate must be a SHA-256 fingerprint (64 hex digits)".to_string())),
+                }
+            };
+            let resource = p_str(params, "resource", &current.resource).trim().to_string();
+            if !resource.is_empty() && tokio_xmpp::jid::BareJid::new(&current.jid).ok().and_then(|b| b.with_resource_str(&resource).ok()).is_none() {
+                return (None, Some(format!("{resource:?} cannot be a resource")));
+            }
+            // The trust settings are tried before they are kept: a CA that is not a certificate is said now, not at connecting.
+            let client_cert_pem = p_str(params, "clientCertPem", &current.client_cert_pem).trim().to_string();
+            let settings = backend::xmpp::transport::Settings { account_id: account_id.to_string(), host: host.clone(), port, direct: security == "direct", websocket: security == "websocket", ca_pem: ca_pem.clone(), pin_sha256: pin.clone(), client_cert_pem: client_cert_pem.clone() };
+            if let Err(e) = backend::xmpp::transport::tls_config(&settings, &Default::default()) {
+                return (None, Some(format!("{e:#}")));
+            }
+            let changed = (host != current.host) || port != current.port || security != current.security || ca_pem != current.ca_pem || pin != current.pin_sha256 || resource != current.resource || client_cert_pem != current.client_cert_pem;
+            let pin_changed = pin != current.pin_sha256;
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                (a.host, a.port, a.security, a.ca_pem, a.resource, a.client_cert_pem) = (host, port, security, ca_pem, resource, client_cert_pem);
+                if pin_changed {
+                    a.pin_sha256 = pin;
+                    a.pin_info.clear();
+                }
+            }) {
+                Ok(true) => {
+                    if changed {
+                        backend::xmpp::transport::forget_refused(account_id);
+                        if let Some(config) = state.accounts.get_xmpp(account_id) {
+                            backend::xmpp::spawn(state.clone(), config);
+                        }
+                    }
+                    (Some(serde_json::json!({ "changed": changed })), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "trustXmppCertificate" => {
+            let (Some(account_id), Some(fingerprint)) = (p_str_opt(params, "accountId"), p_str_opt(params, "sha256")) else {
+                return (None, Some("trustXmppCertificate requires \"accountId\" and \"sha256\"".to_string()));
+            };
+            let Some(seen) = backend::xmpp::transport::refused_by(account_id) else {
+                return (None, Some("the server has not shown a certificate that was refused".to_string()));
+            };
+            if backend::xmpp::transport::normalise_pin(fingerprint).as_deref() != Some(seen.sha256.as_str()) {
+                return (None, Some("that is not the certificate the server showed last; connect again and look at it".to_string()));
+            }
+            let pinned = seen.sha256.clone();
+            let info = backend::xmpp::transport::cert_details(&seen.der).and_then(|d| serde_json::to_string(&d).ok()).unwrap_or_default();
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                a.pin_sha256 = pinned;
+                a.pin_info = info;
+            }) {
+                Ok(true) => {
+                    backend::xmpp::transport::forget_refused(account_id);
+                    if let Some(config) = state.accounts.get_xmpp(account_id) {
+                        backend::xmpp::spawn(state.clone(), config);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Making an account on a server: what it asks for, then the answers. A captcha is refused in words. Made, it is signed in as.
+        "xmppRegistrationForm" | "xmppRegister" => {
+            let address = p_str(params, "jid", "").trim().to_string();
+            let domain = address.rsplit('@').next().unwrap_or("").to_string();
+            if domain.is_empty() {
+                return (None, Some("the server's address is needed".to_string()));
+            }
+            let routed_key = format!("xmpp-registration:{domain}");
+            crate::net::route::router().mark(&routed_key, params.get("useTor").and_then(|v| v.as_bool()).unwrap_or(false));
+            let settings = backend::xmpp::transport::Settings {
+                account_id: routed_key,
+                host: p_str(params, "host", "").trim().to_string(),
+                port: params.get("port").and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
+                direct: p_str(params, "security", "starttls") == "direct",
+                websocket: p_str(params, "security", "starttls") == "websocket",
+                ca_pem: p_str(params, "caPem", "").to_string(),
+                pin_sha256: backend::xmpp::transport::normalise_pin(p_str(params, "pinSha256", "")).unwrap_or_default(),
+                client_cert_pem: String::new(),
+            };
+            let preauth = p_str(params, "preauth", "").to_string();
+            let registration = match backend::xmpp::register::form(settings.clone(), &domain, &preauth).await {
+                Ok(r) => r,
+                Err(e) => return (None, Some(e)),
+            };
+            if method == "xmppRegistrationForm" {
+                return (Some(serde_json::json!(registration)), None);
+            }
+            let Some(form) = registration.form else { return (None, Some("this server asks for its own page to be used".to_string())) };
+            let answers = params.get("answers").cloned().unwrap_or(serde_json::Value::Null);
+            if let Err(e) = backend::xmpp::register::submit(settings.clone(), &domain, &form, &answers, &preauth).await {
+                return (None, Some(e));
+            }
+            let (Some(user), Some(password)) = (answers.get("username").and_then(|v| v.as_str()), answers.get("password").and_then(|v| v.as_str())) else {
+                return (Some(serde_json::json!({ "registered": true })), None);
+            };
+            let Ok(jid) = backend::xmpp::connect::normalise_jid(&format!("{user}@{domain}")) else { return (Some(serde_json::json!({ "registered": true })), None) };
+            let config = crate::accounts::XmppAccountConfig {
+                jid: jid.to_string(),
+                password: password.to_string(),
+                host: settings.host,
+                port: settings.port,
+                security: if settings.websocket { "websocket".into() } else if settings.direct { "direct".into() } else { "starttls".into() },
+                ca_pem: settings.ca_pem,
+                pin_sha256: settings.pin_sha256,
+                use_tor: params.get("useTor").and_then(|v| v.as_bool()).unwrap_or(false),
+                ..Default::default()
+            };
+            match state.accounts.add_xmpp(config) {
+                Ok(config) => {
+                    let account_id = config.account_id();
+                    backend::xmpp::spawn(state.clone(), config);
+                    // An invitation that named who sent it (`xmpp:them?roster;preauth=…`): the new account asks them, with the
+                    // same token, as soon as it is in - which is what links the two on a server that does not do it itself.
+                    let inviter = p_str(params, "inviter", "").trim().to_string();
+                    let preauth = p_str(params, "preauth", "").trim().to_string();
+                    if let (Ok(inviter), false) = (backend::xmpp::connect::normalise_jid(&inviter), preauth.is_empty()) {
+                        let (state, id) = (state.clone(), account_id.clone());
+                        tokio::spawn(async move {
+                            for _ in 0..120 {
+                                if let Some(handle) = state.runtime.xmpp_handle(&id) {
+                                    if let Err(e) = backend::xmpp::roster::add_contact(&handle, &inviter, None, None, Some(&preauth)).await {
+                                        tracing::info!("xmpp[{id}]: adding {inviter}, who sent the invitation: {e}");
+                                    }
+                                    return;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        });
+                    }
+                    (Some(serde_json::json!({ "registered": true, "accountId": account_id })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Things an XMPP account does on the server it is on: its password, its end, what the server says it is, the people it
+        // has blocked, and the commands that things offer (a server's own administration, a gateway's menu).
+        "xmppChangePassword" | "xmppDeleteAccount" | "xmppServerInfo" | "xmppBlocklist" | "xmppBlock" | "xmppCommands" | "xmppCommand" | "xmppArchivePrefs" | "xmppSetArchivePrefs" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let result: Result<serde_json::Value, String> = match method {
+                "xmppChangePassword" => {
+                    let new = p_str(params, "password", "").to_string();
+                    match backend::xmpp::account::change_password(&handle, &new).await {
+                        Ok(()) => {
+                            // Kept, so the next connection signs in with it.
+                            let kept = new.clone();
+                            let _ = state.accounts.mutate_xmpp(account_id, move |a| a.password = kept);
+                            Ok(serde_json::json!({}))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                "xmppDeleteAccount" => backend::xmpp::account::delete(&handle).await.map(|_| serde_json::json!({})),
+                "xmppServerInfo" => backend::xmpp::account::server_info(&handle).await,
+                "xmppBlocklist" => Ok(serde_json::json!({ "blocked": handle.session().blocked.iter().cloned().collect::<Vec<_>>() })),
+                "xmppBlock" => match p_str_opt(params, "jid") {
+                    Some(j) => {
+                        // Said to the server as spam or abuse too, if the person chose to (XEP-0377).
+                        let report = p_str_opt(params, "report").filter(|r| !r.is_empty()).map(|r| (r, p_str(params, "reportText", "")));
+                        backend::xmpp::blocking::set_reporting(&handle, j.trim(), p_bool(params, "block", true), report).await.map(|_| serde_json::json!({}))
+                    }
+                    None => Err("xmppBlock requires \"jid\"".to_string()),
+                },
+                "xmppArchivePrefs" => backend::xmpp::archive_prefs::get(&handle).await.map(|p| serde_json::json!(p)),
+                "xmppSetArchivePrefs" => {
+                    let list = |k: &str| params.get(k).and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|j| j.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+                    let prefs = backend::xmpp::archive_prefs::Prefs { default: p_str(params, "default", "always").to_string(), always: list("always"), never: list("never") };
+                    backend::xmpp::archive_prefs::set(&handle, &prefs).await.map(|_| serde_json::json!({}))
+                }
+                _ => {
+                    // The address whose commands these are: the account's server by default.
+                    let to = p_str_opt(params, "to").filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(|| handle.own().domain().as_str().to_string());
+                    match to.parse::<tokio_xmpp::jid::Jid>() {
+                        Err(_) => Err(format!("{to:?} is not an address")),
+                        Ok(to) if method == "xmppCommands" => backend::xmpp::adhoc::list(&handle, &to).await.map(|c| serde_json::json!({ "commands": c })),
+                        Ok(to) => {
+                            let node = p_str(params, "node", "");
+                            let session = p_str(params, "sessionId", "");
+                            let action = p_str(params, "action", "execute");
+                            let form: Option<backend::xmpp::dataform::Form> = params.get("form").and_then(|f| serde_json::from_value(f.clone()).ok());
+                            backend::xmpp::adhoc::run(&handle, &to, node, session, action, form.as_ref(), params.get("answers").unwrap_or(&serde_json::Value::Null)).await.map(|s| serde_json::json!(s))
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // OMEMO: a conversation encrypted or not, and who is trusted. A fingerprint is the identity key a device showed; trusting
+        // one is the person's call after comparing it with the other person.
+        "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" | "xmppOmemoReset" | "xmppOmemoVerifyUri" => {
+            let (account_id, buffer) = match method {
+                "xmppSetEncryption" => {
+                    let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && (b.kind == "dm" || b.kind == "channel")) else {
+                        return (None, Some("encryption is turned on for a conversation with a person, or a room".to_string()));
+                    };
+                    (b.account_id.clone(), Some(b))
+                }
+                _ => match p_str_opt(params, "accountId") {
+                    Some(a) => (a.to_string(), None),
+                    None => return (None, Some(format!("{method} requires \"accountId\""))),
+                },
+            };
+            let Some(handle) = state.runtime.xmpp_handle(&account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let Some(omemo) = handle.session().omemo.clone() else { return (None, Some("OMEMO is not ready on this account yet".to_string())) };
+            match method {
+                "xmppSetEncryption" => {
+                    let Some(buffer) = buffer else { return (None, Some("no such conversation".to_string())) };
+                    let on = p_bool(params, "on", true);
+                    let Some(jid) = buffer.remote_id.clone() else { return (None, Some("no such conversation".to_string())) };
+                    if on {
+                        // Only if there is somebody to encrypt to: turning it on and then failing every send is worse than saying no now.
+                        let Ok(bare) = jid.parse::<tokio_xmpp::jid::BareJid>() else { return (None, Some("not an address".to_string())) };
+                        if buffer.kind == "channel" {
+                            match backend::xmpp::send::room_recipients(&handle, &bare).await {
+                                Ok(people) if people.is_empty() => return (None, Some("there is nobody else in this room to encrypt to yet".to_string())),
+                                Ok(_) => {}
+                                Err(e) => return (None, Some(e)),
+                            }
+                        } else if backend::xmpp::omemo::usable_devices(&handle, &omemo, &bare, false).await.is_empty() {
+                            return (None, Some(format!("{jid} has no device that can be encrypted to: they may not use OMEMO, or their devices are not trusted")));
+                        }
+                    }
+                    {
+                        let mut store = omemo.store();
+                        if on {
+                            store.state.enabled.insert(jid);
+                        } else {
+                            store.state.enabled.remove(&jid);
+                        }
+                        store.save();
+                    }
+                    state.runtime.set_buffer_encrypted(state, &buffer.id, on);
+                    (Some(ok_node()), None)
+                }
+                "xmppOmemoDevices" => {
+                    let mut out = Vec::new();
+                    let me = handle.own();
+                    let people: Vec<tokio_xmpp::jid::BareJid> = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                        Some(Ok(j)) => vec![j, me.clone()],
+                        _ => vec![me.clone()],
+                    };
+                    for person in &people {
+                        for device in backend::xmpp::omemo::devices_of(&handle, &omemo, person, true).await {
+                            let omemo2 = backend::xmpp::omemo::speaks_v2(&omemo, person.as_str(), device);
+                            let store = omemo.store();
+                            let key = backend::xmpp::omemo::store::key(person.as_str(), device);
+                            let identity = store.state.identities.get(&key).cloned().unwrap_or_default();
+                            out.push(serde_json::json!({
+                                "jid": person.to_string(), "device": device, "own": device == store.state.device_id && *person == me,
+                                "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&identity), "known": !identity.is_empty(),
+                                "trust": store.trust_of(person.as_str(), device), "omemo2": omemo2,
+                            }));
+                        }
+                    }
+                    let store = omemo.store();
+                    let own_key = store.identity().public;
+                    let own = backend::xmpp::omemo::curve::hex(&own_key);
+                    // This device's verification links (and their QR codes): the form most clients scan, and XEP-0434's, which
+                    // also vouches for this account's other verified devices.
+                    let others: Vec<[u8; 32]> = store.verified().into_iter().filter(|(j, ..)| *j == me.as_str()).map(|(.., k)| k).collect();
+                    let (uri, trust_uri) = backend::xmpp::omemo::atm::own_uris(me.as_str(), store.state.device_id, &own_key, &others);
+                    let qr = backend::xmpp::omemo::atm::qr_svg(&uri);
+                    let trust_qr = backend::xmpp::omemo::atm::qr_svg(&trust_uri);
+                    (Some(serde_json::json!({ "deviceId": store.state.device_id, "fingerprint": backend::xmpp::omemo::store::Store::fingerprint(&own), "devices": out, "uri": uri, "qr": qr, "trustUri": trust_uri, "trustQr": trust_qr })), None)
+                }
+                // A verification link (scanned or pasted): the keys it vouches for are verified (those it distrusts distrusted), now
+                // for devices already seen, when they are seen otherwise; then the devices that should know are told (ATM).
+                "xmppOmemoVerifyUri" => {
+                    let Some(uri) = p_str_opt(params, "uri") else { return (None, Some("xmppOmemoVerifyUri requires \"uri\"".to_string())) };
+                    let Some((owner, keys)) = backend::xmpp::omemo::atm::parse_uri(uri) else {
+                        return (None, Some("That is not an OMEMO verification link (xmpp:…?omemo-sid-…, or a trust-message link for OMEMO 2)".to_string()));
+                    };
+                    let Ok(owner_jid) = backend::xmpp::connect::normalise_jid(&owner) else { return (None, Some("the link's address is not valid".to_string())) };
+                    backend::xmpp::omemo::learn_identities(&handle, &omemo, &owner_jid).await;
+                    let (mut verified, mut distrusted, mut waiting) = (0, 0, 0);
+                    for (k, trust) in keys.trust.iter().map(|k| (*k, true)).chain(keys.distrust.iter().map(|k| (*k, false))) {
+                        let devices = omemo.store().decide_key(owner_jid.as_str(), &k, trust);
+                        match (devices.is_empty(), trust) {
+                            (true, _) => waiting += 1,
+                            (false, true) => verified += devices.len(),
+                            (false, false) => distrusted += devices.len(),
+                        }
+                        if !devices.is_empty() {
+                            let (h, o) = (handle.clone(), owner_jid.clone());
+                            tokio::spawn(async move { backend::xmpp::send::atm_announce(&h, &o, k, trust).await });
+                        }
+                    }
+                    (Some(serde_json::json!({ "jid": owner_jid.to_string(), "verified": verified, "distrusted": distrusted, "waiting": waiting })), None)
+                }
+                // A broken session is replaced by hand (XEP-0384: never on its own): every session with the person's devices.
+                "xmppOmemoReset" => {
+                    let Some(Ok(jid)) = p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) else { return (None, Some("xmppOmemoReset requires \"jid\"".to_string())) };
+                    match backend::xmpp::send::omemo_reset(&handle, &jid).await {
+                        Ok(n) => (Some(serde_json::json!({ "devices": n })), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
+                _ => {
+                    let (Some(jid), Some(device), Some(trust)) = (p_str_opt(params, "jid"), params.get("device").and_then(|v| v.as_u64()), p_str_opt(params, "trust")) else {
+                        return (None, Some("xmppOmemoTrust requires \"jid\", \"device\" and \"trust\"".to_string()));
+                    };
+                    let trust = match trust {
+                        "trusted" => backend::xmpp::omemo::store::Trust::Trusted,
+                        "verified" => backend::xmpp::omemo::store::Trust::Verified,
+                        "untrusted" => backend::xmpp::omemo::store::Trust::Untrusted,
+                        _ => return (None, Some("trust is trusted, verified or untrusted".to_string())),
+                    };
+                    omemo.store().set_trust(jid, device as u32, trust);
+                    // Verified or distrusted by hand: the devices that should know are told (ATM). Blind trust is not news.
+                    let identity = omemo.store().state.identities.get(&backend::xmpp::omemo::store::key(jid, device as u32)).and_then(|h| backend::xmpp::omemo::curve::unhex(h)).and_then(|b| <[u8; 32]>::try_from(b).ok());
+                    if let (Some(k), Ok(owner), true) = (identity, jid.parse::<tokio_xmpp::jid::BareJid>(), trust != backend::xmpp::omemo::store::Trust::Trusted) {
+                        let h = handle.clone();
+                        tokio::spawn(async move { backend::xmpp::send::atm_announce(&h, &owner, k, trust == backend::xmpp::omemo::store::Trust::Verified).await });
+                    }
+                    (Some(ok_node()), None)
+                }
+            }
+        }
+
+        // Whether anybody is looking (client state indication): every XMPP account tells its server.
+        "xmppSetActive" => {
+            let active = p_bool(params, "active", true);
+            for account in state.accounts.all_xmpp() {
+                if let Some(handle) = state.runtime.xmpp_handle(&account.account_id()) {
+                    handle.set_active(active);
+                } else {
+                    // Not connected yet: it will be told when it is.
+                }
+            }
+            (Some(ok_node()), None)
+        }
+
+        // The account's own picture: a file, or nothing to take it off.
+        "xmppSetAvatar" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("xmppSetAvatar requires \"accountId\"".to_string())) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            match backend::xmpp::avatars::set_own(&handle, p_str(params, "path", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A new password for an account the server stopped accepting one for.
+        "setXmppPassword" => {
+            let (Some(account_id), Some(password)) = (p_str_opt(params, "accountId"), p_str_opt(params, "password")) else {
+                return (None, Some("setXmppPassword requires \"accountId\" and \"password\"".to_string()));
+            };
+            let password = password.to_string();
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                // A new password starts the sign-in over: the token and the floor belonged to the old one.
+                a.password = password;
+                a.fast_token.clear();
+                a.fast_mechanism.clear();
+                a.fast_expiry.clear();
+                a.sasl_floor.clear();
+            }) {
+                Ok(true) => {
+                    if let Some(config) = state.accounts.get_xmpp(account_id) {
+                        backend::xmpp::spawn(state.clone(), config);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // The second factor Stoat asked for, for a sign-in that is waiting.
@@ -5140,10 +6054,17 @@ pub async fn dispatch(
         // One call of Steam's voice signalling: see backend/steam/voice.rs.
         "steamVoice" => match p_str_opt(params, "accountId") {
             None => (None, Some("steamVoice requires \"accountId\"".to_string())),
-            Some(account_id) => match backend::steam::voice::act(state, account_id, params).await {
-                Ok(done) => (Some(done), None),
-                Err(e) => (None, Some(e)),
-            },
+            Some(account_id) => {
+                // Starting or taking a call (or a room's voice) on an account routed through Tor would send its media around Tor.
+                let starts = matches!(params["op"].as_str(), Some("initiate" | "requestCall" | "joinRoom")) || (params["op"].as_str() == Some("answerCall") && params["accept"].as_bool().unwrap_or(true));
+                if let Some(why) = crate::net::route::router().call_refusal(account_id).filter(|_| starts) {
+                    return (None, Some(why));
+                }
+                match backend::steam::voice::act(state, account_id, params).await {
+                    Ok(done) => (Some(done), None),
+                    Err(e) => (None, Some(e)),
+                }
+            }
         },
         "steamChatGroupAction" => {
             use backend::steam::chatgroups::Action;
@@ -5278,7 +6199,7 @@ pub async fn dispatch(
 
         // What this account keeps about a friend - what it calls them, whether
         // their messages notify it - and blocking them. By the conversation.
-        "steamSetNickname" | "steamSetFriendMuted" | "steamBlockFriend" => {
+        "steamSetNickname" | "steamBlockFriend" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {
                 return (None, Some(format!("{method} requires a known \"bufferId\"")));
             };
@@ -5291,7 +6212,6 @@ pub async fn dispatch(
             let number = backend::steam::steamid::account_of(friend).unwrap_or_default();
             let done = match method {
                 "steamSetNickname" => backend::steam::prefs::set_nickname(&link, number, p_str(params, "nickname", "")).await,
-                "steamSetFriendMuted" => backend::steam::prefs::set_muted(&link, number, p_bool(params, "muted", true)).await,
                 _ => backend::steam::prefs::block(&link, friend, p_bool(params, "block", true)).await,
             };
             match done {
@@ -6475,6 +7395,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("xmpp:") {
+                return match state.runtime.xmpp_handle(&buffer.account_id) {
+                    Some(handle) => (Some(backend::xmpp::calls::muji::members(&handle, &buffer.id)), None),
+                    None => (Some(serde_json::json!([])), None),
+                };
+            }
             let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
                 return (Some(serde_json::json!([])), None);
             };
@@ -6808,6 +7734,7 @@ pub async fn dispatch(
             state.runtime.clear_buffer_groups_for_account(account_id);
             state.highlights.forget(account_id);
             state.ignores.forget(account_id);
+            state.notify_levels.forget_account(account_id);
             state.runtime.forget_account(account_id);
             if let Err(e) = state.store.forget_account(account_id) {
                 tracing::warn!("could not clear the scrollback for {account_id}: {e}");
@@ -7174,6 +8101,23 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if joined {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
+            // XMPP: the conversation's group call (XEP-0272), joined or left; see `backend/xmpp/calls/muji.rs`.
+            if buffer.account_id.starts_with("xmpp:") {
+                let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+                if !joined {
+                    backend::xmpp::calls::muji::leave(state, &handle, &buffer.id).await;
+                    return (Some(ok_node()), None);
+                }
+                return match backend::xmpp::calls::muji::join(state, &handle, &buffer).await {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(account) = state.accounts.get_matrix(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
@@ -7290,6 +8234,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("xmpp:") {
+                return match state.runtime.xmpp_handle(&buffer.account_id) {
+                    Some(handle) => (Some(backend::xmpp::calls::muji::members(&handle, &buffer.id)), None),
+                    None => (Some(serde_json::json!([])), None),
+                };
+            }
             let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
                 return (Some(serde_json::json!([])), None);
             };

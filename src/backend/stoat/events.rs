@@ -796,6 +796,9 @@ mod tests {
         assert_eq!(super::super::people::incoming(&h).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>(), vec!["erin"]);
         handle(&state, &h, &json!({ "type": "UserRelationship", "id": "ME", "user": { "_id": "ERIN", "username": "erin", "relationship": "Friend" } }));
         assert!(super::super::people::incoming(&h).is_empty(), "answered: no longer waiting");
+        let page = super::super::people::page(&h);
+        assert_eq!(page["friends"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect::<Vec<_>>(), vec!["erin"], "a friend is on the friends page");
+        assert!(page["outgoing"].as_array().unwrap().is_empty() && page["blocked"].as_array().unwrap().is_empty());
     }
 
     /// A role changing or an own membership changing makes the server's channels again, which takes the world's lock: an

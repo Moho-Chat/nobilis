@@ -96,22 +96,34 @@ pub async fn leave_server(state: &AppState, handle: &Handle, server: &str) -> Re
     Ok(())
 }
 
-/// Everybody who has asked to be this account's friend, as the invitations tile lists them.
-pub fn incoming(handle: &Handle) -> Vec<Value> {
+/// Everybody whose relationship to this account is `relationship`, by name.
+fn with_relationship(handle: &Handle, relationship: &str) -> Vec<Value> {
     let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
-    let mut list: Vec<(&String, &super::world::User)> = world.users.iter().filter(|(_, u)| u.relationship == "Incoming").collect();
+    let mut list: Vec<(&String, &super::world::User)> = world.users.iter().filter(|(_, u)| u.relationship == relationship).collect();
     list.sort_by_key(|(_, u)| u.name.to_lowercase());
     list.into_iter()
         .map(|(id, u)| {
             let avatar = u.avatar.as_deref().and_then(|f| media::file_url(&handle.instance, "avatars", f)).map(|url| media::cached(&handle.account_id, media::AVATARS, &url, None, None));
-            json!({ "id": id, "name": u.name, "avatarUrl": avatar })
+            json!({ "id": id, "name": u.name, "avatarUrl": avatar, "online": u.online && u.presence != "Invisible", "statusText": u.status_text })
         })
         .collect()
 }
 
-/// Says the list of requests, so the tile is right.
+/// Everybody who has asked to be this account's friend, as the invitations tile lists them.
+pub fn incoming(handle: &Handle) -> Vec<Value> {
+    with_relationship(handle, "Incoming")
+}
+
+/// Everybody on this account's friends page: its friends, the requests it is waiting on, and who it has blocked.
+pub fn page(handle: &Handle) -> Value {
+    json!({ "incoming": incoming(handle), "friends": with_relationship(handle, "Friend"), "outgoing": with_relationship(handle, "Outgoing"), "blocked": with_relationship(handle, "Blocked") })
+}
+
+/// Says the lists of people, so the tile and the friends page are right.
 pub fn tell_requests(state: &AppState, handle: &Handle) {
-    state.events.emit("stoatFriendRequests", json!({ "accountId": handle.account_id, "incoming": incoming(handle) }));
+    let mut page = page(handle);
+    page["accountId"] = json!(handle.account_id);
+    state.events.emit("stoatFriendRequests", page);
 }
 
 /// Asks somebody to be a friend by their `name#1234`.

@@ -197,6 +197,10 @@ pub struct Account {
     /// moderate, whisper and change its colour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub moderation: bool,
+    /// XMPP only: why an account that stopped did (`password`, `certificate`, `certificate-changed`, `setup`), so the card can
+    /// say it in a word and offer the one thing that helps.
+    #[serde(rename = "stopReason", default, skip_serializing_if = "String::is_empty")]
+    pub stop_reason: String,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on
@@ -341,17 +345,23 @@ pub struct Buffer {
     /// before the channel was ever seen still reads correctly once it is.
     #[serde(rename = "remoteId", skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
-    /// Muted on the account itself rather than in this window.
+    /// What this conversation was set to: every message, only what mentions
+    /// you, nothing - or left alone, which says nothing at all.
     ///
-    /// A Discord guild or channel silenced in the official client, a Matrix
-    /// room silenced by a push rule - the setting travels with the account, so
-    /// every device signed in to it is already honouring it and this one
-    /// should too. Carried separately from a frontend's own mute because the
-    /// two are not the same offer: this one was made somewhere else and
-    /// cannot be undone from here, and a client that drew them identically
-    /// would put an un-mute in front of somebody that does nothing.
-    #[serde(rename = "serverMuted", default, skip_serializing_if = "std::ops::Not::not")]
-    pub server_muted: bool,
+    /// Kept on the account where the service has a setting for it (Matrix push
+    /// rules, a Discord channel override), so one made on a phone arrives here
+    /// and one made here arrives there; kept by the daemon everywhere else.
+    /// A frontend draws and offers it the same either way - see notify.rs. It
+    /// is the level as set on *this* conversation: what a server's own default
+    /// makes of it is the daemon's to apply, not a frontend's to work out.
+    #[serde(default, skip_serializing_if = "crate::notify::NotifyLevel::is_default")]
+    pub notify: crate::notify::NotifyLevel,
+    /// What actually applies, where that is not what was set here: a channel
+    /// left on its default inside a server somebody muted is silent, and a row
+    /// that drew itself as an ordinary channel would be a lie about the sound.
+    /// Absent when the two agree, which is nearly always.
+    #[serde(rename = "notifyApplied", default, skip_serializing_if = "Option::is_none")]
+    pub notify_applied: Option<crate::notify::NotifyLevel>,
     /// Starred on the account itself: Matrix's `m.favourite` tag today.
     ///
     /// The account's own filing rather than this window's, and the reason it
@@ -938,6 +948,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("twitch") => "twitch",
         Some("telegram") => "telegram",
         Some("stoat") => "stoat",
+        Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
@@ -1057,7 +1068,8 @@ mod tests {
             channel_modes: None,
             group_id: None,
             remote_id: None,
-            server_muted: false,
+            notify: crate::notify::NotifyLevel::Default,
+            notify_applied: None,
             favourite: false,
             low_priority: false,
             service_room: false,

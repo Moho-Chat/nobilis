@@ -18,6 +18,16 @@ use crate::state::AppState;
 use serde_json::json;
 use std::collections::HashMap;
 
+/// A friend's level: Steam keeps only whether their messages notify the
+/// account at all, so there are two to read.
+pub fn friend_level(muted: bool) -> crate::notify::NotifyLevel {
+    if muted {
+        crate::notify::NotifyLevel::Mute
+    } else {
+        crate::notify::NotifyLevel::Default
+    }
+}
+
 /// What the window was last told about one person.
 #[derive(Clone, Debug, PartialEq)]
 struct Shown {
@@ -65,7 +75,8 @@ impl Conversations {
     /// conversations: muted on Steam is silent here, and the row says so.
     pub fn apply_mutes(&self, state: &AppState, roster: &Roster) {
         for (account, shown) in &self.shown {
-            state.runtime.set_silenced(state, &crate::model::buffer_id(&self.account_id, &shown.name), roster.muted(*account));
+            let level = friend_level(roster.muted(*account));
+            state.runtime.set_notify_level(state, &crate::model::buffer_id(&self.account_id, &shown.name), level, level);
         }
     }
 
@@ -109,7 +120,8 @@ impl Conversations {
             // Made new, or renamed from its number: a warning on it comes back.
             super::notices::restore_buffer(state, &self.account_id, &buffer.id);
             // And whether the account has muted them, wherever it did.
-            state.runtime.set_silenced(state, &buffer.id, roster.muted(account));
+            let level = friend_level(roster.muted(account));
+            state.runtime.set_notify_level(state, &buffer.id, level, level);
             state.runtime.set_buffer_remote_id(state, &buffer.id, &steamid::text_of(account));
             // Under no heading of a service's: see groups::unfile_conversations.
             super::groups::unfile_one(state, &buffer.id);
@@ -280,14 +292,14 @@ mod tests {
         let mut shown = Conversations::new(ACCOUNT);
         shown.publish(&state, &roster);
         let id = crate::model::buffer_id(ACCOUNT, "Gabe");
-        assert!(!state.runtime.get_buffer(&id).unwrap().server_muted);
+        assert!(state.runtime.get_buffer(&id).unwrap().notify != crate::notify::NotifyLevel::Mute);
         // Muted in another client: it arrives as the account's preferences for them.
         roster.set_preferences(&PerFriendPreferences { accountid: Some(22202), notifications_showmessages: Some(crate::backend::steam::friends::NOTIFY_NEVER), ..Default::default() });
         shown.apply_mutes(&state, &roster);
-        assert!(state.runtime.get_buffer(&id).unwrap().server_muted, "the row says it is muted");
+        assert!(state.runtime.get_buffer(&id).unwrap().notify == crate::notify::NotifyLevel::Mute, "the row says it is muted");
         roster.set_preferences(&PerFriendPreferences { accountid: Some(22202), ..Default::default() });
         shown.apply_mutes(&state, &roster);
-        assert!(!state.runtime.get_buffer(&id).unwrap().server_muted);
+        assert!(state.runtime.get_buffer(&id).unwrap().notify != crate::notify::NotifyLevel::Mute);
     }
 
     #[test]

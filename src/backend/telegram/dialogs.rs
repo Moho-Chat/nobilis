@@ -73,7 +73,8 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result
         }
         // Silenced on the account, perhaps on the phone.
         if let tl::enums::Dialog::Dialog(d) = &dialog.raw {
-            state.runtime.set_silenced(state, &buffer.id, super::notify::silent(&d.notify_settings, chrono::Utc::now().timestamp()));
+            let level = super::notify::level_of(super::notify::silent(&d.notify_settings, chrono::Utc::now().timestamp()));
+            state.runtime.set_notify_level(state, &buffer.id, level, level);
         }
         // Nothing unread there, as Telegram counts it: the window need not call it unread either.
         if matches!(&dialog.raw, tl::enums::Dialog::Dialog(d) if d.unread_count == 0) {

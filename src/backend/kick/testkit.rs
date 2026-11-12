@@ -33,6 +33,7 @@ pub(crate) fn simulated_daemon(name: &str) -> AppState {
         irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(dir.join("irc-sts.toml"))),
         highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
         ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
+        notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(dir.join("notify.toml"))),
     }
 }
 

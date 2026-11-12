@@ -262,6 +262,7 @@ dependencies = [
  "num-traits",
  "rusticata-macros",
  "thiserror 2.0.21",
+ "time",
 ]
 
 [[package]]
@@ -527,6 +528,15 @@ dependencies = [
 
 [[package]]
 name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
+name = "block-padding"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
@@ -618,6 +628,24 @@ name = "caret"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3135adcc2ec978dbad556b41b7c71e0be7625d70b79159a8a19b5879a761115"
+
+[[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher 0.4.4",
+]
 
 [[package]]
 name = "cbc"
@@ -775,6 +803,20 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -1374,6 +1416,7 @@ dependencies = [
  "cookie-factory",
  "displaydoc",
  "nom",
+ "num-bigint 0.4.8",
  "num-traits",
  "rusticata-macros",
 ]
@@ -3049,6 +3092,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
+ "block-padding 0.3.3",
  "generic-array",
 ]
 
@@ -3058,7 +3102,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "block-padding",
+ "block-padding 0.4.2",
  "hybrid-array",
 ]
 
@@ -3172,6 +3216,18 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jid"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01200283c7e9307b1afee820eea16008048b6712ef768617e18f36aadb1ed272"
+dependencies = [
+ "idna",
+ "memchr",
+ "minidom",
+ "stringprep",
+]
 
 [[package]]
 name = "jiff"
@@ -3972,6 +4028,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "minidom"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50b47a02dceb0a36b59ebd5971ce47b9db62593527f9e6800d640f3677fc0021"
+dependencies = [
+ "rxml",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4091,8 +4157,9 @@ dependencies = [
 
 [[package]]
 name = "nobilis"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "anyhow",
  "argon2",
@@ -4100,9 +4167,11 @@ dependencies = [
  "base32",
  "base64 0.22.1",
  "bytes",
+ "cbc 0.1.2",
  "chacha20poly1305 0.10.1",
  "chrono",
  "cpal",
+ "curve25519-dalek 4.1.3",
  "davey",
  "dirs 5.0.1",
  "flate2",
@@ -4112,11 +4181,15 @@ dependencies = [
  "grammers-mtsender",
  "grammers-session",
  "hex",
+ "hickory-resolver",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
  "hmac 0.13.0",
  "http-body-util",
  "hyper",
  "hyper-util",
  "iana-time-zone",
+ "idna",
  "image",
  "imagesize",
  "irc",
@@ -4137,24 +4210,33 @@ dependencies = [
  "ruma-events",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
+ "sasl",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha1 0.11.0",
  "sha2 0.10.9",
  "socket2",
  "sonora",
+ "stringprep",
  "symphonia",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-socks",
  "tokio-tungstenite",
  "tokio-util",
+ "tokio-xmpp",
  "toml 0.8.23",
  "tor-rtcompat",
  "tracing",
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
+ "x25519-dalek 2.0.1",
+ "x509-parser",
+ "xmpp-parsers",
 ]
 
 [[package]]
@@ -4550,6 +4632,15 @@ checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
 dependencies = [
  "objc2",
  "objc2-foundation",
+]
+
+[[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
 ]
 
 [[package]]
@@ -5972,6 +6063,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rxml"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4959705975475401c48b375deedd848d15b816c3915978fc617b31a1776fb60a"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "pin-project-lite",
+ "rxml_proc",
+ "rxml_validation 0.12.0",
+ "tokio",
+]
+
+[[package]]
+name = "rxml_proc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d46a2e263a1beb8b39e69bffee9f2395f479cc02472c247af00e065006970ca7"
+dependencies = [
+ "quote",
+ "rxml_validation 0.11.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "rxml_validation"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "826e80413b9a35e9d33217b3dcac04cf95f6559d15944b93887a08be5496c4a4"
+
+[[package]]
+name = "rxml_validation"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4895cf728e9ef2b921d1b80793affb1a2d2e0cbd6c24555c18e25d8aee0124b8"
+dependencies = [
+ "compact_str",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6024,6 +6155,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc984f4f9ceb736a7bb755c3e3bd17dc56370af2600c9780dcc48c66453da34d"
 dependencies = [
  "regex",
+]
+
+[[package]]
+name = "sasl"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6777dddc8108d9f36afbb008bc15b18edab2d17a8664ef58380b9398460e4e30"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
+ "pbkdf2 0.12.2",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -6673,6 +6818,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "stringprep"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1"
+dependencies = [
+ "unicode-bidi",
+ "unicode-normalization",
+ "unicode-properties",
+]
+
+[[package]]
 name = "strsim"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7135,6 +7291,30 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-xmpp"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8921a165ab1eefd447cb1661423c582ac77b9c6960e123a71c8ad9cebc40b026"
+dependencies = [
+ "bytes",
+ "futures",
+ "hickory-resolver",
+ "idna",
+ "log",
+ "pin-project-lite",
+ "rand 0.10.2",
+ "rustls-native-certs",
+ "rxml",
+ "sasl",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "xmpp-parsers",
+ "xso",
 ]
 
 [[package]]
@@ -8480,6 +8660,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8493,6 +8679,12 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unicode-segmentation"
@@ -8613,7 +8805,7 @@ dependencies = [
  "arrayvec",
  "base64 0.23.1",
  "base64ct",
- "cbc",
+ "cbc 0.2.1",
  "chacha20poly1305 0.11.0",
  "cipher 0.5.2",
  "curve25519-dalek 5.0.0",
@@ -9294,6 +9486,72 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "x509-parser"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
+name = "xmpp-parsers"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92b5d63bbd122ce3b5287d83efdd6916fb88bb274be23f6a9140238e0e1465b0"
+dependencies = [
+ "base64 0.22.1",
+ "blake2",
+ "chrono",
+ "digest 0.11.3",
+ "jid",
+ "log",
+ "minidom",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "sha3 0.12.0",
+ "uuid",
+ "xso",
+]
+
+[[package]]
+name = "xso"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0e57b564328d6826ab1fe8775f45ea062522cc2c345efd6e9de2c9ebcc94a1e"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "jid",
+ "minidom",
+ "rxml",
+ "serde_json",
+ "uuid",
+ "xso_proc",
+]
+
+[[package]]
+name = "xso_proc"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd68a7ea9d0463945b441dd8003121da60f2ab07f70f6a7510ac59eedd6ae6aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rxml_validation 0.12.0",
+ "syn 2.0.119",
 ]
 
 [[package]]

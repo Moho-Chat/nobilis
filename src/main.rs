@@ -11,6 +11,7 @@ mod ignores;
 mod ipc;
 mod media_cache;
 mod model;
+mod notify;
 mod net;
 mod oggopus;
 mod opus_packet;
@@ -312,6 +313,7 @@ async fn run() -> Result<()> {
         irc_sts: Arc::new(backend::irc::sts::StsStore::open(opts.data_dir.join("irc-sts.toml"))),
         highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
         ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
+        notify_levels: Arc::new(crate::notify::NotifyStore::open(opts.data_dir.join("notify.toml"))),
     };
     media_cache::init(state.store.clone(), opts.data_dir.clone());
     // Before any account connects, so the first client to attach sees every
@@ -348,6 +350,9 @@ async fn run() -> Result<()> {
     }
     for cfg in state.accounts.all_stoat() {
         backend::stoat::spawn(state.clone(), cfg);
+    }
+    for cfg in state.accounts.all_xmpp() {
+        backend::xmpp::spawn(state.clone(), cfg);
     }
 
     // What was going on last time, before anything is served: a window that

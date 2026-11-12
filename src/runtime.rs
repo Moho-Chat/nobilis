@@ -61,10 +61,10 @@ impl VoiceFlags {
     }
 }
 
-/// What one Discord account has silenced in one guild - or, under the key
-/// "@me", in its direct messages.
+/// What one Discord account has said about notifications in one guild - or,
+/// under the key "@me", in its direct messages.
 ///
-/// The guild's own flag and its channel overrides are one thing because
+/// The guild's own settings and its channel overrides are one thing because
 /// Discord sends them as one: the whole entry arrives together and replaces
 /// what was there, so holding half of it separately would be holding a half
 /// that can go stale on its own.
@@ -72,13 +72,56 @@ impl VoiceFlags {
 pub struct DiscordMute {
     /// The guild itself. A muted guild silences everything under it.
     pub muted: bool,
-    /// channel id -> muted, for the channels given a setting of their own.
+    /// What the guild as a whole is set to tell this account about, in
+    /// Discord's own numbers: 0 everything, 1 mentions only, 2 nothing.
+    pub level: Option<i64>,
+    /// channel id -> the setting given to that channel on its own.
+    pub channels: HashMap<String, DiscordChannelNotify>,
+}
+
+/// One channel's override. Discord's client treats a muted guild as silencing
+/// everything in it - an unmuted channel inside one is still quiet - so the
+/// guild's mute and the channel's are read as an "or" rather than the channel
+/// overruling the guild.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiscordChannelNotify {
+    pub muted: bool,
+    /// 0 everything, 1 mentions only, 2 nothing, and 3 - or nothing - for "use
+    /// the server's".
+    pub level: Option<i64>,
+}
+
+fn discord_level(number: Option<i64>) -> crate::notify::NotifyLevel {
+    use crate::notify::NotifyLevel;
+    match number {
+        Some(0) => NotifyLevel::All,
+        Some(1) => NotifyLevel::Mentions,
+        // Told of nothing is a mute in all but the word.
+        Some(2) => NotifyLevel::Mute,
+        _ => NotifyLevel::Default,
+    }
+}
+
+impl DiscordMute {
+    /// What a channel here is set to, and what that comes to.
     ///
-    /// Only an override that says *muted* matters here. Discord's own client
-    /// treats a muted guild as silencing everything in it - an unmuted
-    /// channel inside one is still quiet - so the two are read as an "or"
-    /// rather than the channel overruling the guild.
-    pub channels: HashMap<String, bool>,
+    /// The first is what a menu ticks: this channel's own setting, or
+    /// "default" while it has none. The second decides what announces, and it
+    /// differs only where the server speaks for a channel that has not: a
+    /// muted server, or one set to tell this account of nothing, silences it.
+    /// A server set to everything is *not* carried down. Discord stores that
+    /// number for every server somebody never changed, and treating it as
+    /// "notify about everything" would turn a quiet client loud in every
+    /// channel of every server the moment this was read.
+    pub fn levels(&self, channel_id: &str) -> (crate::notify::NotifyLevel, crate::notify::NotifyLevel) {
+        use crate::notify::NotifyLevel;
+        let own = self.channels.get(channel_id).copied().unwrap_or_default();
+        // A timed mute that has run out was already read as no mute - see
+        // `mutes::parse_entry` - so by here it is one or it is not.
+        let shown = if own.muted { NotifyLevel::Mute } else { discord_level(own.level) };
+        let applies = if self.muted || self.level == Some(2) && shown == NotifyLevel::Default { NotifyLevel::Mute } else { shown };
+        (shown, applies)
+    }
 }
 
 /// A file somebody has offered, from the moment it is offered to the moment
@@ -547,6 +590,8 @@ pub struct Runtime {
     telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
     /// A connected Stoat account's client, by account id (see backend/stoat).
     stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
+    /// A connected XMPP account's stream, by account id (see backend/xmpp).
+    xmpp_handles: Mutex<HashMap<String, crate::backend::xmpp::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -832,10 +877,20 @@ pub struct Runtime {
     /// message seen before; this covers the first time, which is exactly the
     /// case that fires.
     replaying: Mutex<std::collections::HashSet<String>>,
-    /// Buffers whose messages must not announce themselves, because the
-    /// service says so - a Matrix room muted through push rules, which every
-    /// other client of that account is also honouring.
-    silenced: Mutex<std::collections::HashSet<String>>,
+    /// What the account itself says about a conversation's notifications, for
+    /// the services that keep it there - a Matrix room muted through push
+    /// rules, a Discord channel set to mentions only. Every other client of
+    /// that account is honouring the same answer.
+    ///
+    /// Two levels per conversation, because they are two questions: the one
+    /// set on this conversation (what a menu ticks), and the one that
+    /// actually applies to it (what announces). They differ whenever the
+    /// conversation is left on its default and the account's own default - a
+    /// Discord server set to mentions only - says something.
+    ///
+    /// A conversation with no entry here is not held on the account at all,
+    /// and its level is the daemon's own: see `NotifyStore`.
+    notify_held: Mutex<HashMap<String, (crate::notify::NotifyLevel, crate::notify::NotifyLevel)>>,
     /// (account, room) -> the motd last shown there, so it is shown once.
     sneedchat_motds: Mutex<HashMap<(String, String), String>>,
     /// (account, channel, split message) -> who has gone, so far.
@@ -1116,6 +1171,7 @@ impl Runtime {
             steam_links: Mutex::new(HashMap::new()),
             telegram_handles: Mutex::new(HashMap::new()),
             stoat_handles: Mutex::new(HashMap::new()),
+            xmpp_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -1170,7 +1226,7 @@ impl Runtime {
             matrix_upgrades: Mutex::new(Vec::new()),
             matrix_push_rules: Mutex::new(HashMap::new()),
             replaying: Mutex::new(std::collections::HashSet::new()),
-            silenced: Mutex::new(std::collections::HashSet::new()),
+            notify_held: Mutex::new(HashMap::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
             kick_pins: Mutex::new(HashMap::new()),
@@ -1276,6 +1332,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::stoat_account_to_json(cfg, conn)
         }));
+        out.extend(state.accounts.all_xmpp().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::xmpp_account_to_json(cfg, conn)
+        }));
         out
     }
 
@@ -1338,6 +1399,13 @@ impl Runtime {
                 // state and the backend say that afresh.
                 buffer.link = None;
                 buffer.syncing = false;
+                // A level the daemon keeps is read from where it is kept, not
+                // from the layout - which was saved before the last change to
+                // it, if it was changed since. One the account keeps stays as
+                // it was until the account is read again.
+                if !crate::notify::held_on_account(&buffer.account_id) {
+                    buffer.notify = state.notify_levels.get(&buffer.id);
+                }
                 buffer.last_activity_ts = state.store.last_activity(&buffer.id).unwrap_or(buffer.last_activity_ts);
                 pending.insert(buffer.id.clone(), ());
                 live.entry(buffer.id.clone()).or_insert(buffer);
@@ -1727,7 +1795,10 @@ impl Runtime {
             remote_id: None,
             // Whichever backend knows says so; a buffer is not muted until
             // the service tells us it is.
-            server_muted: false,
+            // The daemon's own level where the service keeps none; where the
+            // account does, it says so once it has been read.
+            notify: if crate::notify::held_on_account(account_id) { crate::notify::NotifyLevel::Default } else { state.notify_levels.get(&id) },
+            notify_applied: None,
             // Likewise: the account's own filing arrives with the room's
             // tags, which is after the buffer exists.
             favourite: false,
@@ -2580,12 +2651,14 @@ impl Runtime {
             .insert((account_id.to_string(), guild_key.to_string()), mute);
     }
 
-    /// Whether this account has silenced a channel on Discord - because the
-    /// channel is muted, or because the guild holding it is.
-    pub fn discord_muted(&self, account_id: &str, guild_key: &str, channel_id: &str) -> bool {
+    /// What this account says about a channel on Discord: what was set on it,
+    /// and what that comes to once its server is taken into account.
+    pub fn discord_notify(&self, account_id: &str, guild_key: &str, channel_id: &str) -> (crate::notify::NotifyLevel, crate::notify::NotifyLevel) {
         let mutes = self.discord_mutes.lock().unwrap();
-        let Some(entry) = mutes.get(&(account_id.to_string(), guild_key.to_string())) else { return false };
-        entry.muted || entry.channels.get(channel_id).copied().unwrap_or(false)
+        match mutes.get(&(account_id.to_string(), guild_key.to_string())) {
+            Some(entry) => entry.levels(channel_id),
+            None => (crate::notify::NotifyLevel::Default, crate::notify::NotifyLevel::Default),
+        }
     }
 
     pub fn discord_buffers_in_guild(&self, account_id: &str, guild_id: &str) -> Vec<String> {
@@ -2798,6 +2871,24 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.encrypted != Some(confirmed) => {
                     b.encrypted = Some(confirmed);
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Says whether a conversation is encrypted, for the services where that is something a person turns on (XMPP's OMEMO), as
+    /// the lock beside the message box.
+    pub fn set_buffer_encrypted(&self, state: &AppState, buffer_id: &str, on: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.encrypted != Some(on) => {
+                    b.encrypted = Some(on);
                     Some(b.clone())
                 }
                 _ => None,
@@ -3667,29 +3758,40 @@ impl Runtime {
         }
     }
 
-    /// Marks a buffer as one the service says should stay quiet. Unlike a
-    /// local mute this comes from the account itself, so it holds wherever
-    /// that account is signed in.
+    /// Records what the account itself says about a conversation's
+    /// notifications. Unlike a level kept here, this comes from the service,
+    /// so it holds wherever that account is signed in - and it is the service's
+    /// to change, from any client, at any time.
     ///
-    /// Two things follow from it, which is why this is one call rather than
-    /// two: nothing here announces itself, and the buffer says so on the wire
-    /// so a client can draw the row muted without having asked for it. A
-    /// client that only learned the first would show an ordinary-looking
-    /// channel that never makes a sound, which reads as a bug.
-    pub fn set_silenced(&self, state: &AppState, buffer_id: &str, silenced: bool) {
-        {
-            let mut all = self.silenced.lock().unwrap();
-            if silenced {
-                all.insert(buffer_id.to_string());
-            } else {
-                all.remove(buffer_id);
-            }
-        }
+    /// `shown` is the level set on this conversation, which is what a menu
+    /// ticks; `applies` is what actually decides whether a message announces,
+    /// which differs while the conversation is left on its default and the
+    /// account's own default has an opinion (a Discord server set to mentions
+    /// only). They are told together because a client that learned only the
+    /// first would draw a conversation that never makes a sound, which reads
+    /// as a bug - and one that learned only the second could not say why.
+    pub fn set_notify_level(&self, state: &AppState, buffer_id: &str, shown: crate::notify::NotifyLevel, applies: crate::notify::NotifyLevel) {
+        self.notify_held.lock().unwrap().insert(buffer_id.to_string(), (shown, applies));
+        self.show_notify_level(state, buffer_id, shown, applies);
+    }
+
+    /// Sets the level of a conversation whose service has nowhere to keep one,
+    /// and remembers it across restarts. Says whether anything changed.
+    pub fn set_local_notify(&self, state: &AppState, buffer_id: &str, level: crate::notify::NotifyLevel) -> bool {
+        let changed = state.notify_levels.set(buffer_id, level);
+        self.show_notify_level(state, buffer_id, level, level);
+        changed
+    }
+
+    /// Puts a level on the buffer and tells every client, if it moved.
+    fn show_notify_level(&self, state: &AppState, buffer_id: &str, shown: crate::notify::NotifyLevel, applies: crate::notify::NotifyLevel) {
+        let applied = (applies != shown).then_some(applies);
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(buffer_id) {
-                Some(b) if b.server_muted != silenced => {
-                    b.server_muted = silenced;
+                Some(b) if b.notify != shown || b.notify_applied != applied => {
+                    b.notify = shown;
+                    b.notify_applied = applied;
                     Some(b.clone())
                 }
                 _ => None,
@@ -3700,8 +3802,13 @@ impl Runtime {
         }
     }
 
-    fn is_silenced(&self, buffer_id: &str) -> bool {
-        self.silenced.lock().unwrap().contains(buffer_id)
+    /// The level that decides whether a message here announces itself: the
+    /// account's answer where it keeps one, and this daemon's own otherwise.
+    pub fn notify_level(&self, state: &AppState, buffer_id: &str) -> crate::notify::NotifyLevel {
+        match self.notify_held.lock().unwrap().get(buffer_id) {
+            Some((_, applies)) => *applies,
+            None => state.notify_levels.get(buffer_id),
+        }
     }
 
     fn is_replaying(&self, buffer_id: &str) -> bool {
@@ -4440,6 +4547,27 @@ impl Runtime {
         self.stoat_handles.lock().unwrap().insert(account_id.to_string(), handle);
     }
 
+    pub fn set_xmpp_handle(&self, account_id: &str, handle: crate::backend::xmpp::Handle) {
+        self.xmpp_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    /// Forgets the handle only if it is still the one of the connection that owns `session`: a connection being torn down
+    /// must not take its successor's handle with it.
+    pub fn clear_xmpp_handle_of(&self, account_id: &str, session: &std::sync::Arc<std::sync::Mutex<crate::backend::xmpp::session::Session>>) {
+        let mut handles = self.xmpp_handles.lock().unwrap();
+        if handles.get(account_id).is_some_and(|h| h.is_of(session)) {
+            handles.remove(account_id);
+        }
+    }
+
+    pub fn clear_xmpp_handle(&self, account_id: &str) {
+        self.xmpp_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn xmpp_handle(&self, account_id: &str) -> Option<crate::backend::xmpp::Handle> {
+        self.xmpp_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn clear_stoat_handle(&self, account_id: &str) {
         self.stoat_handles.lock().unwrap().remove(account_id);
     }
@@ -4617,7 +4745,6 @@ impl Runtime {
     /// rather than duplicating highlight/store/emit logic (see project
     /// plan's "Architecture" section on why this lives in the daemon core,
     /// not per-backend).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_message(
         &self,
@@ -4828,8 +4955,8 @@ impl Runtime {
         // Not what an account on Stoat's Focus asked for: it hears only of mentions, and a direct message that mentions
         // nobody is not one.
         let focused = is_dm && !is_highlight && self.account_status(account_id) == "focus";
-        if spoken && from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
-            && !self.is_silenced(&buffer.id)
+        if spoken && from != own_nick && !self.is_replaying(&buffer.id)
+            && self.notify_level(state, &buffer.id).announces(is_dm, is_highlight)
             && !focused
         {
             state.events.emit(
@@ -5114,6 +5241,7 @@ mod tests {
             irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
+            notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(dir.join("notify.toml"))),
         };
         let account = "irc:tester";
         state.runtime.set_own_identity(account, "Salastil");
@@ -5740,7 +5868,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, xmpp_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
@@ -5750,7 +5878,7 @@ impl Runtime {
             matrix_verifications, matrix_ignored, matrix_verification_peers,
             matrix_push_rules, irc_away, kick_pins,
             matrix_server_facts, irc_isupport, sneedchat_rooms,
-            discord_premium,
+            discord_premium, notify_held,
         );
         // Keyed by (account, something) or (buffer, something): the first
         // element carries the account either way.
@@ -5768,7 +5896,7 @@ impl Runtime {
         sweep_set!(
             discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,
             emoji_unrestricted, wants_connected, discord_gated, irc_monitor, replaying,
-            silenced, irc_rostered,
+            irc_rostered,
         );
         sweep_set_pairs!(matrix_previews_off);
     }
@@ -5858,8 +5986,8 @@ mod forget_tests {
         rt.matrix_rooms.lock().unwrap().insert("irc:ab|#one".into(), "!one".into());
         rt.set_wants_connected("irc:a", true);
         rt.set_wants_connected("irc:ab", true);
-        rt.silenced.lock().unwrap().insert("irc:a|#one".into());
-        rt.silenced.lock().unwrap().insert("irc:ab|#one".into());
+        rt.notify_held.lock().unwrap().insert("irc:a|#one".into(), Default::default());
+        rt.notify_held.lock().unwrap().insert("irc:ab|#one".into(), Default::default());
         rt.discord_members.lock().unwrap().insert(("irc:a|#one".into(), "u".into()), serde_json::json!({}));
         rt.set_steam_requests("irc:a", serde_json::json!({ "incoming": [1], "outgoing": [] }));
         rt.set_steam_requests("irc:ab", serde_json::json!({ "incoming": [2], "outgoing": [] }));
@@ -5875,7 +6003,7 @@ mod forget_tests {
         assert!(rt.discord_members.lock().unwrap().is_empty());
         assert!(!rt.wants_connected("irc:a"), "a removed account is not wanted online");
         assert!(rt.wants_connected("irc:ab"));
-        assert_eq!(rt.silenced.lock().unwrap().len(), 1);
+        assert_eq!(rt.notify_held.lock().unwrap().len(), 1);
     }
 
     /// The whole of forgetting an account rests on this one test, so it is

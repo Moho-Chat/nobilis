@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -65,6 +65,15 @@ grammers-client = { version = "=0.11.0", default-features = false, features = ["
 grammers-mtsender = { version = "=0.11.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
 
+# XMPP backend: the xmpp-rs stack (MPL-2.0, which GPLv3 can include). `ring`, not the default aws-lc-rs, so the one TLS
+# provider main.rs installs is the one these use and no C compiler is needed - see backend/xmpp.
+tokio-xmpp = { version = "6.0", default-features = false, features = ["ring", "starttls", "direct-tls", "rustls-native-certs"] }
+xmpp-parsers = "0.23"
+# Named directly because the connector in backend/xmpp/transport.rs speaks their types: the same versions the library
+# already resolved.
+sasl = "0.5"
+rustls-native-certs = "0.8"
+
 # Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }
 tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }
@@ -128,6 +137,18 @@ sonora = "0.2"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis"] }
 imagesize = "0.13"
 iana-time-zone = "0.1.65"
+x25519-dalek = "2"
+curve25519-dalek = "4"
+hkdf = "0.12"
+cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.8"
+hmac012 = { version = "0.12", package = "hmac" }
+sha1_010 = { version = "0.10", package = "sha1" }
+stringprep = "0.1"
+hickory-resolver = "0.26"
+idna = "1"
+thiserror = "2"
+x509-parser = { version = "0.17", default-features = false }
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

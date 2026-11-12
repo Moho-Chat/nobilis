@@ -6,6 +6,7 @@
 //! belongs.
 
 use super::*;
+use crate::notify::NotifyLevel;
 use anyhow::bail;
 
 /// Says that this account is composing something in a room.
@@ -91,8 +92,11 @@ pub async fn set_ignored_user(state: &AppState, account_id: &str, user_id: &str,
 }
 
 pub(super) async fn fetch_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) {
-    if let Err(e) = read_push_rules(state, account_id, homeserver_url, access_token).await {
-        tracing::debug!("matrix[{account_id}]: reading push rules: {e:#}");
+    match read_push_rules(state, account_id, homeserver_url, access_token).await {
+        // Onto the rooms already known - restored from the last run, before
+        // anything has been said in them.
+        Ok(_) => apply_all(state, account_id),
+        Err(e) => tracing::debug!("matrix[{account_id}]: reading push rules: {e:#}"),
     }
 }
 
@@ -104,78 +108,163 @@ async fn read_push_rules(state: &AppState, account_id: &str, homeserver_url: &st
     Ok(rules)
 }
 
-/// Mutes a room for this account, everywhere it is signed in - or stops.
+/// Sets how much a room may interrupt, for this account, everywhere it is
+/// signed in.
 ///
-/// A per-room push rule, which is what Element writes and what a phone reads.
-/// Muting only locally was the old behaviour and is still what the client
-/// does for services with no such idea; on Matrix the account itself can hold
-/// the answer, so it should.
-pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str, muted: bool) -> Result<()> {
+/// Written the way Element writes it, because Element is what the same account
+/// is most likely signed in to: a room's four states are three different rules
+/// and the absence of any.
+///
+/// - Match the default: no rule of the room's own at all.
+/// - All messages: a room rule that notifies, with the default sound.
+/// - Mentions and keywords: a room rule that says "do not notify". Mentions and
+///   keywords still get through, because they are override and content rules
+///   and those are read first.
+/// - Mute: an *override* rule for the room, which is read before everything
+///   else and so is the only one that silences a mention too.
+///
+/// The last two were one thing here until now - a mute wrote the room rule, which
+/// Element reads as "Mentions and keywords", so a room muted from here was not
+/// muted anywhere else.
+pub async fn set_room_level(state: &AppState, account_id: &str, buffer_id: &str, level: NotifyLevel) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let url = format!("{base}/_matrix/client/v3/pushrules/global/room/{encoded}");
+    let rule = |kind: &str| format!("{base}/_matrix/client/v3/pushrules/global/{kind}/{encoded}");
+    let token = &account.access_token;
 
-    if muted {
-        // An empty action list is how the current spec spells "notify about
-        // nothing"; `dont_notify` is the older word for it and servers still
-        // accept both. The new one is sent, since that is what a current
-        // client reading it back expects to find.
-        http::put_json(&url, &account.access_token, serde_json::json!({ "actions": [] })).await.context("muting the room")?;
-    } else {
-        // Both kinds that can hold a mute, whichever client made it: this one
-        // writes a room rule, Element an override rule named for the room. One
-        // that is not there is the ordinary case, not a failure.
-        for kind in ["room", "override"] {
-            let url = format!("{base}/_matrix/client/v3/pushrules/global/{kind}/{encoded}");
-            if let Err(e) = http::delete_json(&url, &account.access_token).await {
-                if !format!("{e:#}").contains("M_NOT_FOUND") {
-                    return Err(e).context("unmuting the room");
-                }
+    // A rule that is not there is the ordinary case, not a failure.
+    let remove = |kind: &'static str| {
+        let url = rule(kind);
+        async move {
+            match http::delete_json(&url, token).await {
+                Err(e) if !format!("{e:#}").contains("M_NOT_FOUND") => Err(e).with_context(|| format!("taking the {kind} rule off the room")),
+                _ => Ok(()),
             }
         }
+    };
+
+    match level {
+        NotifyLevel::Mute => {
+            remove("room").await?;
+            let body = serde_json::json!({
+                "conditions": [{ "kind": "event_match", "key": "room_id", "pattern": room_id }],
+                "actions": ["dont_notify"],
+            });
+            http::put_json(&rule("override"), token, body).await.context("muting the room")?;
+        }
+        NotifyLevel::Mentions => {
+            remove("override").await?;
+            http::put_json(&rule("room"), token, serde_json::json!({ "actions": ["dont_notify"] })).await.context("setting the room to mentions only")?;
+        }
+        NotifyLevel::All => {
+            remove("override").await?;
+            let body = serde_json::json!({ "actions": ["notify", { "set_tweak": "sound", "value": "default" }] });
+            http::put_json(&rule("room"), token, body).await.context("setting the room to every message")?;
+        }
+        NotifyLevel::Default => {
+            remove("override").await?;
+            remove("room").await?;
+        }
     }
+    // A rule written over one somebody had switched off is still switched off
+    // on some servers; this is the one thing about it the PUT does not say.
+    if matches!(level, NotifyLevel::Mentions | NotifyLevel::All | NotifyLevel::Mute) {
+        let kind = if level == NotifyLevel::Mute { "override" } else { "room" };
+        let _ = http::put_json(&format!("{}/enabled", rule(kind)), token, serde_json::json!({ "enabled": true })).await;
+    }
+
     // What the server now says, read back rather than assumed. A write it
-    // accepted is not the same as a room that is muted, or no longer muted:
-    // another rule can still silence it, or the server can say yes and keep the
-    // old answer, and "it worked" with the room unchanged is the worst thing
-    // this could report. So the rules are read again, and the room is judged by
+    // accepted is not the same as a room that is set the way it was asked: a
+    // rule above it can still win, or the server can say yes and keep the old
+    // answer, and "it worked" with the room unchanged is the worst thing this
+    // could report. So the rules are read again, and the room is judged by
     // them; if they do not agree with what was asked, that is the answer.
     let rules = read_push_rules(state, account_id, &account.homeserver_url, &account.access_token)
         .await
         .context("the change was sent, but the server's rules could not be read back to check it")?;
-    let (now_muted, _) = push_rule_verdict(&rules, &room_id, "");
+    let now = room_level(&rules, &room_id);
     // Whatever the answer, the room is shown as the server has it.
-    state.runtime.set_silenced(state, buffer_id, now_muted);
-    if now_muted != muted {
-        let remaining = silencing_rules(&rules, &room_id);
-        if muted {
-            bail!("the server accepted the mute but does not list it - it is not muted on {}", account.homeserver_url);
-        }
-        bail!(
-            "the server did not take the mute off: it still lists {}",
-            if remaining.is_empty() { "a rule silencing this room".to_string() } else { remaining.join(", ") }
-        );
+    state.runtime.set_notify_level(state, buffer_id, now, now);
+    if now != level {
+        bail!("the server accepted the change but still lists this room as {} on {}", now.as_str(), account.homeserver_url);
     }
     Ok(())
 }
 
-/// The rules that silence a room, by kind and what they are named, for saying
-/// what is still in the way.
-fn silencing_rules(rules: &Value, room_id: &str) -> Vec<String> {
-    ["room", "override"]
-        .iter()
-        .flat_map(|kind| {
-            rules["global"][kind]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
-                .filter(|rule| rule["enabled"].as_bool().unwrap_or(true) && silences(&rule["actions"]))
-                .map(move |_| if *kind == "room" { "a room rule for it".to_string() } else { "an override rule for it".to_string() })
-        })
-        .collect()
+/// What the account's push rules say about one room, as Element would read
+/// them.
+///
+/// The same order Element reads in, which is the order the rules are applied
+/// in: an override rule that matches the whole room is a mute and beats
+/// everything; failing that the room's own rule decides between mentions only
+/// and every message; failing that nothing was said, and the account's
+/// defaults stand.
+///
+/// "Do not notify" is both `["dont_notify"]` and an empty list - the older word
+/// and the newer spelling - and a rule somebody switched off says nothing.
+pub(super) fn room_level(rules: &Value, room_id: &str) -> NotifyLevel {
+    let enabled = |rule: &&Value| rule["enabled"].as_bool().unwrap_or(true);
+    let rules_of = |kind: &str| -> Vec<&Value> { rules["global"][kind].as_array().into_iter().flatten().filter(enabled).collect() };
+
+    // A mute is an override rule that matches this room and nothing but this
+    // room. Named for the room by Element; matched on what it says as well, so
+    // one made by a client that names it differently is still a mute.
+    let muted = rules_of("override").into_iter().any(|rule| {
+        let only_this_room = rule["conditions"].as_array().is_some_and(|conditions| {
+            conditions.len() == 1
+                && conditions[0]["kind"].as_str() == Some("event_match")
+                && conditions[0]["key"].as_str() == Some("room_id")
+                && conditions[0]["pattern"].as_str() == Some(room_id)
+        });
+        (only_this_room || rule["rule_id"].as_str() == Some(room_id)) && silences(&rule["actions"])
+    });
+    if muted {
+        return NotifyLevel::Mute;
+    }
+
+    match rules_of("room").into_iter().find(|rule| rule["rule_id"].as_str() == Some(room_id)) {
+        Some(rule) if silences(&rule["actions"]) => NotifyLevel::Mentions,
+        Some(rule) if rule["actions"].as_array().is_some_and(|a| a.iter().any(|action| action.as_str() == Some("notify"))) => NotifyLevel::All,
+        _ => NotifyLevel::Default,
+    }
+}
+
+/// Puts what the push rules say onto one room, if they have been read.
+pub(super) fn apply_room(state: &AppState, account_id: &str, buffer_id: &str, room_id: &str) {
+    let Some(rules) = state.runtime.matrix_push_rules(account_id) else { return };
+    let level = room_level(&rules, room_id);
+    state.runtime.set_notify_level(state, buffer_id, level, level);
+}
+
+/// Puts what the push rules say onto every room this account has.
+///
+/// Run when the rules are first read and whenever another client changes
+/// them: a room quietened in Element is quiet here the moment the server says
+/// so, rather than the next time somebody speaks in it.
+pub(super) fn apply_all(state: &AppState, account_id: &str) {
+    let prefix = format!("{account_id}|");
+    for buffer in state.runtime.list_buffers() {
+        if !buffer.id.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(room_id) = state.runtime.get_matrix_room(&buffer.id) {
+            apply_room(state, account_id, &buffer.id, &room_id);
+        }
+    }
+}
+
+/// The account's push rules, as another client has just changed them.
+///
+/// They arrive as the `m.push_rules` account data event, whose content is the
+/// whole rule set in the same shape the rules endpoint answers with.
+pub(super) fn push_rules_changed(state: &AppState, account_id: &str, content: &Value) {
+    if !content["global"].is_object() {
+        return;
+    }
+    state.runtime.set_matrix_push_rules(account_id, content.clone());
+    apply_all(state, account_id);
 }
 
 /// Whether a room's messages should announce themselves, per the account's
@@ -186,18 +275,8 @@ fn silencing_rules(rules: &Value, room_id: &str) -> Vec<String> {
 /// about. Everything else in the rule language - conditions on message counts,
 /// sender display names, arbitrary event fields - is left to the server, whose
 /// job it is, and to the clients that edit it.
-pub(super) fn push_rule_verdict(rules: &Value, room_id: &str, body: &str) -> (bool, bool) {
-    // A room rule is what this client writes. Element writes an override rule
-    // named for the room, which beats everything else, so both are a mute.
-    let muted = ["room", "override"].iter().any(|kind| {
-        rules["global"][kind]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
-            .filter(|rule| rule["enabled"].as_bool().unwrap_or(true))
-            .any(|rule| silences(&rule["actions"]))
-    });
+pub(super) fn push_rule_verdict(rules: &Value, room_id: &str, body: &str) -> (NotifyLevel, bool) {
+    let level = room_level(rules, room_id);
 
     let lower = body.to_lowercase();
     let keyword = rules["global"]["content"]
@@ -212,7 +291,7 @@ pub(super) fn push_rule_verdict(rules: &Value, room_id: &str, body: &str) -> (bo
         .filter_map(|rule| rule["pattern"].as_str())
         .any(|pattern| matches_keyword(&lower, &pattern.to_lowercase()));
 
-    (muted, keyword)
+    (level, keyword)
 }
 
 /// Whether the account still has the spec's own rule suppressing notices.
@@ -263,45 +342,90 @@ pub(super) fn matches_keyword(body: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod push_rule_tests {
     use super::notices_are_suppressed;
-    use super::{matches_keyword, push_rule_verdict, silencing_rules};
+    use super::{matches_keyword, push_rule_verdict, room_level};
+    use crate::notify::NotifyLevel;
     use serde_json::json;
 
+    const ROOM: &str = "!q:example.org";
+
+    /// The four states, each written the way Element writes it - which is the
+    /// only reason a change made there is read as the same thing here.
     #[test]
-    fn what_is_still_in_the_way_is_named() {
-        let rules = json!({ "global": {
-            "room": [{ "rule_id": "!q:x", "actions": [] }],
-            "override": [{ "rule_id": "!q:x", "actions": ["dont_notify"] }, { "rule_id": "!other:x", "actions": [] }]
-        } });
-        assert_eq!(silencing_rules(&rules, "!q:x"), vec!["a room rule for it".to_string(), "an override rule for it".to_string()]);
-        assert!(silencing_rules(&rules, "!none:x").is_empty());
+    fn each_level_is_read_the_way_element_writes_it() {
+        let nothing = json!({ "global": {} });
+        assert_eq!(room_level(&nothing, ROOM), NotifyLevel::Default);
+
+        let mute = json!({ "global": { "override": [{
+            "rule_id": ROOM, "enabled": true, "default": false,
+            "conditions": [{ "kind": "event_match", "key": "room_id", "pattern": ROOM }],
+            "actions": ["dont_notify"]
+        }] } });
+        assert_eq!(room_level(&mute, ROOM), NotifyLevel::Mute);
+
+        let mentions = json!({ "global": { "room": [{ "rule_id": ROOM, "enabled": true, "actions": ["dont_notify"] }] } });
+        assert_eq!(room_level(&mentions, ROOM), NotifyLevel::Mentions);
+
+        let all = json!({ "global": { "room": [{
+            "rule_id": ROOM, "enabled": true,
+            "actions": ["notify", { "set_tweak": "sound", "value": "default" }]
+        }] } });
+        assert_eq!(room_level(&all, ROOM), NotifyLevel::All);
+    }
+
+    /// What moho wrote before this: a *room* rule with nothing to do. Element
+    /// reads that as mentions only, and so does this now - which is the point,
+    /// since a room it called muted was never muted anywhere else.
+    #[test]
+    fn a_room_rule_that_says_nothing_is_mentions_only_not_a_mute() {
+        let old = json!({ "global": { "room": [{ "rule_id": ROOM, "actions": [] }] } });
+        assert_eq!(room_level(&old, ROOM), NotifyLevel::Mentions);
+        let spelled_old = json!({ "global": { "room": [{ "rule_id": ROOM, "actions": ["dont_notify"] }] } });
+        assert_eq!(room_level(&spelled_old, ROOM), NotifyLevel::Mentions);
     }
 
     #[test]
-    fn a_room_muted_by_an_override_rule_is_muted_too() {
-        // How Element mutes a room: an override rule named for it.
-        let rules = json!({ "global": { "override": [{
-            "rule_id": "!quiet:example.org",
-            "conditions": [{ "kind": "event_match", "key": "room_id", "pattern": "!quiet:example.org" }],
+    fn a_mute_beats_the_room_rule_and_both_are_per_room() {
+        let both = json!({ "global": {
+            "override": [{ "rule_id": ROOM, "conditions": [{ "kind": "event_match", "key": "room_id", "pattern": ROOM }], "actions": [] }],
+            "room": [{ "rule_id": ROOM, "actions": ["notify"] }]
+        } });
+        assert_eq!(room_level(&both, ROOM), NotifyLevel::Mute);
+        assert_eq!(room_level(&both, "!other:example.org"), NotifyLevel::Default);
+    }
+
+    /// A rule somebody switched off says nothing, and the spec's own override
+    /// rules are not somebody's mute.
+    #[test]
+    fn rules_switched_off_or_not_about_this_room_are_not_a_level() {
+        let off = json!({ "global": {
+            "override": [{ "rule_id": ROOM, "enabled": false, "actions": [] }],
+            "room": [{ "rule_id": ROOM, "enabled": false, "actions": ["dont_notify"] }]
+        } });
+        assert_eq!(room_level(&off, ROOM), NotifyLevel::Default);
+
+        let stock = json!({ "global": { "override": [{ "rule_id": ".m.rule.suppress_notices", "actions": [] }] } });
+        assert_eq!(room_level(&stock, ROOM), NotifyLevel::Default);
+
+        // An override that silences more than this room is not this room's mute.
+        let wide = json!({ "global": { "override": [{
+            "rule_id": "somebody's own",
+            "conditions": [
+                { "kind": "event_match", "key": "room_id", "pattern": ROOM },
+                { "kind": "event_match", "key": "sender", "pattern": "@bot:example.org" }
+            ],
             "actions": []
         }] } });
-        assert!(push_rule_verdict(&rules, "!quiet:example.org", "x").0);
-        assert!(!push_rule_verdict(&rules, "!other:example.org", "x").0);
-        // The spec's own override rules are not somebody's mute.
-        let stock = json!({ "global": { "override": [{ "rule_id": ".m.rule.suppress_notices", "actions": [] }] } });
-        assert!(!push_rule_verdict(&stock, "!quiet:example.org", "x").0);
+        assert_eq!(room_level(&wide, ROOM), NotifyLevel::Default);
     }
 
     #[test]
-    fn a_muted_room_is_muted_here_too() {
-        let rules = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": ["dont_notify"] }] } });
-        assert!(push_rule_verdict(&rules, "!quiet:example.org", "anything").0);
-        assert!(!push_rule_verdict(&rules, "!other:example.org", "anything").0);
-        // The newer spelling of the same thing.
-        let empty = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [] }] } });
-        assert!(push_rule_verdict(&empty, "!quiet:example.org", "x").0);
-        // A rule somebody switched off says nothing.
-        let off = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [], "enabled": false }] } });
-        assert!(!push_rule_verdict(&off, "!quiet:example.org", "x").0);
+    fn the_verdict_carries_the_level_beside_the_keyword() {
+        let rules = json!({ "global": {
+            "room": [{ "rule_id": ROOM, "actions": ["dont_notify"] }],
+            "content": [{ "rule_id": "moho", "pattern": "moho", "actions": ["notify"] }]
+        } });
+        assert_eq!(push_rule_verdict(&rules, ROOM, "look at moho").0, NotifyLevel::Mentions);
+        assert!(push_rule_verdict(&rules, ROOM, "look at moho").1);
     }
 
     #[test]
