@@ -18,6 +18,7 @@
 
 pub mod account;
 pub mod adhoc;
+pub mod affiliation;
 pub mod archive_prefs;
 pub mod avatars;
 pub mod blocking;

@@ -206,8 +206,18 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
             if asked {
                 answer_subscription(handle, &bare, true).await;
             } else {
-                handle.session().requests.insert(bare, status);
+                handle.session().requests.insert(bare.clone(), status);
                 announce_requests(state, handle);
+                // What their server says about their account (XEP-0489), believed only from a server that says it adds it.
+                if let Some(info) = p.payloads.iter().find(|e| e.is("info", super::affiliation::NS)).cloned() {
+                    let (state, handle) = (state.clone(), handle.clone());
+                    tokio::spawn(async move {
+                        if let Some(words) = super::affiliation::vouched(&handle, &bare, &info, super::affiliation::EMBED_SUB).await {
+                            handle.session().request_info.insert(bare, words);
+                            announce_requests(&state, &handle);
+                        }
+                    });
+                }
             }
         }
         PresenceType::Unsubscribe => {
@@ -223,11 +233,13 @@ pub async fn answer_subscription(handle: &Handle, jid: &BareJid, accept: bool) {
     let kind = if accept { PresenceType::Subscribed } else { PresenceType::Unsubscribed };
     handle.send_presence(Presence::new(kind).with_to(Jid::from(jid.clone()))).await;
     handle.session().requests.remove(jid);
+    handle.session().request_info.remove(jid);
 }
 
 /// What is waiting to be answered, for the window's Invitations tile.
 pub fn requests(handle: &Handle) -> Vec<Value> {
-    handle.session().requests.iter().map(|(jid, text)| json!({ "jid": jid.to_string(), "text": text })).collect()
+    let s = handle.session();
+    s.requests.iter().map(|(jid, text)| json!({ "jid": jid.to_string(), "text": text, "server": s.request_info.get(jid).cloned().unwrap_or_default() })).collect()
 }
 
 pub fn announce_requests(state: &AppState, handle: &Handle) {
