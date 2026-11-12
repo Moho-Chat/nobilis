@@ -57,7 +57,8 @@ pub fn restrict_file_to_owner(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Makes a directory enterable by its owner and nobody else.
+/// Makes a directory enterable by its owner and nobody else. (Used for the daemon's socket directory, which only Unix has.)
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn restrict_to_owner(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
