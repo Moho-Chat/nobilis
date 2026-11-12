@@ -5244,7 +5244,11 @@ pub async fn dispatch(
                     backend::xmpp::roster::set_item(&handle, &jid, name, groups).await
                 }
                 _ => {
-                    backend::xmpp::roster::answer_subscription(&handle, &jid, p_bool(params, "accept", true)).await;
+                    if p_bool(params, "accept", true) {
+                        backend::xmpp::roster::accept_request(&handle, &jid).await;
+                    } else {
+                        backend::xmpp::roster::answer_subscription(&handle, &jid, false).await;
+                    }
                     backend::xmpp::roster::announce_requests(state, &handle);
                     Ok(())
                 }

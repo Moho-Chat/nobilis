@@ -395,7 +395,7 @@ async fn start_relay(tor: Arc<TorManager>) -> Result<(u16, tokio::task::JoinHand
 async fn relay_one(mut client: TcpStream, tor: Arc<TorManager>) -> Result<()> {
     let (host, port) = socks_handshake(&mut client).await?;
     let tor_client = tor.get_or_bootstrap(|_| {}).await?;
-    let mut upstream: BoxStream = match tor_client.connect((host.as_str(), port)).await {
+    let mut upstream: BoxStream = match super::tor::connect_through(&tor_client, &host, port).await {
         Ok(stream) => Box::new(stream),
         Err(e) => {
             // General failure, so the far end is told rather than left hanging.

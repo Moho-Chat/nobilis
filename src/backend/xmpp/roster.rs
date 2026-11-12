@@ -247,6 +247,16 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
     }
 }
 
+/// Says yes to somebody's request, the way other clients do: they may see this account, and they are asked in turn, so each sees
+/// the other (their client approves a request from somebody it asked, as this one does). Not asked again when already seen or asked.
+pub async fn accept_request(handle: &Handle, jid: &BareJid) {
+    answer_subscription(handle, jid, true).await;
+    let asked = handle.session().roster.get(jid).is_some_and(|c| c.ask || c.we_see_them());
+    if !asked {
+        handle.send_presence(Presence::new(PresenceType::Subscribe).with_to(Jid::from(jid.clone()))).await;
+    }
+}
+
 /// Says yes or no to somebody who asked to see this account's presence.
 pub async fn answer_subscription(handle: &Handle, jid: &BareJid, accept: bool) {
     let kind = if accept { PresenceType::Subscribed } else { PresenceType::Unsubscribed };

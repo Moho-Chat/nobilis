@@ -235,7 +235,7 @@ impl Transport {
     pub async fn connect(&self, host: &str, port: u16, tls: bool) -> Result<BoxStream> {
         let stream: BoxStream = match self {
             Transport::Tor(client) => {
-                let s = client.connect((host, port)).await.with_context(|| format!("Tor connect to {host}:{port}"))?;
+                let s = connect_through(client, host, port).await.with_context(|| format!("Tor connect to {host}:{port}"))?;
                 Box::new(s)
             }
             Transport::Socks { host: ph, port: pp } => {
@@ -284,6 +284,29 @@ fn tls_config() -> Result<Arc<ClientConfig>> {
     let cfg = Arc::new(cfg);
     let _ = CFG.set(Arc::clone(&cfg));
     Ok(cfg)
+}
+
+/// How many circuits a connection is tried on before Tor is said to have failed.
+const CIRCUIT_TRIES: usize = 3;
+
+/// A stream through Tor to `host:port`. Tor shares circuits between streams, so a circuit whose exit cannot reach a server would
+/// be used again for every retry, failing the same way for as long as it lives: after a failure the stream is tried on a circuit
+/// of its own (a new exit), a few times, before giving up.
+pub async fn connect_through(client: &TorClient<PreferredRuntime>, host: &str, port: u16) -> Result<arti_client::DataStream> {
+    let mut last = match client.connect((host, port)).await {
+        Ok(stream) => return Ok(stream),
+        Err(e) => e,
+    };
+    for attempt in 1..CIRCUIT_TRIES {
+        tracing::info!("net: Tor could not reach {host}:{port} ({last}); trying a new circuit ({attempt} of {})", CIRCUIT_TRIES - 1);
+        let mut prefs = arti_client::StreamPrefs::new();
+        prefs.set_isolation(arti_client::IsolationToken::new());
+        match client.connect_with_prefs((host, port), &prefs).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = e,
+        }
+    }
+    Err(last.into())
 }
 
 #[cfg(test)]
