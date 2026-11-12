@@ -99,6 +99,12 @@ fn emit(state: &AppState, handle: &Handle, buffer_id: &str, kind: &str, sid: &st
     state.events.emit("matrixCall", json!({ "accountId": handle.account_id, "bufferId": buffer_id, "kind": kind, "callId": sid, "from": from, "own": own, "partyId": party, "content": content }));
 }
 
+/// Says in the conversation that a call was declined because the account goes through Tor.
+fn declined(state: &AppState, handle: &Handle, buffer: &Buffer, peer: &BareJid) {
+    let words = format!("{peer} called, and the call was declined. {}", crate::net::route::CALLS_REFUSED);
+    state.runtime.record_message_at(state, &handle.account_id, &buffer.name, "dm", "*", &words, false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
+}
+
 /// Only people on the contact list may ring: anybody else's call is not shown (and nobody is told).
 fn known(handle: &Handle, who: &BareJid) -> bool {
     handle.session().roster.contains_key(who)
@@ -526,6 +532,14 @@ pub fn message(state: &AppState, handle: &Handle, message: &Message, carbon: Opt
                 return true;
             }
             let buffer = super::roster::ensure_buffer(state, handle, &peer);
+            // An account routed through Tor takes no calls (their media would go around Tor): the caller is told no, and this
+            // side why.
+            if crate::net::route::router().call_refusal(&handle.account_id).is_some() {
+                let (h, to, id) = (handle.clone(), from.clone(), sid.clone());
+                tokio::spawn(async move { h.send_message(jmi_message(to, "reject", &id, &[])).await });
+                declined(state, handle, &buffer, &peer);
+                return true;
+            }
             let stub = Sdp { session_id: "1".into(), media: kinds.iter().enumerate().map(|(i, k)| Media { kind: k.clone(), mid: i.to_string(), port: 9, proto: "UDP/TLS/RTP/SAVPF".into(), direction: "sendrecv".into(), ..Default::default() }).collect(), ..Default::default() };
             handle.session().calls.insert(sid.clone(), Call::new(&buffer.id, peer.clone(), Some(from.clone()), false, Phase::Proposed));
             // The offer is not here yet: this rings the window, which answers by taking the call.
@@ -576,6 +590,18 @@ pub async fn jingle_iq(state: &AppState, handle: &Handle, from: Option<Jid>, id:
     let Some(from) = from else { return };
     let peer = from.to_bare();
     let unknown = || Some((DefinedCondition::ItemNotFound, Some(xml::empty("unknown-session", UNKNOWN_SESSION))));
+    // An account routed through Tor takes no calls: the session is declined, and this side told why.
+    if action == "session-initiate" && crate::net::route::router().call_refusal(&handle.account_id).is_some() {
+        handle.send(reply(handle, Some(from.clone()), id, None)).await;
+        let mut t = jingle_el("session-terminate", &sid);
+        t.append_child(Element::builder("reason", jingle::JINGLE).append(Element::builder("decline", jingle::JINGLE).build()).build());
+        send_jingle(state, handle, &sid, from.clone(), t, false).await;
+        if known(handle, &peer) {
+            let buffer = super::roster::ensure_buffer(state, handle, &peer);
+            declined(state, handle, &buffer, &peer);
+        }
+        return;
+    }
     // A leg of the group call this account is in, from a participant (who need not be a contact).
     let group_leg = child(j, "muji", muji::MUJI).and_then(|m| m.attr("room")).is_some_and(|room| muji::participant(handle, room, &from));
     if action == "session-initiate" && group_leg {

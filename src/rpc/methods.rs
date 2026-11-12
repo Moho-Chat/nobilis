@@ -2265,6 +2265,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            // Placing, taking or answering a call on an account routed through Tor would send its media around Tor.
+            if matches!(event_type, "m.call.invite" | "m.call.answer" | "m.call.proceed") {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
             let Some(content) = params.get("content").filter(|c| c.is_object()).cloned() else {
                 return (None, Some("sendMatrixCallEvent requires \"content\"".to_string()));
             };
@@ -2779,6 +2785,9 @@ pub async fn dispatch(
                 (Some(a), Some(u)) => (a, u),
                 _ => return (None, Some("callDiscordUser requires \"accountId\" and \"userId\"".to_string())),
             };
+            if let Some(why) = crate::net::route::router().call_refusal(account_id) {
+                return (None, Some(why));
+            }
             match backend::discord::call_user(state, account_id, user_id).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2794,6 +2803,9 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                return (None, Some(why));
+            }
             let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
                 return (None, Some("that conversation has no Discord channel".to_string()));
             };
@@ -2813,6 +2825,11 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if method == "acceptCall" {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
             let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
                 return (None, Some("that conversation has no Discord channel".to_string()));
             };
@@ -3291,6 +3308,9 @@ pub async fn dispatch(
                 (Some(a), Some(c)) => (a, c),
                 _ => return (None, Some("joinVoiceChannel requires \"accountId\" and \"channelId\"".to_string())),
             };
+            if let Some(why) = crate::net::route::router().call_refusal(account_id) {
+                return (None, Some(why));
+            }
             let guild_id = p_str_opt(params, "guildId");
             // Both default to the cautious setting, so a caller that says
             // nothing gets an empty channel and a closed microphone.
@@ -4948,6 +4968,9 @@ pub async fn dispatch(
             let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
                 return (None, Some("that Stoat account is not connected".to_string()));
             };
+            if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                return (None, Some(why));
+            }
             match backend::stoat::voice::join(&handle, &buffer).await {
                 Ok(joined) => (Some(joined), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -6031,10 +6054,17 @@ pub async fn dispatch(
         // One call of Steam's voice signalling: see backend/steam/voice.rs.
         "steamVoice" => match p_str_opt(params, "accountId") {
             None => (None, Some("steamVoice requires \"accountId\"".to_string())),
-            Some(account_id) => match backend::steam::voice::act(state, account_id, params).await {
-                Ok(done) => (Some(done), None),
-                Err(e) => (None, Some(e)),
-            },
+            Some(account_id) => {
+                // Starting or taking a call (or a room's voice) on an account routed through Tor would send its media around Tor.
+                let starts = matches!(params["op"].as_str(), Some("initiate" | "requestCall" | "joinRoom")) || (params["op"].as_str() == Some("answerCall") && params["accept"].as_bool().unwrap_or(true));
+                if let Some(why) = crate::net::route::router().call_refusal(account_id).filter(|_| starts) {
+                    return (None, Some(why));
+                }
+                match backend::steam::voice::act(state, account_id, params).await {
+                    Ok(done) => (Some(done), None),
+                    Err(e) => (None, Some(e)),
+                }
+            }
         },
         "steamChatGroupAction" => {
             use backend::steam::chatgroups::Action;
@@ -8071,6 +8101,11 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if joined {
+                if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                    return (None, Some(why));
+                }
+            }
             // XMPP: the conversation's group call (XEP-0272), joined or left; see `backend/xmpp/calls/muji.rs`.
             if buffer.account_id.starts_with("xmpp:") {
                 let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };

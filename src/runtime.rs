@@ -4746,7 +4746,6 @@ impl Runtime {
     /// plan's "Architecture" section on why this lives in the daemon core,
     /// not per-backend).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn record_message(
         &self,
         state: &AppState,

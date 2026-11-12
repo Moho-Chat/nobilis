@@ -34,6 +34,9 @@ use super::tor::{BoxStream, TorManager};
 /// window fails at once instead of leaving directly.
 const NOWHERE: &str = "socks5h://127.0.0.1:9";
 
+/// What is said when a call is refused on an account that goes through Tor or the proxy.
+pub const CALLS_REFUSED: &str = "Calls are off for this account because it goes through Tor (or the proxy): a call's audio and video cannot travel through it, so they would go around it and show your real IP address to the other side and to the call's relay. To call from this account, turn off routing through Tor for it.";
+
 /// The daemon-wide half of the choice. Persisted in `net.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetSettings {
@@ -149,6 +152,13 @@ impl Router {
     /// routed. What an account being created inherits from its add form.
     pub fn wanted(&self, key: &str) -> bool {
         self.wants.lock().unwrap().get(key).copied().unwrap_or(false)
+    }
+
+    /// Why a call cannot be made, answered or joined on an account, if it cannot: an account that goes through Tor (or the proxy)
+    /// would have its call go around it - neither carries a call's audio and video, which travel straight between the two ends
+    /// and to the call's relay - and show its real address to both. So calls are refused there, saying why.
+    pub fn call_refusal(&self, account_id: &str) -> Option<String> {
+        self.routed(account_id).then(|| CALLS_REFUSED.to_string())
     }
 
     /// Whether connections under `key` are routed: the key asked to be, or
@@ -463,6 +473,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nobilis-route-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Router::open(dir.join("net.toml"), Arc::new(TorManager::new(&dir)), None)
+    }
+
+    #[test]
+    fn calls_are_refused_on_a_routed_account_and_only_there() {
+        let r = router_at("calls");
+        assert!(r.call_refusal("xmpp:a@b").is_none());
+        r.mark("xmpp:a@b", true);
+        assert!(r.call_refusal("xmpp:a@b").is_some_and(|w| w.contains("goes through Tor")));
+        assert!(r.call_refusal("xmpp:c@d").is_none());
     }
 
     #[test]

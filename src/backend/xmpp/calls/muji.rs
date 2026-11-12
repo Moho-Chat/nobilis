@@ -47,8 +47,9 @@ pub struct Invite {
 pub struct Participant {
     pub real: Option<FullJid>,
     pub preparing: bool,
-    /// This end starts the session with them: they were in the call when it joined.
-    pub offer: bool,
+    /// They were in the room before this end was (their presence came before this end's own): this end starts the session with
+    /// them, whenever what they send arrives. Those who come later start it with this end.
+    pub existing: bool,
 }
 
 /// The group call this account is in (one at a time, as calls are).
@@ -100,7 +101,7 @@ fn members_json(m: &Muji) -> Value {
         .participants
         .values()
         .filter(|p| !p.preparing)
-        .filter_map(|p| p.real.as_ref().map(|r| (r, p.offer)))
+        .filter_map(|p| p.real.as_ref().map(|r| (r, p.existing)))
         .map(|(r, offer)| json!({ "user_id": r.to_bare().to_string(), "membership": { "device_id": r.resource().to_string() }, "transports": ["moho.mesh"], "offer": offer }))
         .collect::<Vec<_>>())
 }
@@ -260,14 +261,8 @@ pub async fn join(state: &AppState, handle: &Handle, buffer: &Buffer) -> Result<
     }
     // Those still looking around are waited for (briefly): they will call this end, or be called, once they say what they send.
     until(handle, 6_000, |m| m.participants.values().all(|p| !p.preparing)).await;
-    {
-        let mut s = handle.session();
-        if let Some(m) = s.muji.as_mut() {
-            for p in m.participants.values_mut() {
-                p.offer = !p.preparing && p.real.is_some();
-            }
-            m.ready = true;
-        }
+    if let Some(m) = handle.session().muji.as_mut() {
+        m.ready = true;
     }
     presence_to_room(handle, &room, &nick, contents(), false).await;
     announce_current(state, handle);
@@ -318,7 +313,8 @@ pub async fn presence(state: &AppState, handle: &Handle, p: &Presence) {
             (true, _) | (false, None) => m.participants.remove(&nick).is_some(),
             (false, Some(muji)) => {
                 let preparing = muji.children().any(|c| c.is("preparing", MUJI));
-                let entry = m.participants.entry(nick.clone()).or_default();
+                let joined = m.joined;
+                let entry = m.participants.entry(nick.clone()).or_insert_with(|| Participant { existing: !joined, ..Default::default() });
                 let was = (entry.preparing, entry.real.clone());
                 entry.preparing = preparing;
                 entry.real = real.or(entry.real.take());
