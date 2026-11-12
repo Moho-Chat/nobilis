@@ -118,6 +118,14 @@ pub fn ensure_buffer(state: &AppState, handle: &Handle, jid: &BareJid) -> Buffer
     state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
 }
 
+/// Something about a contact that is not anybody speaking (they accepted, they stopped sharing): a card in the conversation with
+/// them, if there is one.
+fn notice(state: &AppState, handle: &Handle, jid: &BareJid, words: &str) {
+    if let Some(buffer) = find_buffer(state, handle, jid) {
+        state.runtime.record_message_at(state, &handle.account_id, &buffer.name, "dm", "*", words, false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
+    }
+}
+
 /// One person as the window's member list wants them.
 fn entry(handle: &Handle, jid: &BareJid) -> Value {
     let s = handle.session();
@@ -220,7 +228,14 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
                 }
             }
         }
+        PresenceType::Subscribed => notice(state, handle, &bare, &format!("{} accepted: you see when they are online", handle.session().shown_name(&bare))),
+        PresenceType::Unsubscribed => {
+            let asked = handle.session().roster.get(&bare).is_some_and(|c| c.ask);
+            let name = handle.session().shown_name(&bare);
+            notice(state, handle, &bare, &if asked { format!("{name} declined to share when they are online") } else { format!("{name} stopped sharing when they are online") });
+        }
         PresenceType::Unsubscribe => {
+            notice(state, handle, &bare, &format!("{} no longer sees when you are online", handle.session().shown_name(&bare)));
             // They stopped seeing us; the roster push says so. Acknowledged, as the RFC asks.
             handle.send_presence(Presence::new(PresenceType::Unsubscribed).with_to(Jid::from(bare))).await;
         }

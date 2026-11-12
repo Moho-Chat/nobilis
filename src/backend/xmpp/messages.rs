@@ -333,7 +333,10 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
         state.runtime.set_replaying(&buffer.id, true);
     }
     let embeds = link_cards(&p.links, &text);
-    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, "chat", reply, Some(local.clone()), conv.mentioned, None, embeds, attachments, Some(conv.sender_id.clone()), sent_at, None, None);
+    // What a server or a component says (an address with no user part: an announcement, a gateway's notice) is a card, not
+    // somebody speaking.
+    let line_kind = if conv.kind == "dm" && !conv.is_own && !conv.key.contains('@') { "system" } else { "chat" };
+    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, line_kind, reply, Some(local.clone()), conv.mentioned, None, embeds, attachments, Some(conv.sender_id.clone()), sent_at, None, None);
     if replay {
         state.runtime.set_replaying(&buffer.id, false);
     }

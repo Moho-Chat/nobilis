@@ -136,6 +136,49 @@ fn card(state: &AppState, handle: &Handle, buffer: &Buffer, kind: &str, text: &s
 
 // --- joining -------------------------------------------------------------------------------------------------------
 
+/// What a change of somebody's role or affiliation is, in words; `None` when nothing that is shown changed.
+pub fn standing_change(who: &str, role: &str, affiliation: &str, new_role: &str, new_affiliation: &str) -> Option<String> {
+    let you = who == "You";
+    let (are, have) = if you { ("are", "have") } else { ("is", "has") };
+    if affiliation != new_affiliation {
+        return Some(match new_affiliation {
+            "owner" => format!("{who} {are} now an owner of the room"),
+            "admin" => format!("{who} {are} now an admin of the room"),
+            "member" if affiliation == "none" || affiliation == "outcast" => format!("{who} {are} now a member of the room"),
+            "member" => format!("{who} {are} no longer an {affiliation} of the room, only a member"),
+            "none" => format!("{who} {are} no longer {} of the room", if affiliation == "member" { "a member".to_string() } else { format!("an {affiliation}") }),
+            other => format!("{who} {are} now {other} in the room"),
+        });
+    }
+    if role != new_role {
+        return Some(match (role, new_role) {
+            (_, "moderator") => format!("{who} {are} now a moderator"),
+            ("moderator", "participant") => format!("{who} {are} no longer a moderator"),
+            ("visitor", "participant") => format!("{who} can speak now ({have} been given a voice)"),
+            (_, "visitor") => format!("{who} can no longer speak in the room"),
+            (_, other) => format!("{who} {are} now a {other}"),
+        });
+    }
+    None
+}
+
+/// What a room's status codes say about a change to its configuration (XEP-0045 10.2.1), in words.
+pub fn config_words(codes: &[u16]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for c in codes {
+        out.push(match c {
+            170 => "The room now keeps what is said in it (it is logged)",
+            171 => "The room no longer keeps what is said in it",
+            172 => "The room now shows everyone's address to everyone in it",
+            173 => "The room now shows addresses to its moderators only",
+            174 => "The room no longer shows anybody's address",
+            104 => "The room's settings were changed",
+            _ => continue,
+        });
+    }
+    out
+}
+
 /// What a room says about itself: its name and what it supports.
 async fn disco(handle: &Handle, room: &BareJid) -> (Option<String>, HashSet<String>, Option<String>) {
     let to = Jid::from(room.clone());
@@ -295,6 +338,11 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
                 "You were removed from the room because it became members-only".into()
             } else if codes.contains(&332) {
                 "You were removed from the room because its service is shutting down".into()
+            } else if let Some(d) = user.children().find(|c| c.name() == "destroy") {
+                // The room was closed by its owner: why, and where it went, if they said.
+                let why = d.children().find(|c| c.name() == "reason").map(|r| r.text()).filter(|r| !r.trim().is_empty());
+                let moved = d.attr("jid").filter(|j| !j.is_empty());
+                format!("The room was closed{}{}", why.map(|r| format!(": {}", r.trim())).unwrap_or_default(), moved.map(|j| format!(". It moved to {j}")).unwrap_or_default())
             } else {
                 "You left the room".into()
             };
@@ -303,7 +351,7 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
                 r.occupants.clear();
             }
             state.runtime.set_buffer_read_only(state, &buffer.id, Some(&words));
-            card(state, handle, &buffer, "part", &words);
+            card(state, handle, &buffer, if codes.contains(&307) || codes.contains(&301) { "kick" } else { "part" }, &words);
         } else if gone.is_some() {
             let words = if codes.contains(&307) {
                 format!("{who} was kicked{}", reason.map(|r| format!(": {r}")).unwrap_or_default())
@@ -312,7 +360,7 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
             } else {
                 format!("{who} left")
             };
-            card(state, handle, &buffer, "part", &words);
+            card(state, handle, &buffer, if codes.contains(&307) || codes.contains(&301) { "kick" } else { "part" }, &words);
         }
         publish_occupants(state, handle, &room);
         return;
@@ -334,18 +382,25 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         occupant_id: occupant_id_of(&p.payloads, &room),
         hats: hats_of(&p.payloads),
     };
-    let first_time = {
+    let (first_time, before) = {
         let mut s = handle.session();
         let Some(r) = s.rooms.get_mut(&room) else { return };
-        let new = !r.occupants.contains_key(&nick);
+        let before = r.occupants.get(&nick).map(|o| (o.role.clone(), o.affiliation.clone()));
+        let new = before.is_none();
         if is_self {
             r.own_role = occupant.role.clone();
             r.own_affiliation = occupant.affiliation.clone();
             r.own_occupant_id = occupant.occupant_id.clone();
         }
         r.occupants.insert(nick.clone(), occupant.clone());
-        new
+        (new, before)
     };
+    // Somebody's standing changed while they were here: said once, as the room says it.
+    if let Some((role, affiliation)) = &before {
+        if let Some(words) = standing_change(if is_self { "You" } else { &nick }, role, affiliation, &occupant.role, &occupant.affiliation) {
+            card(state, handle, &buffer, "mode", &words);
+        }
+    }
     if is_self && !handle.session().rooms.get(&room).is_some_and(|r| r.joined) {
         if let Some(r) = handle.session().rooms.get_mut(&room) {
             r.joined = true;
@@ -432,12 +487,22 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
         return;
     }
     let buffer = ensure_buffer(state, handle, &room);
-    // The room's configuration changed (status 104 from the room itself): asked again, its picture included (XEP-0486).
+    // What the room itself says (no nickname): its configuration changed (status codes), or an invitation was declined.
     if nick.is_empty() && matches!(origin, Origin::Live) {
         if let Some(x) = message.payloads.iter().find(|e| e.is("x", MUC_USER)) {
-            if status_codes(x).contains(&104) {
+            let codes = status_codes(x);
+            if codes.contains(&104) {
+                // Asked again, its picture included (XEP-0486).
                 let (s, h, r) = (state.clone(), handle.clone(), room.clone());
                 tokio::spawn(async move { refresh_avatar(&s, &h, &r).await });
+            }
+            for words in config_words(&codes) {
+                card(state, handle, &buffer, "system", words);
+            }
+            if let Some(d) = x.children().find(|c| c.name() == "decline") {
+                let who = d.attr("from").unwrap_or("Somebody");
+                let why = d.children().find(|c| c.name() == "reason").map(|r| r.text()).filter(|r| !r.trim().is_empty());
+                card(state, handle, &buffer, "system", &format!("{who} declined your invitation{}", why.map(|r| format!(": {}", r.trim())).unwrap_or_default()));
             }
         }
     }
@@ -701,6 +766,27 @@ mod tests {
         assert!(!r.has_archive());
         r.features.insert(ns::MAM.into());
         assert!(r.has_archive());
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_of_standing_is_said_in_words() {
+        assert_eq!(standing_change("pat", "participant", "none", "moderator", "none").as_deref(), Some("pat is now a moderator"));
+        assert_eq!(standing_change("pat", "visitor", "none", "participant", "none").as_deref(), Some("pat can speak now (has been given a voice)"));
+        assert_eq!(standing_change("pat", "participant", "none", "visitor", "none").as_deref(), Some("pat can no longer speak in the room"));
+        assert_eq!(standing_change("You", "participant", "none", "participant", "member").as_deref(), Some("You are now a member of the room"));
+        assert_eq!(standing_change("pat", "moderator", "admin", "participant", "none").as_deref(), Some("pat is no longer an admin of the room"));
+        assert_eq!(standing_change("pat", "participant", "member", "participant", "member"), None, "a presence that changes nothing shown says nothing");
+    }
+
+    #[test]
+    fn a_rooms_configuration_change_is_said() {
+        assert_eq!(config_words(&[104, 172]), vec!["The room's settings were changed", "The room now shows everyone's address to everyone in it"]);
+        assert!(config_words(&[110, 201]).is_empty());
     }
 }
 
