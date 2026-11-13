@@ -1721,6 +1721,12 @@ impl Runtime {
             if let Some(avatar) = old.avatar_url {
                 self.set_buffer_avatar(state, &new_id, &avatar);
             }
+            // And keeps the id its service knows it by. Without this the renamed conversation was no longer found by
+            // that id: an XMPP contact, room, Stoat channel or Telegram topic renamed was looked up afresh and made
+            // again, and a Signal group renamed from moho could no longer be changed or written to.
+            if let Some(remote) = old.remote_id {
+                self.set_buffer_remote_id(state, &new_id, &remote);
+            }
         }
         self.refresh_buffer_activity(state, &new_id);
     }
@@ -5237,6 +5243,17 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_renamed_conversation_keeps_the_id_its_service_knows_it_by() {
+        let state = crate::backend::kick::testkit::simulated_daemon("rename-keeps-remote");
+        let buffer = state.runtime.ensure_buffer(&state, "xmpp:me@example.org", "Alice", "dm");
+        state.runtime.set_buffer_remote_id(&state, &buffer.id, "alice@example.org");
+        state.runtime.rename_buffer(&state, "xmpp:me@example.org", "Alice", "Alice Smith", "dm");
+        let renamed = state.runtime.get_buffer(&crate::model::buffer_id("xmpp:me@example.org", "Alice Smith")).expect("renamed");
+        assert_eq!(renamed.remote_id.as_deref(), Some("alice@example.org"));
+        assert!(state.runtime.get_buffer(&buffer.id).is_none());
+    }
 
     #[test]
     fn a_cache_stops_at_its_ceiling() {
