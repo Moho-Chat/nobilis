@@ -699,6 +699,67 @@ pub async fn gif(state: &AppState, buffer: &Buffer, url: &str) -> Result<(), Str
     Ok(())
 }
 
+/// The stickers of the account's installed packs (installed on the phone; the library fetches them), each written to
+/// the cache once so the picker can draw it.
+pub async fn stickers(state: &AppState, buffer: &Buffer) -> Result<serde_json::Value, String> {
+    use presage::store::ContentsStore;
+    let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
+    let packs = handle.store.sticker_packs().await.map_err(|e| e.to_string())?;
+    let dir = crate::media_cache::dir(super::media::MEDIA).join("stickers");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut out = Vec::new();
+    for pack in packs.filter_map(Result::ok) {
+        for sticker in &pack.manifest.stickers {
+            let Some(bytes) = &sticker.bytes else { continue };
+            let path = dir.join(format!("{}-{}.webp", ids::hex(&pack.id), sticker.id));
+            if !path.exists() {
+                let _ = std::fs::write(&path, bytes);
+            }
+            let emoji = sticker.emoji.clone().unwrap_or_default();
+            out.push(serde_json::json!({
+                "id": format!("{}:{}", ids::hex(&pack.id), sticker.id),
+                "name": if emoji.is_empty() { "sticker".to_string() } else { emoji.clone() },
+                "pack": pack.manifest.title,
+                "body": emoji,
+                "url": format!("file://{}", path.display()),
+            }));
+        }
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// Sends sticker `id` (`<pack id hex>:<number>`) from the picker.
+pub async fn sticker(state: &AppState, buffer: &Buffer, id: &str) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let (pack, number) = id.split_once(':').ok_or("that is not a Signal sticker")?;
+    let pack_id = ids::unhex(pack).ok_or("that is not a Signal sticker")?;
+    let sticker_id: u32 = number.parse().map_err(|_| "that is not a Signal sticker".to_string())?;
+    let at = ask(&handle, |done| Command::SendSticker { thread, pack_id, sticker_id, done }).await?;
+    // Drawn from the picture the picker already wrote, as the account's own message.
+    let path = crate::media_cache::dir(super::media::MEDIA).join("stickers").join(format!("{pack}-{sticker_id}.webp"));
+    let attachment = crate::model::Attachment {
+        kind: "image".to_string(),
+        mimetype: Some("image/webp".to_string()),
+        filename: None,
+        size: std::fs::metadata(&path).ok().map(|m| m.len()),
+        width: None,
+        height: None,
+        blurhash: None,
+        duration_secs: None,
+        waveform: None,
+        voice: false,
+        path: Some(format!("file://{}", path.display())),
+        thumbnail_path: None,
+        url: None,
+    };
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    state.runtime.record_message_at(
+        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, "", false, "chat", None, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), vec![attachment],
+        Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
+    );
+    Ok(())
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

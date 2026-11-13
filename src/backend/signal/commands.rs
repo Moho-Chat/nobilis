@@ -233,6 +233,37 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::SendSticker { thread, pack_id, sticker_id, done } => {
+                use presage::store::ContentsStore;
+                let at = now_ms();
+                let result = async {
+                    let pack = manager.store().sticker_pack(&pack_id).await.ok().flatten().ok_or("that sticker pack is not installed")?;
+                    let sticker = pack.manifest.stickers.iter().find(|s| s.id == sticker_id).cloned().ok_or("that sticker is not in its pack")?;
+                    let bytes = sticker.bytes.clone().ok_or("that sticker's picture has not been fetched")?;
+                    let content_type = sticker.content_type.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| "image/webp".to_string());
+                    let spec = presage::libsignal_service::sender::AttachmentSpec {
+                        content_type,
+                        length: bytes.len(),
+                        file_name: None,
+                        preview: None,
+                        voice_note: None,
+                        borderless: Some(true),
+                        width: None,
+                        height: None,
+                        caption: None,
+                        blur_hash: None,
+                    };
+                    let pointer = match manager.upload_attachments(vec![(spec, bytes)]).await {
+                        Ok(mut results) => results.pop().ok_or("Signal did not take the sticker")?.map_err(|e| format!("Signal did not take the sticker: {e}"))?,
+                        Err(e) => return Err(explain(&e)),
+                    };
+                    let message = data_message::Sticker { pack_id: Some(pack.id.clone()), pack_key: Some(pack.key.clone()), sticker_id: Some(sticker_id), data: Some(pointer), emoji: sticker.emoji.clone() };
+                    let dm = DataMessage { sticker: Some(message), timestamp: Some(at), ..Default::default() };
+                    deliver(&mut manager, &thread, dm, at).await
+                }
+                .await;
+                finish(done, result.map_err(|e: String| e), at);
+            }
             Command::StoryAnswer { thread, context, body, emoji, done } => {
                 let at = now_ms();
                 let reaction = emoji.map(|(emoji, remove)| data_message::Reaction {

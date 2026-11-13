@@ -125,6 +125,8 @@ pub enum Command {
     Vote { thread: presage::store::Thread, vote: presage::proto::data_message::PollVote, done: Done },
     /// Answer a story: a reply in words or a reaction, sent to its author naming the story.
     StoryAnswer { thread: presage::store::Thread, context: presage::proto::data_message::StoryContext, body: Option<String>, emoji: Option<(String, bool)>, done: Done },
+    /// Send a sticker from one of the account's installed packs.
+    SendSticker { thread: presage::store::Thread, pack_id: Vec<u8>, sticker_id: u32, done: Done },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

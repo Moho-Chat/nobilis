@@ -5948,6 +5948,21 @@ pub async fn dispatch(
             }
         }
 
+        "listSignalStickers" | "sendSignalSticker" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let result = if method == "listSignalStickers" {
+                backend::signal::send::stickers(state, &buffer).await
+            } else {
+                backend::signal::send::sticker(state, &buffer, p_str(params, "id", "")).await.map(|()| ok_node())
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "sendSignalGif" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
                 return (None, Some("sendSignalGif requires a Signal \"bufferId\"".to_string()));
