@@ -91,6 +91,9 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     }
     let mut uploads = Vec::new();
     let mut local = Vec::new();
+    // Over Signal's 2000 bytes, the message carries the first part as its text and the whole as a file, as Signal's
+    // clients send it.
+    let (wire_text, wire_ranges, long) = cut_long(&plain, &styles);
     let total: u64 = paths.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
     if let Some(p) = progress {
         p.at(crate::upload::Phase::Preparing, total as usize, "Signal");
@@ -106,6 +109,9 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
         local.push(path.clone());
         uploads.push(super::Upload { name, content_type: content_type.to_string(), bytes, width, height });
+    }
+    if let Some(whole) = long {
+        uploads.push(super::Upload { name: "long-message.txt".to_string(), content_type: super::media::LONG_TEXT.to_string(), bytes: whole.into_bytes(), width: None, height: None });
     }
     let pointers = if uploads.is_empty() {
         Vec::new()
@@ -135,7 +141,7 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         thread_root: None,
         chat: None,
     });
-    let (plain_for_wire, ranges_for_wire) = (plain.clone(), styles.clone());
+    let (plain_for_wire, ranges_for_wire) = (wire_text, wire_ranges);
     let timer = presage::store::ContentsStore::expire_timer(&handle.store, &thread).await.ok().flatten().map(|(seconds, _)| seconds).filter(|s| *s > 0);
     let noted_thread = thread.clone();
     let sent_pointers = pointers.clone();
@@ -144,7 +150,8 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     let drawn = ranges::render(&plain, &styles, |aci| names.iter().find(|(id, _)| id == aci).map(|(_, n)| n.clone()).unwrap_or_else(|| "someone".to_string()));
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
     // The files are on hand already: they go into the cache under the names the attachments will be looked for by.
-    let attachments = super::media::attachments_of(&buffer.account_id, &noted_thread, &handle.own, at, &pointers);
+    let mut attachments = super::media::attachments_of(&buffer.account_id, &noted_thread, &handle.own, at, &pointers);
+    attachments.retain(|a| a.mimetype.as_deref() != Some(super::media::LONG_TEXT));
     for (attachment, from) in attachments.iter().zip(&local) {
         if let Some(to) = attachment.path.as_deref().and_then(|p| p.strip_prefix("file://")) {
             if let Some(parent) = std::path::Path::new(to).parent() {
@@ -333,6 +340,25 @@ pub async fn rename_device(state: &AppState, account_id: &str, name: &str) -> Re
     let owned = name.to_string();
     let _ = state.accounts.mutate_signal(account_id, |a| a.device_name = owned);
     Ok(())
+}
+
+/// The most a message's own text may be, in bytes; past it the whole text goes as a file.
+const MOST_TEXT: usize = 2000;
+
+/// A text that is too long for a message, cut where Signal's clients cut it: the first part (on a character boundary)
+/// with the styles that fit in it, and the whole text to send beside it. `None` for the whole when it fits.
+pub fn cut_long(plain: &str, styles: &[presage::proto::BodyRange]) -> (String, Vec<presage::proto::BodyRange>, Option<String>) {
+    if plain.len() <= MOST_TEXT {
+        return (plain.to_string(), styles.to_vec(), None);
+    }
+    let mut end = MOST_TEXT;
+    while !plain.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = plain[..end].to_string();
+    let units = head.encode_utf16().count() as u32;
+    let kept = styles.iter().filter(|r| r.start.unwrap_or(0) + r.length.unwrap_or(0) <= units).cloned().collect();
+    (head, kept, Some(plain.to_string()))
 }
 
 /// The members of a group other than the account, with what they are called, for finding mentions.
@@ -711,5 +737,17 @@ mod tests {
     fn only_a_picture_has_a_size_to_read() {
         assert_eq!(dimensions_of("/nonexistent.png", "image/png"), (None, None));
         assert_eq!(dimensions_of("/nonexistent.mp4", "video/mp4"), (None, None));
+    }
+
+    #[test]
+    fn a_long_message_is_cut_on_a_character_and_sent_whole_beside() {
+        let short = "hello";
+        assert_eq!(super::cut_long(short, &[]).2, None);
+        let long = format!("{}é{}", "a".repeat(1999), "b".repeat(50));
+        let range = |start, length| presage::proto::BodyRange { start: Some(start), length: Some(length), associated_value: None };
+        let (head, kept, whole) = super::cut_long(&long, &[range(0, 5), range(1990, 30)]);
+        assert_eq!(head.len(), 1999, "the two-byte letter would straddle the limit, so the cut is before it");
+        assert_eq!(kept.len(), 1, "a style running past the cut is left off the short part");
+        assert_eq!(whole.as_deref(), Some(long.as_str()));
     }
 }

@@ -143,6 +143,9 @@ pub fn data_message_of(content: &Content) -> Option<&DataMessage> {
 
 /// Every pointer a message carries, in a fixed order: its attachments, a sticker's picture, then the pictures of its link
 /// previews. A cached file is found again by its place in this list.
+/// The content type of the file that carries a long message's whole text.
+pub const LONG_TEXT: &str = "text/x-signal-plain";
+
 pub fn pointers_of(dm: &DataMessage) -> Vec<AttachmentPointer> {
     let mut all: Vec<AttachmentPointer> = dm.attachments.clone();
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {

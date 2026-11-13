@@ -634,7 +634,10 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
     // The pictures, files and stickers: named in the cache now, fetched when looked at (see `media`).
     let view_once = dm.is_view_once.unwrap_or(false);
     let pointers = if view_once { Vec::new() } else { super::media::pointers_of(dm) };
-    let attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers[..super::media::shown_count(dm).min(pointers.len())]);
+    let mut attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers[..super::media::shown_count(dm).min(pointers.len())]);
+    // A message longer than Signal's 2000 bytes carries the whole of its text as a file; that is not a file to show.
+    let long_text = pointers.iter().find(|p| p.content_type.as_deref() == Some(super::media::LONG_TEXT)).cloned();
+    attachments.retain(|a| a.mimetype.as_deref() != Some(super::media::LONG_TEXT));
     let cards = if view_once { Vec::new() } else { super::media::previews_of(ctx.account_id, thread, &author, at, dm) };
     let recorded = ctx.state.runtime.record_message_at(
         ctx.state,
@@ -656,6 +659,22 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         shown.html,
         None,
     );
+    if recorded {
+        if let (Some(pointer), Some(handle)) = (long_text, ctx.state.runtime.signal_handle(ctx.account_id)) {
+            // The whole text, fetched now rather than on look: it is the message, not an attachment to it.
+            let (state, buffer_id, id) = (ctx.state.clone(), buffer.id.clone(), ids::message_id(at, &author));
+            tokio::task::spawn_local(async move {
+                let (done, answer) = tokio::sync::oneshot::channel();
+                if handle.commands.send(super::Command::Fetch { pointer: Box::new(pointer), done }).is_err() {
+                    return;
+                }
+                if let Ok(Ok(bytes)) = answer.await {
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    state.runtime.update_message_body_only(&state, &buffer_id, &id, &text);
+                }
+            });
+        }
+    }
     if !recorded {
         tracing::debug!("signal[{}]: a message was not new", ctx.account_id);
     } else if let Some(seconds) = dm.expire_timer.filter(|s| *s > 0) {
