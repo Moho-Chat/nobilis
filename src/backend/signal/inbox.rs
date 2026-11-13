@@ -276,6 +276,15 @@ async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &
             }
         }
         Some(Sync::Blocked(blocked)) => blocked_on_phone(ctx, blocked).await,
+        Some(Sync::DeleteForMe(deletes)) => deleted_on_phone(ctx, deletes).await,
+        Some(Sync::Verified(verified)) => {
+            // Marked verified (or not) on the phone: kept with the person, for their card.
+            if let Some(who) = ids::aci_of(verified.destination_aci.as_deref(), verified.destination_aci_binary.as_deref()) {
+                let state = verified.state.unwrap_or(0);
+                let key = format!("verified:{who}");
+                let _ = ctx.store.set_blob(&key, if state == 1 { b"1" } else { b"0" });
+            }
+        }
         Some(Sync::FetchLatest(latest)) => {
             use presage::proto::sync_message::fetch_latest::Type;
             if latest.r#type == Some(Type::StorageManifest as i32) {
@@ -445,6 +454,55 @@ async fn blocked_on_phone(ctx: &Ctx<'_>, blocked: &presage::proto::sync_message:
     }
     super::storage::keep(ctx.account_id, &ctx.store, kept);
     tracing::info!("signal[{}]: the phone's block list arrived ({} blocked)", ctx.account_id, listed.len());
+}
+
+/// The thread a conversation identifier names.
+async fn thread_of_conversation(ctx: &Ctx<'_>, id: &presage::proto::ConversationIdentifier) -> Option<Thread> {
+    use presage::proto::conversation_identifier::Identifier;
+    match id.identifier.as_ref()? {
+        Identifier::ThreadServiceId(text) => ServiceId::parse_from_service_id_string(text).map(Thread::Contact),
+        Identifier::ThreadServiceIdBinary(bytes) => ServiceId::parse_from_service_id_binary(bytes).map(Thread::Contact),
+        Identifier::ThreadGroupId(group_id) => thread_of_group_id(ctx, group_id).await,
+        Identifier::ThreadE164(_) => None,
+    }
+}
+
+/// The id a message an addressable reference names has here.
+fn addressed(message: &presage::proto::AddressableMessage) -> Option<(u64, Uuid)> {
+    use presage::proto::addressable_message::Author;
+    let author = match message.author.as_ref()? {
+        Author::AuthorServiceId(text) => ServiceId::parse_from_service_id_string(text).map(|id| ids::uuid_of(&id)),
+        Author::AuthorServiceIdBinary(bytes) => ServiceId::parse_from_service_id_binary(bytes).map(|id| ids::uuid_of(&id)),
+        Author::AuthorE164(_) => None,
+    }?;
+    Some((message.sent_timestamp?, author))
+}
+
+/// Messages and conversations deleted on the phone for the account only ("delete for me"): gone here as well.
+async fn deleted_on_phone(ctx: &Ctx<'_>, deletes: &presage::proto::sync_message::DeleteForMe) {
+    let mut store = ctx.store.clone();
+    for delete in &deletes.message_deletes {
+        let Some(thread) = delete.conversation.as_ref() else { continue };
+        let Some(thread) = thread_of_conversation(ctx, thread).await else { continue };
+        let remote = ids::remote_id(&thread);
+        let buffer = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str()));
+        for (sent, author) in delete.messages.iter().filter_map(addressed) {
+            if let Some(buffer) = &buffer {
+                ctx.state.runtime.delete_message(ctx.state, &buffer.id, &ids::message_id(sent, &author));
+            }
+            let _ = presage::store::ContentsStore::delete_message(&mut store, &thread, sent).await;
+        }
+    }
+    let whole = deletes.conversation_deletes.iter().filter_map(|d| d.conversation.as_ref()).chain(deletes.local_only_conversation_deletes.iter().filter_map(|d| d.conversation.as_ref()));
+    for conversation in whole {
+        let Some(thread) = thread_of_conversation(ctx, conversation).await else { continue };
+        let remote = ids::remote_id(&thread);
+        let _ = presage::store::ContentsStore::clear_thread(&mut store, &thread).await;
+        if let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) {
+            let _ = ctx.state.store.forget_buffer(&buffer.id);
+            ctx.state.runtime.remove_buffer(ctx.state, &buffer.id);
+        }
+    }
 }
 
 /// Whether a message is a line in the conversation (text, a file, a sticker...) rather than housekeeping.

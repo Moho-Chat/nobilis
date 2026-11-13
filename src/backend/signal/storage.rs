@@ -235,6 +235,23 @@ impl Kept {
     }
 }
 
+/// The block list a `Blocked` sync carries: every person and group blocked.
+pub fn blocked_list(kept: &Kept) -> presage::proto::sync_message::Blocked {
+    let mut list = presage::proto::sync_message::Blocked::default();
+    for (remote, standing) in kept.conversations.iter().filter(|(_, s)| s.blocked) {
+        if let Some(aci) = remote.strip_prefix("p:").and_then(|a| Uuid::parse_str(a).ok()) {
+            list.acis.push(aci.to_string());
+            list.acis_binary.push(aci.as_bytes().to_vec());
+        } else if let Some(key) = remote.strip_prefix("g:").and_then(ids::unhex) {
+            if let Ok(key) = <[u8; 32]>::try_from(key.as_slice()) {
+                list.group_ids.push(super::commands::group_identifier(&key));
+            }
+        }
+        let _ = standing;
+    }
+    list
+}
+
 /// What has been read for each account, so names and requests are answered without opening the file each time.
 fn cache() -> &'static Mutex<HashMap<String, Arc<Kept>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<Kept>>>> = OnceLock::new();
@@ -461,6 +478,17 @@ mod tests {
         assert!(!kept.is_request(&own, &own, false), "Note to Self");
         let accepted = Kept::from_records(2, &[contact(A, |c| c.whitelisted = true)]);
         assert!(!accepted.is_request(&format!("p:{A}"), &own, false));
+    }
+
+    #[test]
+    fn the_block_list_names_every_blocked_person_and_group() {
+        let key = [4u8; 32];
+        let group = StorageRecord { record: Some(storage_record::Record::GroupV2(GroupV2Record { master_key: key.to_vec(), blocked: true, ..Default::default() })) };
+        let kept = Kept::from_records(1, &[contact(A, |c| c.blocked = true), contact(B, |_| {}), group]);
+        let list = blocked_list(&kept);
+        assert_eq!(list.acis, vec![A.to_string()]);
+        assert_eq!(list.acis_binary.len(), 1);
+        assert_eq!(list.group_ids, vec![super::super::commands::group_identifier(&key)]);
     }
 
     #[test]

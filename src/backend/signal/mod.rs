@@ -113,6 +113,10 @@ pub enum Command {
     JoinByLink { link: String, done: tokio::sync::oneshot::Sender<Result<([u8; 32], bool), String>> },
     /// Set the disappearing-message timer of a conversation with one person.
     SetTimer { thread: presage::store::Thread, seconds: u32, done: Done },
+    /// Block or unblock a person or group: the account's other devices are sent the new list.
+    Block { thread: presage::store::Thread, blocked: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Mark a person's safety number verified (or take that back), on every device of the account.
+    Verify { who: uuid::Uuid, verified: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

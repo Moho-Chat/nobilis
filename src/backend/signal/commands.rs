@@ -233,6 +233,54 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::Block { thread, blocked, done } => {
+                let remote = super::ids::remote_id(&thread);
+                let store = manager.store().clone();
+                let mut kept = (*super::storage::current(&account_id, &store)).clone();
+                kept.conversations.entry(remote.clone()).or_default().blocked = blocked;
+                let list = super::storage::blocked_list(&kept);
+                let sync = SyncMessage { content: Some(sync_message::Content::Blocked(list)), ..Default::default() };
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let result = manager.send_message(own, sync, now_ms()).await.map_err(|e| explain(&e));
+                if result.is_ok() {
+                    super::storage::keep(&account_id, &store, kept);
+                    // A blocked request is answered by the blocking.
+                    if blocked {
+                        let own_aci = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                        let ctx = super::people::Ctx::new(&state, &account_id, store.clone(), own_aci);
+                        if super::requests::is_held(&store, &remote) {
+                            super::requests::apply(&ctx, &thread, super::requests::Answer::Block).await;
+                        }
+                    }
+                }
+                let _ = done.send(result);
+            }
+            Command::Verify { who, verified, done } => {
+                let store = manager.store().clone();
+                let result = match store.identity_of(&who.to_string()) {
+                    Ok(Some(key)) => {
+                        use presage::proto::verified::State;
+                        let state_value = if verified { State::Verified } else { State::Default };
+                        let padding: Vec<u8> = (0..rand::random::<u8>() % 64 + 1).map(|_| rand::random()).collect();
+                        let message = presage::proto::Verified {
+                            destination_aci: Some(who.to_string()),
+                            destination_aci_binary: Some(who.as_bytes().to_vec()),
+                            identity_key: Some(key.serialize().to_vec()),
+                            state: Some(state_value as i32),
+                            null_message: Some(padding),
+                        };
+                        let sync = SyncMessage { content: Some(sync_message::Content::Verified(message)), ..Default::default() };
+                        let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                        manager.send_message(own, sync, now_ms()).await.map_err(|e| explain(&e))
+                    }
+                    Ok(None) => Err("Their key is not known yet: exchange a message with them first".to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                if result.is_ok() {
+                    let _ = store.set_blob(&format!("verified:{who}"), if verified { b"1" } else { b"0" });
+                }
+                let _ = done.send(result);
+            }
             Command::EditGroup { key, edit, done } => {
                 let result = edit_group(&mut manager, key, edit).await;
                 if result.is_ok() {

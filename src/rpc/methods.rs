@@ -5981,6 +5981,22 @@ pub async fn dispatch(
             }
         }
 
+        "signalBlock" | "signalVerify" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let on = |name: &str| params.get(name).and_then(|v| v.as_bool()).unwrap_or(true);
+            let result = if method == "signalBlock" {
+                backend::signal::send::block(state, account_id, p_str(params, "id", ""), on("blocked")).await
+            } else {
+                backend::signal::send::verify(state, account_id, p_str(params, "userId", ""), on("verified")).await
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "signalRequests" | "signalAnswerRequest" => {
             let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
                 return (None, Some(format!("{method} requires a Signal \"accountId\"")));

@@ -487,6 +487,25 @@ pub async fn set_timer(state: &AppState, buffer: &Buffer, seconds: u32) -> Resul
     ask(&handle, |done| Command::SetTimer { thread, seconds, done }).await.map(|_| ())
 }
 
+/// Blocks or unblocks a person (`p:<aci>` or their id) or a group (`g:<key>`).
+pub async fn block(state: &AppState, account_id: &str, id: &str, blocked: bool) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let id = id.trim();
+    let thread = ids::parse_remote_id(id).or_else(|| uuid::Uuid::parse_str(id).ok().map(|u| Thread::Contact(presage::libsignal_service::protocol::ServiceId::Aci(u.into())))).ok_or("that is not a Signal person or group")?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::Block { thread, blocked, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(60)).await
+}
+
+/// Marks a person's safety number as verified (or not), as the account's other devices will see it.
+pub async fn verify(state: &AppState, account_id: &str, user_id: &str, verified: bool) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let who = uuid::Uuid::parse_str(user_id.trim().trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::Verify { who, verified, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(60)).await
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

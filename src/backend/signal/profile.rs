@@ -66,10 +66,22 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
             }
         }
     }
+    let kept = super::storage::current(account_id, &ctx.store);
+    if let Some(standing) = kept.standing(&format!("p:{target}")) {
+        if let Some(username) = &standing.username {
+            profile::note(&mut card, "Username", username.clone());
+        }
+        if let Some(note) = &standing.note {
+            profile::note(&mut card, "Your note", note.clone());
+        }
+    }
     if target != handle.own {
         if let Some(number) = safety_number(&ctx.store, &handle.own, &target).await {
             profile::note(&mut card, "Safety number (compare with theirs in Signal; not yet checked against another client)", number);
         }
+        let verified = ctx.store.blob(&format!("verified:{target}")).ok().flatten().is_some_and(|b| b == b"1");
+        card["signalVerified"] = json!(verified);
+        card["signalBlocked"] = json!(kept.blocked(&format!("p:{target}")));
     }
     card
 }
