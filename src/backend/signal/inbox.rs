@@ -142,6 +142,16 @@ pub async fn open_groups(state: &AppState, account_id: &str, manager: &Manager<S
     let keys: Vec<[u8; 32]> = groups.filter_map(|g| g.ok()).map(|(key, _)| key).collect();
     for key in keys {
         if ctx.store.is_group_left(key).await.unwrap_or(false) {
+            // A group the account left keeps its conversation, as on the phone ("You are no longer in the group"), if
+            // there is history in it: it was taken away after connecting, history and all, and could not be found
+            // again (seen on the first real account). One with nothing here is not made for it.
+            let remote = ids::remote_id(&Thread::Group(key));
+            let open = state.runtime.list_buffers().iter().any(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str()));
+            let title = people::group_title(&ctx, &key).await;
+            let history = state.store.has_messages(&crate::model::buffer_id(account_id, &title)).unwrap_or(false);
+            if open || history {
+                people::buffer_for(&ctx, &Thread::Group(key)).await;
+            }
             continue;
         }
         people::buffer_for(&ctx, &Thread::Group(key)).await;

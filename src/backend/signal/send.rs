@@ -16,6 +16,12 @@ const PATIENCE: Duration = Duration::from_secs(90);
 fn target(state: &AppState, buffer: &Buffer) -> Result<(Handle, Thread), String> {
     let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
     let thread = buffer.remote_id.as_deref().and_then(ids::parse_remote_id).ok_or("that conversation is not a Signal one")?;
+    // A group left stays to be read, as on the phone, and nothing more is sent to it.
+    if let Thread::Group(key) = &thread {
+        if handle.store.has_left(key) {
+            return Err("You are no longer in this group".to_string());
+        }
+    }
     Ok((handle, thread))
 }
 

@@ -589,3 +589,13 @@ fn a_store_made_before_disappearing_messages_gets_the_table() {
     let version: i64 = s.read(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?)).unwrap();
     assert_eq!(version, 2);
 }
+
+#[tokio::test]
+async fn a_group_left_is_known_as_left_without_waiting() -> TestResult {
+    let s = store();
+    assert!(!s.has_left(&[4; 32]));
+    s.mark_group_left([4; 32]).await?;
+    assert!(s.has_left(&[4; 32]) && s.is_group_left([4; 32]).await?);
+    assert!(!s.has_left(&[5; 32]));
+    Ok(())
+}

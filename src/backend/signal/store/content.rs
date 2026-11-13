@@ -49,6 +49,13 @@ fn thread_id(conn: &Connection, thread: &Thread) -> Result<Option<i64>> {
 }
 
 impl SignalStore {
+    /// Whether the account has left (or been taken out of) the group: the same answer as `is_group_left`, for code that
+    /// is not async.
+    pub fn has_left(&self, master_key: &[u8; 32]) -> bool {
+        self.read(|conn| Ok(conn.query_row("SELECT EXISTS (SELECT 1 FROM left_groups WHERE master_key = ?1)", [master_key.as_slice()], |row| row.get(0))?))
+            .unwrap_or(false)
+    }
+
     /// The people the account has a one-to-one conversation with that still holds a message (the account itself among
     /// them, for Note to Self). Signal keeps no list of conversations on its server; this is what there is of one.
     pub fn people_with_messages(&self) -> Result<Vec<uuid::Uuid>> {
