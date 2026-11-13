@@ -758,8 +758,16 @@ impl<S: Store> Manager<S, Registered> {
         let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
         let params = self.state.service_configuration().zkgroup_server_public_params;
         let timer = (timer_seconds > 0).then_some(Timer { duration: timer_seconds });
+        // moho: the server refuses a new group whose access rules are unset (HTTP 400, seen on the first real account).
+        // These are what Signal's own clients make a group with: members edit it and add people, no joining by link.
+        let access = libsignal_service::groups_v2::AccessControl {
+            attributes: libsignal_service::groups_v2::AccessRequired::Member,
+            members: libsignal_service::groups_v2::AccessRequired::Member,
+            add_from_invite_link: libsignal_service::groups_v2::AccessRequired::Unsatisfiable,
+            member_label: libsignal_service::groups_v2::AccessRequired::Member,
+        };
         let group = operations
-            .encrypt_group_with_credentials(title, None, timer.as_ref(), None, &own_credential, &candidates, &params, String::new(), &mut rng())
+            .encrypt_group_with_credentials(title, None, timer.as_ref(), Some(&access), &own_credential, &candidates, &params, String::new(), &mut rng())
             .map_err(|e| Error::GroupChange(format!("the group could not be made: {e:?}")))?;
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let authorization = groups_manager

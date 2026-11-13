@@ -17,6 +17,8 @@ What is changed, and nothing else:
   caller from the group's operations, sent with the patched `PushService::patch_group`, then saved and sent to the
   members and to anybody it took out; leaving marks the group left), `create_group`, `add_member_action` and
   `profile_key_credential` (adding somebody directly), `group_link_info` and `join_group_by_link`.
+  `create_group` sends the access rules Signal's clients make a group with (members edit and add, no joining by
+  link): unset, the server answers HTTP 400.
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the
