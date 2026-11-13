@@ -145,6 +145,7 @@ pub async fn open_groups(state: &AppState, account_id: &str, manager: &Manager<S
             continue;
         }
         people::buffer_for(&ctx, &Thread::Group(key)).await;
+        super::groups::publish_members(&ctx, &key).await;
     }
 }
 
@@ -493,6 +494,9 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         }
         if changes.changes.iter().any(|c| matches!(c, presage::libsignal_service::groups_v2::GroupChange::Title(_))) {
             rename_known(ctx).await;
+        }
+        if let Thread::Group(key) = thread {
+            super::groups::publish_members(ctx, key).await;
         }
     }
     if flags & EXPIRATION_TIMER_UPDATE != 0 {

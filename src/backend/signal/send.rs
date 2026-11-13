@@ -72,7 +72,14 @@ fn dimensions_of(path: &str, content_type: &str) -> (Option<u32>, Option<u32>) {
 /// Sends text and files: `paths` are put on Signal's servers first, then the message carries them.
 pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
     let (handle, thread) = target(state, buffer)?;
-    let (plain, styles) = compose::parse(body);
+    // In a group, `@Name` for a member is a mention, which Signal carries as a character and a range over it.
+    let (body, mentioned) = match &thread {
+        Thread::Group(key) => compose::mentions(body, &members_of(state, buffer, &handle, key).await),
+        Thread::Contact(_) => (body.to_string(), Vec::new()),
+    };
+    let (plain, mut styles) = compose::parse(&body);
+    styles.extend(compose::mention_ranges(&plain, &mentioned));
+    styles.sort_by_key(|r| (r.start, std::cmp::Reverse(r.length)));
     if plain.trim().is_empty() && paths.is_empty() {
         return Err("there is nothing to send".to_string());
     }
@@ -130,7 +137,8 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     let noted_thread = thread.clone();
     let sent_pointers = pointers.clone();
     let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, attachments: sent_pointers, done }).await?;
-    let drawn = ranges::render(&plain, &styles, |_| "someone".to_string());
+    let names: Vec<(String, String)> = mentioned.iter().map(|id| (id.to_string(), name_here(state, buffer, id, &handle))).collect();
+    let drawn = ranges::render(&plain, &styles, |aci| names.iter().find(|(id, _)| id == aci).map(|(_, n)| n.clone()).unwrap_or_else(|| "someone".to_string()));
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
     // The files are on hand already: they go into the cache under the names the attachments will be looked for by.
     let attachments = super::media::attachments_of(&buffer.account_id, &noted_thread, &handle.own, at, &pointers);
@@ -282,6 +290,17 @@ pub async fn rename_device(state: &AppState, account_id: &str, name: &str) -> Re
     let owned = name.to_string();
     let _ = state.accounts.mutate_signal(account_id, |a| a.device_name = owned);
     Ok(())
+}
+
+/// The members of a group other than the account, with what they are called, for finding mentions.
+async fn members_of(state: &AppState, buffer: &Buffer, handle: &Handle, key: &[u8; 32]) -> Vec<(String, uuid::Uuid)> {
+    let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, *key).await else { return Vec::new() };
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    let mut out = Vec::new();
+    for id in group.members.iter().map(|m| uuid::Uuid::from(m.aci)).filter(|id| *id != handle.own) {
+        out.push((super::people::person(&ctx, &id).await, id));
+    }
+    out
 }
 
 /// The message requests waiting on an account.

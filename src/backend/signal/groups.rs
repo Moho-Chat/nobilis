@@ -153,6 +153,52 @@ pub async fn lines_for(ctx: &Ctx<'_>, changes: &GroupChanges) -> Vec<String> {
     })
 }
 
+/// The window's member list for a group: its members, admins first by their mark, and those invited and not yet in.
+/// Signal has no presence, so nobody is drawn online or away.
+pub async fn publish_members(ctx: &Ctx<'_>, key: &[u8; 32]) {
+    use presage::store::ContentsStore;
+    let Ok(Some(group)) = ctx.store.group(*key).await else { return };
+    let remote = format!("g:{}", ids::hex(key));
+    let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { return };
+    let mut list = Vec::new();
+    for member in &group.members {
+        let who = Uuid::from(member.aci);
+        let admin = matches!(member.role, Role::Administrator);
+        list.push(serde_json::json!({
+            "nick": people::person(ctx, &who).await,
+            "userId": who.to_string(),
+            "prefix": if admin { "admin" } else { "" },
+            "away": false,
+            "bot": false,
+            "relationship": "",
+            "avatarUrl": super::media::avatar_of(ctx.account_id, &who),
+            "roles": [if admin { "admin" } else { "member" }],
+        }));
+    }
+    for pending in &group.pending_members {
+        // One invited by number (their PNI) has no name this account can know.
+        if !matches!(pending.service_id_type, presage::model::ServiceIdType::AccountIdentity) {
+            continue;
+        }
+        let who = pending.uuid;
+        list.push(serde_json::json!({
+            "nick": people::person(ctx, &who).await,
+            "userId": who.to_string(),
+            "prefix": "invited",
+            "away": false,
+            "bot": false,
+            "relationship": "",
+            "avatarUrl": super::media::avatar_of(ctx.account_id, &who),
+            "roles": ["invited"],
+        }));
+    }
+    let total = group.members.len();
+    let list = serde_json::Value::Array(list);
+    ctx.state.runtime.set_presence(&buffer.id, list.clone());
+    ctx.state.runtime.set_presence_total(&buffer.id, total);
+    ctx.state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer.id, "members": list, "total": total }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

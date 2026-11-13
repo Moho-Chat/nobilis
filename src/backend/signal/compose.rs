@@ -79,6 +79,60 @@ fn run(chars: &[char], from: usize, to: usize, out: &mut String, units: &mut usi
     }
 }
 
+/// The character Signal puts in a message's text where a mention is; the mention's range covers it.
+pub const MENTION: char = '\u{FFFC}';
+
+/// Finds `@Name` for the people who can be mentioned (`people`: their name and id) and puts the mention character in its
+/// place. Answers the text and who is mentioned, in the order they appear. At each `@` the longest name that fits wins,
+/// and a name must end where a word ends, so `@Sam` is not found in `@Samantha`.
+pub fn mentions(text: &str, people: &[(String, uuid::Uuid)]) -> (String, Vec<uuid::Uuid>) {
+    let mut sorted: Vec<&(String, uuid::Uuid)> = people.iter().filter(|(name, _)| !name.trim().is_empty()).collect();
+    sorted.sort_by_key(|(name, _)| std::cmp::Reverse(name.chars().count()));
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut who = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let starts_word = i == 0 || !chars[i - 1].is_alphanumeric();
+        if chars[i] == '@' && starts_word {
+            let found = sorted.iter().find(|(name, _)| {
+                let needle: Vec<char> = name.chars().collect();
+                let end = i + 1 + needle.len();
+                end <= chars.len() && chars[i + 1..end] == needle[..] && chars.get(end).is_none_or(|c| !c.is_alphanumeric() && *c != '_')
+            });
+            if let Some((name, id)) = found {
+                out.push(MENTION);
+                who.push(*id);
+                i += 1 + name.chars().count();
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out, who)
+}
+
+/// The mention ranges for a text already stripped of its style markers: one per mention character, in order. A text
+/// whose mention characters do not match the people found (somebody typed one) gets none.
+pub fn mention_ranges(plain: &str, who: &[uuid::Uuid]) -> Vec<BodyRange> {
+    let mut at = Vec::new();
+    let mut units = 0u32;
+    for c in plain.chars() {
+        if c == MENTION {
+            at.push(units);
+        }
+        units += c.len_utf16() as u32;
+    }
+    if at.len() != who.len() {
+        return Vec::new();
+    }
+    at.into_iter()
+        .zip(who)
+        .map(|(start, id)| BodyRange { start: Some(start), length: Some(1), associated_value: Some(body_range::AssociatedValue::MentionAci(id.to_string())) })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +192,26 @@ mod tests {
         let drawn = super::super::ranges::render(&text, &ranges, |_| String::new());
         assert_eq!(drawn.body, "hi there and x");
         assert_eq!(drawn.html.as_deref(), Some("hi <b>there</b> and <code>x</code>"));
+    }
+
+    #[test]
+    fn a_member_named_after_an_at_sign_becomes_a_mention() {
+        let sam = uuid::Uuid::from_bytes([1; 16]);
+        let samantha = uuid::Uuid::from_bytes([2; 16]);
+        let people = vec![("Sam".to_string(), sam), ("Samantha Lee".to_string(), samantha)];
+        let (text, who) = mentions("@Samantha Lee and @Sam, *look* at @Samuel and me@Sam", &people);
+        assert_eq!(text, "\u{FFFC} and \u{FFFC}, *look* at @Samuel and me@Sam");
+        assert_eq!(who, vec![samantha, sam]);
+        let (plain, _) = parse(&text);
+        let ranges = mention_ranges(&plain, &who);
+        assert_eq!(ranges.iter().map(|r| r.start.unwrap()).collect::<Vec<_>>(), vec![0, 6]);
+        assert!(matches!(&ranges[1].associated_value, Some(body_range::AssociatedValue::MentionAci(id)) if *id == sam.to_string()));
+    }
+
+    #[test]
+    fn a_stray_mention_character_spoils_nothing() {
+        assert!(mention_ranges("a \u{FFFC} b", &[]).is_empty());
+        let who = vec![uuid::Uuid::from_bytes([1; 16])];
+        assert!(mention_ranges("no mention here", &who).is_empty());
     }
 }
