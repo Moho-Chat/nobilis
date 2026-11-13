@@ -188,14 +188,22 @@ pub(super) async fn rename_all(ctx: &Ctx<'_>) {
 /// Gives every open conversation the name it has now.
 async fn rename_known(ctx: &Ctx<'_>) {
     for buffer in ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id) {
-        let Some(thread) = buffer.remote_id.as_deref().and_then(ids::parse_remote_id) else { continue };
+        let Some(remote) = buffer.remote_id.clone() else { continue };
+        let Some(thread) = ids::parse_remote_id(&remote) else { continue };
         let title = match &thread {
             Thread::Contact(id) if ids::uuid_of(id) == ctx.own => continue,
             Thread::Contact(id) => people::person(ctx, &ids::uuid_of(id)).await,
             Thread::Group(key) => people::group_title(ctx, key).await,
         };
-        if title != buffer.name && !title.starts_with("Signal user") {
-            ctx.state.runtime.rename_buffer(ctx.state, ctx.account_id, &buffer.name, &title, &buffer.kind);
+        if title.starts_with("Signal user") {
+            continue;
+        }
+        // A name no other conversation has: two people of the same name were otherwise renamed into one conversation,
+        // their histories merged.
+        let taken: Vec<(String, Option<String>)> = ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id && b.id != buffer.id).map(|b| (b.name, b.remote_id)).collect();
+        let name = people::unique_name(&taken, &remote, &title);
+        if name != buffer.name {
+            ctx.state.runtime.rename_buffer(ctx.state, ctx.account_id, &buffer.name, &name, &buffer.kind);
         }
     }
 }
@@ -989,6 +997,32 @@ mod tests {
         assert_eq!((rows[0].from.as_str(), rows[0].body.as_str(), rows[0].is_own), ("Alice", "hello", false));
         assert_eq!(rows[0].id, format!("1700000000000-{ALICE}"));
         assert_eq!(rows[0].ts, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_group_that_lost_its_id_is_found_again_and_a_duplicate_folds_back_into_it() {
+        let (state, store) = world("lost-id").await;
+        let writer = store.clone();
+        let key = [7u8; 32];
+        writer
+            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None })
+            .await
+            .unwrap();
+        let ctx = ctx(&state, &store);
+        // As an older moho's rename left it: the group's conversation, with its history, but no id.
+        let unlinked = state.runtime.ensure_buffer(&state, ACCOUNT, "Climbing", "channel");
+        state.runtime.record_message_at(&state, ACCOUNT, "Climbing", "channel", "Bob", "earlier", false, "chat", None, Some("1-x".into()), false, None, Vec::new(), Vec::new(), None, Some(1), None, None);
+        // ...and the second conversation that same moho then made beside it.
+        let duplicate = state.runtime.ensure_buffer(&state, ACCOUNT, "Climbing ·0707", "channel");
+        state.runtime.set_buffer_remote_id(&state, &duplicate.id, &ids::remote_id(&Thread::Group(key)));
+        state.runtime.record_message_at(&state, ACCOUNT, "Climbing ·0707", "channel", "Bob", "later", false, "chat", None, Some("2-x".into()), false, None, Vec::new(), Vec::new(), None, Some(2), None, None);
+        rename_known(&ctx).await;
+        let buffer = only_buffer(&state);
+        assert_eq!((buffer.id.as_str(), buffer.remote_id.as_deref()), (unlinked.id.as_str(), Some(ids::remote_id(&Thread::Group(key)).as_str())));
+        assert_eq!(backlog(&state, &buffer).iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["earlier", "later"]);
+        // And the group's next message lands there.
+        data_message(&ctx, &Thread::Group(key), uuid(BOB), 1_700_000_001_000, &text("who is in", 1_700_000_001_000)).await;
+        assert_eq!(only_buffer(&state).id, unlinked.id);
     }
 
     #[tokio::test]

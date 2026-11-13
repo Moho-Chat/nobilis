@@ -107,9 +107,12 @@ pub async fn group_title(ctx: &Ctx<'_>, key: &[u8; 32]) -> String {
     }
 }
 
-/// A name for a buffer that no other conversation of the account has.
+/// A name for a buffer that no other conversation of the account has. One of the name that is no conversation's (no
+/// remote id: left so by an older moho's rename, or put back from a layout) is not another conversation's, and is taken
+/// over rather than worked around - otherwise a group renamed from moho came back after a restart as a second
+/// conversation, "Name ·abcd", beside its own history.
 pub fn unique_name(taken: &[(String, Option<String>)], remote_id: &str, title: &str) -> String {
-    let used = |name: &str| taken.iter().any(|(n, r)| n == name && r.as_deref() != Some(remote_id));
+    let used = |name: &str| taken.iter().any(|(n, r)| n == name && r.as_deref().is_some_and(|r| r != remote_id));
     if !used(title) {
         return title.to_string();
     }
@@ -174,5 +177,9 @@ mod tests {
         assert_eq!(unique_name(&taken, "p:aaaa1111", "Sam"), "Sam");
         assert_eq!(unique_name(&taken, "p:bbbb2222", "Sam"), "Sam ·2222");
         assert_eq!(unique_name(&taken, "p:bbbb2222", "Alex"), "Alex");
+        // One of the name that is no conversation's is taken over, not worked around (seen on the first real account: a
+        // renamed group came back as "Name ·abcd" beside its history).
+        let unlinked = vec![("Book club".to_string(), None)];
+        assert_eq!(unique_name(&unlinked, "g:cccc3333", "Book club"), "Book club");
     }
 }
