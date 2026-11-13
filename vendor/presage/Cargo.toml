@@ -1,0 +1,43 @@
+[package]
+# be a sign or warning of (an imminent event, typically an unwelcome one).
+name = "presage"
+version = "0.8.0-dev"
+authors = ["Gabriel Féron <g@leirbag.net>"]
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[features]
+default = []
+# brings libsignal-net and all its dependencies
+cdsi = ["libsignal-service/cdsi"]
+
+[dependencies]
+libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "7a7526741dfd9ad4c4894717f22651eb0506fb7e", default-features = false, features = [
+    "phonenumber",
+] }
+
+base64 = "0.22"
+chrono = "0.4"
+futures = "0.3"
+hex = "0.4.3"
+rand = "0.9"
+serde = "1.0"
+serde_json = "1.0"
+sha2 = "0.11.0"
+thiserror = "2.0"
+tokio = { version = "1.48", default-features = false, features = [
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+url = "2.5"
+derive_more = { version = "2.1.0", features = ["debug"] }
+bytes = { version = "1.7.2", features = ["serde"] }
+mime = "0.3.17"
+regex = "1.12.2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy", "socks"] }
+scraper = "0.25.0"
+percent-encoding = "2"
+
+# moho: the dev-dependencies (presage-store-sqlite and a test server) are dropped with the tests that used them; see PATCHED.md.

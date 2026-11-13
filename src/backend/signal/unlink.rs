@@ -10,13 +10,14 @@ use super::store::{self, OnNewIdentity, SignalStore};
 use presage::Manager;
 
 /// Ends the device at Signal and deletes the account's store. Returns at once; the work is on a thread of its own.
-pub fn start(aci: String) {
+pub fn start(aci: String, routed: bool) {
     let path = store::path_for(&aci);
     if !path.exists() {
         return;
     }
     let work = local::run("signal-unlink", move || async move {
         let ended = async {
+            super::network::prepare(routed).await?;
             let store = SignalStore::open(&path, OnNewIdentity::Trust).map_err(|e| e.to_string())?;
             let manager = Manager::load_registered(store).await.map_err(|e| e.to_string())?;
             manager.unlink_self().await.map_err(|e| e.to_string())

@@ -5,6 +5,16 @@
 
 use std::future::Future;
 
+thread_local! {
+    /// The daemon's own runtime, for work on one of these threads that has to run there instead (starting Tor).
+    static MAIN: std::cell::RefCell<Option<tokio::runtime::Handle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The daemon's runtime, from one of these threads (`None` anywhere else).
+pub fn main_runtime() -> Option<tokio::runtime::Handle> {
+    MAIN.with(|m| m.borrow().clone())
+}
+
 /// Runs the future `make` builds on a new thread, and answers with what it returns. The future itself need not be
 /// `Send`, which is the point: only `make` and the result cross threads.
 pub fn run<T, F, Fut>(name: &str, make: F) -> tokio::sync::oneshot::Receiver<T>
@@ -14,7 +24,9 @@ where
     Fut: Future<Output = T> + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let main = tokio::runtime::Handle::try_current().ok();
     let spawned = std::thread::Builder::new().name(name.to_string()).spawn(move || {
+        MAIN.with(|m| *m.borrow_mut() = main);
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => runtime,
             Err(e) => {

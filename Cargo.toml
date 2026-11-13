@@ -189,6 +189,15 @@ core-models-0-0-5 = { path = "vendor/core-models-0.0.5", package = "core-models"
 # crate here that uses dalek (Tor, Matrix) gets the fork too - same version number, checked by the build.
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
 
+# The service layer under presage, patched so an account's connections can be routed through Tor or a SOCKS5 proxy and
+# carry moho's own user agent: see vendor/libsignal-service-rs/PATCHED.md.
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "vendor/libsignal-service-rs" }
+# presage itself, patched so the link previews it fetches when sending follow the account's route and the person's
+# setting: see vendor/presage/PATCHED.md.
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
+
 [dev-dependencies]
 # libsignal's key generation takes the rand 0.9 generators; the daemon itself is on 0.8.
 rand09 = { package = "rand", version = "0.9" }

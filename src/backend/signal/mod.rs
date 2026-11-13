@@ -19,6 +19,7 @@ pub mod link;
 pub mod local;
 pub mod media;
 pub mod memory;
+pub mod network;
 pub mod people;
 pub mod profile;
 pub mod ranges;

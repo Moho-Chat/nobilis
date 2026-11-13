@@ -103,12 +103,10 @@ fn qr_path(login_id: &str) -> std::path::PathBuf {
 
 /// The whole link, on its thread. `None` when the person stopped it.
 async fn flow(state: AppState, login_id: String, mut stop: oneshot::Receiver<()>) -> Result<Option<SignalAccountConfig>> {
-    // The library makes its own connections and cannot be handed a route; going out directly when Tor was asked for
-    // would be worse than not linking.
+    // Through the route the form asked for, if any; the account made from this link keeps it.
     let route = crate::net::route::pending_key("signal");
-    if crate::net::route::router().wanted(&route) {
-        bail!("Signal cannot be linked through Tor or a proxy yet: the library moho uses makes its own connections. Turn the route off for this account to link it");
-    }
+    let routed = crate::net::route::router().routed(&route);
+    super::network::prepare(routed).await.map_err(|e| anyhow!("the route is not ready: {e}"))?;
     let path = store::path_for_link(&login_id);
     let outcome = linking(&state, &login_id, &path, &mut stop).await;
     match outcome {
@@ -119,7 +117,7 @@ async fn flow(state: AppState, login_id: String, mut stop: oneshot::Receiver<()>
                 number: linked.number,
                 device_id: linked.device_id,
                 device_name: linked.device_name,
-                use_tor: false,
+                use_tor: crate::net::route::router().wanted(&route),
                 ..Default::default()
             };
             tracing::info!("signal: linked as device {} (history offered: {})", config.device_id, linked.history_offered);
@@ -142,6 +140,9 @@ async fn linking(state: &AppState, login_id: &str, path: &std::path::Path, stop:
     let began = tokio::time::Instant::now();
     let name = device_name();
     status(state, login_id, "Asking Signal for a code to scan");
+    // Attempts in a row that failed before Signal gave a code: a dead Tor circuit or a dropped connection is worth
+    // another go, a refusal three times over is not.
+    let mut unreached = 0;
     loop {
         if began.elapsed() > PATIENCE {
             bail!("The code was not scanned in time. Start again to get a new one");
@@ -151,9 +152,11 @@ async fn linking(state: &AppState, login_id: &str, path: &std::path::Path, stop:
         store::delete_files(path);
         let store = SignalStore::open(path, OnNewIdentity::Trust).context("opening the account's store")?;
         let (url_tx, url_rx) = futures::channel::oneshot::channel();
+        let got_code = std::cell::Cell::new(false);
         let link = Manager::link_secondary_device(store.clone(), SignalServers::Production, name.clone(), url_tx);
         let show = async {
             if let Ok(url) = url_rx.await {
+                got_code.set(true);
                 let shown = qr_path(login_id);
                 match super::super::steam::login::write_qr(url.as_str(), &shown) {
                     Ok(()) => state.events.emit("signalLinkQr", json!({ "loginId": login_id, "path": shown.to_string_lossy(), "expiresInSeconds": CODE_LIFE.as_secs() })),
@@ -165,7 +168,17 @@ async fn linking(state: &AppState, login_id: &str, path: &std::path::Path, stop:
         let work = future::join(link, show);
         tokio::select! {
             (linked, ()) = work => {
-                let manager = linked.map_err(|e| anyhow!("Signal did not finish linking: {e}"))?;
+                let manager = match linked {
+                    Ok(manager) => manager,
+                    Err(e) if !got_code.get() && unreached < 2 => {
+                        unreached += 1;
+                        tracing::info!("signal: no code from Signal ({e}); trying again");
+                        status(state, login_id, "Could not reach Signal. Trying again");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow!("Signal did not finish linking: {e}")),
+                };
                 let data = manager.registration_data();
                 let found = Linked {
                     aci: data.service_ids.aci.to_string(),

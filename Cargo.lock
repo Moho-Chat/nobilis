@@ -4258,7 +4258,6 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=7a7526741dfd9ad4c4894717f22651eb0506fb7e#7a7526741dfd9ad4c4894717f22651eb0506fb7e"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -5950,7 +5949,6 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=4b81740610c301cbd54d95f4dbd4cadd692af95e#4b81740610c301cbd54d95f4dbd4cadd692af95e"
 dependencies = [
  "base64 0.22.1",
  "bytes",

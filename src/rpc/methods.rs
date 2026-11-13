@@ -862,7 +862,7 @@ pub async fn dispatch(
                         }
                         state.runtime.clear_stoat_handle(id);
                         if let Some(config) = signal_account {
-                            backend::signal::unlink::start(config.aci);
+                            backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
                         backend::xmpp::transport::forget_refused(id);
                         if let Some(config) = telegram_account {

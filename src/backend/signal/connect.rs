@@ -146,10 +146,9 @@ async fn run_with_retry(state: &AppState, account_id: &str) {
 
 /// One go at being connected.
 async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, days_away: Option<i64>) -> Ending {
-    // The library makes its own connections and cannot be handed a route. An account set to go through Tor or a proxy
-    // must not quietly go out directly instead.
-    if crate::net::route::router().wanted(account_id) || config.use_tor {
-        return Ending::Refused("Signal cannot be routed through Tor or a proxy yet, because the library moho uses makes its own connections. Set this account's route to direct to connect it".to_string());
+    // Through the account's route, if it has one; never directly instead when the route is not ready.
+    if let Err(e) = super::network::prepare(crate::net::route::router().routed(account_id) || config.use_tor).await {
+        return Ending::Closed(format!("the route for this account is not ready: {e}"));
     }
     let path = store::path_for(&config.aci);
     if !path.exists() {
@@ -176,7 +175,9 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
     let (commands, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Command>();
     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
     let memory = std::sync::Arc::new(Memory::default());
-    memory.set_synced(Synced::load(manager.store()));
+    let synced = Synced::load(manager.store());
+    memory.set_synced(synced);
+    super::network::allow_link_previews(synced.link_previews == Some(true));
     let handle = Handle { account_id: account_id.to_string(), own, store: manager.store().clone(), memory, commands };
     state.runtime.set_signal_handle(account_id, handle.clone());
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);

@@ -193,6 +193,7 @@ async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &
             // The phone's privacy settings: what decides whether receipts and typing notices are sent at all.
             let synced = handle.memory.synced().with(said);
             handle.memory.set_synced(synced);
+            super::network::allow_link_previews(synced.link_previews == Some(true));
             synced.save(&ctx.store);
             tracing::info!("signal[{}]: the phone's settings arrived", ctx.account_id);
         }
