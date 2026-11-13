@@ -18,6 +18,7 @@ What is changed, and nothing else:
   members and to anybody it took out; leaving marks the group left), `create_group`, `add_member_action` and
   `profile_key_credential` (adding somebody directly), `group_link_info` and `join_group_by_link`.
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
+- `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the
   upstream workspace that are not copied).
 
