@@ -230,7 +230,8 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
     let (target_ms, target_author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
     let emoji_owned = emoji.to_string();
     ask(&handle, |done| Command::React { thread, target_ms, target_author, emoji: emoji_owned, remove: !add, done }).await?;
-    state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
+    // Counted as Signal counts it: the account's new reaction replaces its last, and the same one twice is one.
+    super::inbox::apply_reaction(state, &handle.store, &buffer.id, msg_id, &handle.own, true, emoji, !add);
     Ok(())
 }
 

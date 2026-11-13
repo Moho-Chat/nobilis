@@ -788,28 +788,46 @@ fn reacted(ctx: &Ctx<'_>, buffer: &Buffer, by: Uuid, reaction: &presage::proto::
     let (Some(emoji), Some(ts)) = (reaction.emoji.as_deref(), reaction.target_sent_timestamp) else { return };
     let Some(target) = ids::aci_of(reaction.target_author_aci.as_deref(), reaction.target_author_aci_binary.as_deref()) else { return };
     let id = ids::message_id(ts, &target);
-    let mine = ctx.is_own(&by);
     let removing = reaction.remove.unwrap_or(false);
-    // Signal lets a person have one reaction on a message: a new one replaces theirs. Who reacted with what is kept in
-    // the account's file, so a change after a restart still takes the old one away.
+    apply_reaction(ctx.state, &ctx.store, &buffer.id, &id, &by, ctx.is_own(&by), emoji, removing);
+}
+
+/// What one person's reaction does to the counts drawn. Signal lets a person have one reaction on a message: a new one
+/// replaces theirs, and the same one again changes nothing. Who reacted with what is kept in the account's file, so a
+/// change after a restart still takes the old one away. Used for reactions heard and for the account's own sent here.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_reaction(state: &AppState, store: &SignalStore, buffer_id: &str, id: &str, by: &Uuid, mine: bool, emoji: &str, removing: bool) {
     let key = format!("reactions:{id}");
-    let mut by_person: std::collections::BTreeMap<String, String> = ctx.store.blob(&key).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let before = by_person.get(&by.to_string()).cloned();
-    if removing {
-        if before.as_deref() == Some(emoji) {
-            by_person.remove(&by.to_string());
-        }
-        ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, emoji, mine, false);
-    } else {
-        if let Some(old) = before.filter(|old| old != emoji) {
-            ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, &old, mine, false);
-        }
-        by_person.insert(by.to_string(), emoji.to_string());
-        ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, emoji, mine, true);
+    let mut by_person: std::collections::BTreeMap<String, String> = store.blob(&key).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let (counted, before) = reaction_change(&mut by_person, &by.to_string(), emoji, removing);
+    if let Some(old) = before {
+        state.runtime.update_reaction(state, buffer_id, id, &old, mine, false);
+    }
+    if let Some(add) = counted {
+        state.runtime.update_reaction(state, buffer_id, id, emoji, mine, add);
     }
     if let Ok(bytes) = serde_json::to_vec(&by_person) {
-        let _ = ctx.store.set_blob(&key, &bytes);
+        let _ = store.set_blob(&key, &bytes);
     }
+}
+
+/// The bookkeeping of [`apply_reaction`]: whether `emoji` is counted up (`Some(true)`), down (`Some(false)`) or left
+/// alone, and the person's earlier reaction that is to be taken away first.
+fn reaction_change(by_person: &mut std::collections::BTreeMap<String, String>, by: &str, emoji: &str, removing: bool) -> (Option<bool>, Option<String>) {
+    let before = by_person.get(by).cloned();
+    if removing {
+        // One not on record (made before this was kept) is still taken down; one that is not theirs now is stale.
+        if before.as_deref().is_some_and(|b| b != emoji) {
+            return (None, None);
+        }
+        by_person.remove(by);
+        return (Some(false), None);
+    }
+    if before.as_deref() == Some(emoji) {
+        return (None, None);
+    }
+    by_person.insert(by.to_string(), emoji.to_string());
+    (Some(true), before)
 }
 
 /// A message taken back by its author.
@@ -852,6 +870,19 @@ mod tests {
 
     fn uuid(text: &str) -> Uuid {
         Uuid::parse_str(text).unwrap()
+    }
+
+    #[test]
+    fn one_reaction_a_person_the_same_twice_is_once_and_a_stale_removal_is_ignored() {
+        let mut by = std::collections::BTreeMap::new();
+        assert_eq!(reaction_change(&mut by, ALICE, "👍", false), (Some(true), None));
+        assert_eq!(reaction_change(&mut by, ALICE, "👍", false), (None, None), "the same again counts once");
+        assert_eq!(reaction_change(&mut by, ALICE, "❤️", false), (Some(true), Some("👍".to_string())), "a new one replaces it");
+        assert_eq!(reaction_change(&mut by, ALICE, "👍", true), (None, None), "taking back one that is no longer theirs");
+        assert_eq!(reaction_change(&mut by, ALICE, "❤️", true), (Some(false), None));
+        assert!(by.is_empty());
+        // Made before the account kept who reacted with what: still taken down.
+        assert_eq!(reaction_change(&mut by, BOB, "👍", true), (Some(false), None));
     }
 
     /// A made-up account with a contact called Alice, and a daemon to put what it hears into.
