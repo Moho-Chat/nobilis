@@ -560,7 +560,21 @@ pub async fn set_timer(state: &AppState, buffer: &Buffer, seconds: u32) -> Resul
     if let Thread::Group(_) = thread {
         return edit_group(state, buffer, &serde_json::json!({ "action": "timer", "seconds": seconds })).await;
     }
-    ask(&handle, |done| Command::SetTimer { thread, seconds, done }).await.map(|_| ())
+    let at = ask(&handle, |done| Command::SetTimer { thread, seconds, done }).await?;
+    // Said here as on the phone: nothing comes back to say it (seen on the first real account, where the phone showed
+    // the change and moho did not).
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    super::inbox::system(&ctx, buffer, &timer_line("You", seconds), at);
+    Ok(())
+}
+
+/// How a change of timer is said in the conversation.
+pub(super) fn timer_line(who: &str, seconds: u32) -> String {
+    if seconds == 0 {
+        format!("{who} turned off disappearing messages")
+    } else {
+        format!("{who} set disappearing messages to {}", super::people::timer_words(seconds))
+    }
 }
 
 /// Blocks or unblocks a person (`p:<aci>` or their id) or a group (`g:<key>`).
@@ -791,6 +805,12 @@ pub async fn answer_request(state: &AppState, account_id: &str, id: &str, answer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_of_timer_is_said_as_signal_says_it() {
+        assert_eq!(timer_line("You", 300), "You set disappearing messages to 5 minutes");
+        assert_eq!(timer_line("Alice", 0), "Alice turned off disappearing messages");
+    }
 
     #[test]
     fn a_file_is_sent_as_what_its_name_says_it_is() {

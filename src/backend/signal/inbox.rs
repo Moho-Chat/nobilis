@@ -565,7 +565,7 @@ fn seconds(ms: u64) -> i64 {
 }
 
 /// Writes a line that is the conversation speaking, not a person.
-fn system(ctx: &Ctx<'_>, buffer: &Buffer, text: &str, at_ms: u64) {
+pub(super) fn system(ctx: &Ctx<'_>, buffer: &Buffer, text: &str, at_ms: u64) {
     ctx.state.runtime.record_message_at(
         ctx.state, ctx.account_id, &buffer.name, &buffer.kind, "Signal", text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None, Some(seconds(at_ms)), None, None,
     );
@@ -595,7 +595,7 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
     if flags & EXPIRATION_TIMER_UPDATE != 0 {
         let timer = dm.expire_timer.unwrap_or(0);
         let who = people::person(ctx, &author).await;
-        let words = if timer == 0 { format!("{who} turned off disappearing messages") } else { format!("{who} set disappearing messages to {}", people::timer_words(timer)) };
+        let words = super::send::timer_line(&who, timer);
         system(ctx, &buffer, &words, at);
         let mut store = ctx.store.clone();
         let _ = presage::store::ContentsStore::update_expire_timer(&mut store, thread, timer, dm.expire_timer_version.unwrap_or(1)).await;
