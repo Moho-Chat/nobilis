@@ -162,8 +162,14 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
             let _ = std::fs::copy(from, to);
         }
     }
+    // The link previews the library built while sending (when the phone allows them), from its saved copy: without this
+    // the phone showed the card and moho's own copy did not (seen on the first real account).
+    let embeds = match super::media::stored_content(&handle.store, &noted_thread, at).await {
+        Some(content) => super::media::data_message_of(&content).map(|dm| super::media::previews_of(&buffer.account_id, &noted_thread, &handle.own, at, dm)).unwrap_or_default(),
+        None => Vec::new(),
+    };
     state.runtime.record_message_at(
-        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), attachments, Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
+        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, embeds, attachments, Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
     );
     // The conversation has a disappearing timer, which the library put on the message: it runs from now.
     if let Some(seconds) = timer {
