@@ -607,6 +607,262 @@ impl<S: Store> Manager<S, Registered> {
         Ok(StorageService::new(self.identified_push_service(), storage_key).await?)
     }
 
+    /// moho: changes a group. `build` makes the change's actions from the group as it is now and the group's
+    /// operations (which encrypt what has to be encrypted); the revision and the group's id are filled in here. The
+    /// change goes to the group server, the group's new state is saved, and every member - and anybody the change took
+    /// out - is sent it, so their clients apply it. Answers the new state, or `None` when the change took the account
+    /// itself out (leaving): the group is then marked left.
+    pub async fn change_group(
+        &mut self,
+        master_key: [u8; 32],
+        build: impl FnOnce(
+            &libsignal_service::groups_v2::GroupOperations,
+            &crate::model::groups::Group,
+        ) -> Result<libsignal_service::proto::group_change::Actions, String>,
+        timestamp: u64,
+    ) -> Result<Option<crate::model::groups::Group>, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let before = upsert_group(&self.store, &mut groups_manager, &master_key, &0)
+            .await?
+            .ok_or(Error::UnknownGroup)?;
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
+        let mut actions = build(&operations, &before).map_err(Error::GroupChange)?;
+        actions.version = before.revision + 1;
+        actions.group_id = secret_params.get_group_identifier().to_vec();
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        let signed = self
+            .identified_push_service()
+            .patch_group(authorization, actions, None)
+            .await?;
+        self.after_group_change(&mut groups_manager, master_key, Some(&before), signed, timestamp)
+            .await
+    }
+
+    /// moho: saves a group's state after a change and tells everybody concerned.
+    async fn after_group_change(
+        &mut self,
+        groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+        master_key: [u8; 32],
+        before: Option<&crate::model::groups::Group>,
+        signed: libsignal_service::proto::GroupChange,
+        timestamp: u64,
+    ) -> Result<Option<crate::model::groups::Group>, Error<S::Error>> {
+        use libsignal_service::prelude::ProtobufMessage;
+        let own = self.state.data.service_ids.aci();
+        let message = |revision: u32| DataMessage {
+            group_v2: Some(libsignal_service::proto::GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: Some(signed.encode_to_vec()),
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        let encrypted = match groups_manager.fetch_encrypted_group(&mut rng(), &master_key).await {
+            Ok(encrypted) => encrypted,
+            // Out of the group: the server no longer shows it. Those who were in it are told one by one.
+            Err(libsignal_service::prelude::ServiceError::Unauthorized) => {
+                self.store.mark_group_left(master_key).await?;
+                if let Some(before) = before {
+                    let told = message(before.revision + 1);
+                    for member in before.members.iter().filter(|m| m.aci != own) {
+                        if let Err(error) = self.send_message(member.aci, told.clone(), timestamp).await {
+                            warn!(%error, "a member of a group left was not told");
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.store.save_group(master_key, decrypt_group(&master_key, encrypted)?).await?;
+        let after = self.store.group(master_key).await?.ok_or(Error::UnknownGroup)?;
+        let told = message(after.revision);
+        // The members as they are now, then whoever the change took out: they learn of it too.
+        self.send_message_to_group(&master_key, told.clone(), timestamp).await?;
+        if let Some(before) = before {
+            for gone in before.members.iter().filter(|m| m.aci != own && !after.is_member(&m.aci)) {
+                if let Err(error) = self.send_message(gone.aci, told.clone(), timestamp).await {
+                    warn!(%error, "a member taken out of a group was not told");
+                }
+            }
+        }
+        Ok(Some(after))
+    }
+
+    /// moho: a person's expiring profile key credential, for adding them to a group directly. `None` when their
+    /// profile key is not known (they can then only be invited).
+    pub async fn profile_key_credential(
+        &self,
+        aci: Aci,
+    ) -> Result<Option<libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential>, Error<S::Error>> {
+        let profile_key = if aci == self.state.data.service_ids.aci() {
+            Some(self.state.data.profile_key())
+        } else {
+            self.store.profile_key(&aci.into()).await?
+        };
+        let Some(profile_key) = profile_key else { return Ok(None) };
+        let params = self.state.service_configuration().zkgroup_server_public_params;
+        let mut ws = self.identified_websocket(false).await?;
+        Ok(Some(ws.retrieve_profile_key_credential(aci, profile_key, &params).await?))
+    }
+
+    /// moho: the action that adds a person to a group directly, when their credential can be had (`None`: they can
+    /// only be invited).
+    pub async fn add_member_action(
+        &self,
+        aci: Aci,
+        operations: &libsignal_service::groups_v2::GroupOperations,
+    ) -> Result<Option<libsignal_service::proto::group_change::actions::AddMemberAction>, Error<S::Error>> {
+        let Some(credential) = self.profile_key_credential(aci).await? else { return Ok(None) };
+        let params = self.state.service_configuration().zkgroup_server_public_params;
+        Ok(Some(operations.build_add_member_action_with_credential(
+            &credential,
+            libsignal_service::groups_v2::Role::Default,
+            &params,
+        )))
+    }
+
+    /// moho: makes a group with the account as its only admin and `members` in it (each added directly when their
+    /// credential can be had, invited otherwise), saves it and tells the members. Answers its master key.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        members: &[Aci],
+        timer_seconds: u32,
+        timestamp: u64,
+    ) -> Result<[u8; 32], Error<S::Error>> {
+        use libsignal_service::groups_v2::{GroupMemberCandidate, Timer};
+        let own = self.state.data.service_ids.aci();
+        let own_credential = self
+            .profile_key_credential(own)
+            .await?
+            .ok_or(Error::GroupChange("this account's own profile key is not known".into()))?;
+        let mut candidates = Vec::new();
+        for aci in members.iter().filter(|a| **a != own) {
+            let credential = match self.profile_key_credential(*aci).await {
+                Ok(found) => found,
+                Err(error) => {
+                    warn!(%error, "no credential for a new group's member; inviting instead");
+                    None
+                }
+            };
+            candidates.push(GroupMemberCandidate { service_id: (*aci).into(), credential });
+        }
+        let master_key: [u8; 32] = rand::random();
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
+        let params = self.state.service_configuration().zkgroup_server_public_params;
+        let timer = (timer_seconds > 0).then_some(Timer { duration: timer_seconds });
+        let group = operations
+            .encrypt_group_with_credentials(title, None, timer.as_ref(), None, &own_credential, &candidates, &params, String::new(), &mut rng())
+            .map_err(|e| Error::GroupChange(format!("the group could not be made: {e:?}")))?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        self.identified_push_service()
+            .create_group(authorization, group)
+            .await?;
+        let encrypted = groups_manager
+            .fetch_encrypted_group(&mut rng(), &master_key)
+            .await?;
+        let made = decrypt_group(&master_key, encrypted)?;
+        let revision = made.version;
+        self.store.save_group(master_key, made).await?;
+        let message = DataMessage {
+            group_v2: Some(libsignal_service::proto::GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: None,
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_message_to_group(&master_key, message, timestamp).await?;
+        Ok(master_key)
+    }
+
+    /// moho: what a group link shows: the group's title, how many members, whether an admin approves who joins, and
+    /// the revision. Read with the link's own key and password; joining is `join_group_by_link`.
+    pub async fn group_link_info(
+        &mut self,
+        master_key: [u8; 32],
+        password: &[u8],
+    ) -> Result<(String, u32, bool, u32), Error<S::Error>> {
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        let info = self
+            .identified_push_service()
+            .group_join_info(authorization, password)
+            .await?;
+        let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
+        let title = operations.decrypt_title(&info.title);
+        let needs_approval = info.add_from_invite_link()
+            == libsignal_service::proto::access_control::AccessRequired::Administrator;
+        Ok((title, info.member_count, needs_approval, info.version))
+    }
+
+    /// moho: joins a group through its link: straight in when anybody with the link may join, as a request for an
+    /// admin to approve otherwise. Answers whether the account is in now (false: waiting for approval).
+    pub async fn join_group_by_link(
+        &mut self,
+        master_key: [u8; 32],
+        password: &[u8],
+        timestamp: u64,
+    ) -> Result<bool, Error<S::Error>> {
+        use libsignal_service::proto::{access_control::AccessRequired, group_change::actions};
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
+        let params = self.state.service_configuration().zkgroup_server_public_params;
+        let own = self.state.data.service_ids.aci();
+        let own_credential = self
+            .profile_key_credential(own)
+            .await?
+            .ok_or(Error::GroupChange("this account's own profile key is not known".into()))?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        let info = self
+            .identified_push_service()
+            .group_join_info(authorization.clone(), password)
+            .await?;
+        let presentation = operations.create_member_presentation(&params, &own_credential);
+        let member = libsignal_service::proto::Member {
+            presentation,
+            role: libsignal_service::proto::member::Role::Default as i32,
+            ..Default::default()
+        };
+        let direct = info.add_from_invite_link() == AccessRequired::Any;
+        let mut change = libsignal_service::proto::group_change::Actions {
+            version: info.version + 1,
+            group_id: secret_params.get_group_identifier().to_vec(),
+            ..Default::default()
+        };
+        if direct {
+            change.add_members.push(actions::AddMemberAction { added: Some(member), join_from_invite_link: true });
+        } else {
+            change.add_members_pending_admin_approval.push(actions::AddMemberPendingAdminApprovalAction {
+                added: Some(libsignal_service::proto::MemberPendingAdminApproval { presentation: member.presentation, ..Default::default() }),
+            });
+        }
+        let signed = self
+            .identified_push_service()
+            .patch_group(authorization, change, Some(password))
+            .await?;
+        if direct {
+            self.after_group_change(&mut groups_manager, master_key, None, signed, timestamp).await?;
+        }
+        Ok(direct)
+    }
+
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages

@@ -5948,6 +5948,39 @@ pub async fn dispatch(
             }
         }
 
+        "signalGroup" | "signalGroupInfo" | "signalSetTimer" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let result = match method {
+                "signalGroupInfo" => backend::signal::send::group_info(state, &buffer).await,
+                "signalSetTimer" => backend::signal::send::set_timer(state, &buffer, params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(0) as u32).await.map(|()| ok_node()),
+                _ => backend::signal::send::edit_group(state, &buffer, params).await.map(|()| ok_node()),
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "signalCreateGroup" | "signalGroupLinkInfo" | "signalJoinGroupLink" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let result = match method {
+                "signalCreateGroup" => {
+                    let members: Vec<String> = params.get("userIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                    backend::signal::send::create_group(state, account_id, p_str(params, "title", ""), &members).await.map(|id| serde_json::json!({ "bufferId": id }))
+                }
+                "signalGroupLinkInfo" => backend::signal::send::link_info(state, account_id, p_str(params, "link", "")).await,
+                _ => backend::signal::send::join_link(state, account_id, p_str(params, "link", "")).await.map(|id| serde_json::json!({ "bufferId": id, "waiting": id.is_none() })),
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "signalRequests" | "signalAnswerRequest" => {
             let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
                 return (None, Some(format!("{method} requires a Signal \"accountId\"")));

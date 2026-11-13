@@ -114,6 +114,70 @@ impl SignalWebSocket<websocket::Identified> {
             .await
     }
 
+    /// moho's patch: a person's expiring profile key credential, which adding them to a group (or making a group with
+    /// them in it) presents to the group server. Needs their profile key.
+    pub async fn retrieve_profile_key_credential(
+        &mut self,
+        address: Aci,
+        profile_key: zkgroup::profiles::ProfileKey,
+        server_public_params: &zkgroup::ServerPublicParams,
+    ) -> Result<zkgroup::profiles::ExpiringProfileKeyCredential, ServiceError>
+    {
+        #[derive(Deserialize)]
+        struct WithCredential {
+            #[serde(default, with = "serde_optional_base64")]
+            credential: Option<Vec<u8>>,
+        }
+        let version =
+            bincode::serialize(&profile_key.get_profile_key_version(address))?;
+        let version = std::str::from_utf8(&version)
+            .expect("hex encoded profile key version");
+        let randomness: [u8; 32] = rand::random();
+        let context = server_public_params
+            .create_profile_key_credential_request_context(
+                randomness,
+                address,
+                profile_key,
+            );
+        let request = hex::encode(zkgroup::serialize(&context.get_request()));
+        let path = format!(
+            "/v1/profile/{}/{}/{}?credentialType=expiringProfileKey",
+            address.service_id_string(),
+            version,
+            request
+        );
+        let answer: WithCredential = self
+            .http_request(Method::GET, path)?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await?;
+        let bytes = answer.credential.ok_or(ServiceError::InvalidFrame {
+            reason: "the profile came without the credential asked for",
+        })?;
+        let response: zkgroup::profiles::ExpiringProfileKeyCredentialResponse =
+            zkgroup::deserialize(&bytes).map_err(|_| {
+                ServiceError::InvalidFrame {
+                    reason: "the profile credential could not be read",
+                }
+            })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        server_public_params
+            .receive_expiring_profile_key_credential(
+                &context,
+                &response,
+                zkgroup::Timestamp::from_epoch_seconds(now),
+            )
+            .map_err(|_| ServiceError::InvalidFrame {
+                reason: "the profile credential did not verify",
+            })
+    }
+
     /// Writes a profile and returns the avatar URL, if one was provided.
     ///
     /// The name, about and emoji fields are encrypted with an [`ProfileCipher`][struct@crate::profile_cipher::ProfileCipher].

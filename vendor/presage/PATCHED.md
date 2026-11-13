@@ -13,6 +13,11 @@ What is changed, and nothing else:
   test module is removed.
 - `src/manager/registered.rs`, `storage_service`: a public way to the account's storage service, which upstream
   reads only inside its group sync.
+- `src/manager/registered.rs`, group management, which upstream does not have: `change_group` (any change, built by the
+  caller from the group's operations, sent with the patched `PushService::patch_group`, then saved and sent to the
+  members and to anybody it took out; leaving marks the group left), `create_group`, `add_member_action` and
+  `profile_key_credential` (adding somebody directly), `group_link_info` and `join_group_by_link`.
+- `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the
   upstream workspace that are not copied).
 

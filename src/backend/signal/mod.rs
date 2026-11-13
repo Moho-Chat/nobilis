@@ -17,6 +17,7 @@ pub mod groups;
 pub mod ids;
 pub mod inbox;
 pub mod link;
+pub mod manage;
 pub mod local;
 pub mod media;
 pub mod memory;
@@ -102,6 +103,16 @@ pub enum Command {
     Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
     /// Find who has a username.
     LookUpUsername { name: String, done: tokio::sync::oneshot::Sender<Result<Option<uuid::Uuid>, String>> },
+    /// Change a group.
+    EditGroup { key: [u8; 32], edit: manage::Edit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Make a group; the answer is its master key.
+    CreateGroup { title: String, members: Vec<uuid::Uuid>, done: tokio::sync::oneshot::Sender<Result<[u8; 32], String>> },
+    /// What a group link leads to: (title, members, whether an admin approves).
+    LinkInfo { link: String, done: tokio::sync::oneshot::Sender<Result<(String, u32, bool), String>> },
+    /// Join a group through its link; the answer is whether the account is in (false: waiting for an admin).
+    JoinByLink { link: String, done: tokio::sync::oneshot::Sender<Result<([u8; 32], bool), String>> },
+    /// Set the disappearing-message timer of a conversation with one person.
+    SetTimer { thread: presage::store::Thread, seconds: u32, done: Done },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

@@ -303,6 +303,155 @@ async fn members_of(state: &AppState, buffer: &Buffer, handle: &Handle, key: &[u
     out
 }
 
+async fn wait<T>(answer: oneshot::Receiver<Result<T, String>>, patience: Duration) -> Result<T, String> {
+    match tokio::time::timeout(patience, answer).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the connection ended before Signal answered".to_string()),
+        Err(_) => Err("Signal did not answer in time".to_string()),
+    }
+}
+
+fn uuid_param(params: &serde_json::Value, name: &str) -> Result<uuid::Uuid, String> {
+    params.get(name).and_then(|v| v.as_str()).and_then(|s| uuid::Uuid::parse_str(s.trim_start_matches("p:")).ok()).ok_or_else(|| format!("that needs a Signal person's id as \"{name}\""))
+}
+
+/// The edit an RPC's `action` and parameters name.
+pub fn edit_of(params: &serde_json::Value) -> Result<super::manage::Edit, String> {
+    use super::manage::{Edit, Link, Who};
+    let text = |name: &str| params.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let flag = |name: &str| params.get(name).and_then(|v| v.as_bool()).unwrap_or(false);
+    let who = |name: &str| Who::parse(&text(name)).ok_or_else(|| format!("\"{name}\" is all or admins"));
+    Ok(match text("action").as_str() {
+        "rename" => Edit::Rename(text("name")),
+        "describe" => Edit::Describe(text("text")),
+        "timer" => Edit::Timer(params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(0) as u32),
+        "add" => {
+            let ids = params.get("userIds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let people: Vec<(uuid::Uuid, bool)> = ids.iter().filter_map(|v| v.as_str()).filter_map(|s| uuid::Uuid::parse_str(s.trim_start_matches("p:")).ok()).map(|u| (u, false)).collect();
+            if people.is_empty() {
+                return Err("nobody to add".to_string());
+            }
+            Edit::Add(people)
+        }
+        "remove" => Edit::Remove(uuid_param(params, "userId")?),
+        "admin" => Edit::Admin(uuid_param(params, "userId")?, flag("admin")),
+        "uninvite" => Edit::Uninvite(uuid_param(params, "userId")?),
+        "approve" => Edit::Approve(uuid_param(params, "userId")?, flag("accept")),
+        "leave" => Edit::Leave,
+        "link" => Edit::Link(match text("mode").as_str() {
+            "off" => Link::Off,
+            "on" => Link::On,
+            "approval" => Link::Approval,
+            _ => return Err("the link is off, on or approval".to_string()),
+        }),
+        "resetLink" => Edit::ResetLink,
+        "whoMayEdit" => Edit::DetailsRights(who("who")?),
+        "whoMayAdd" => Edit::AddRights(who("who")?),
+        "announcementsOnly" => Edit::AnnouncementsOnly(flag("on")),
+        other => return Err(format!("a Signal group has no action \"{other}\"")),
+    })
+}
+
+/// Changes a group (the buffer is the group's conversation).
+pub async fn edit_group(state: &AppState, buffer: &Buffer, params: &serde_json::Value) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let Thread::Group(key) = thread else { return Err("that is not a group".to_string()) };
+    let edit = edit_of(params)?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::EditGroup { key, edit, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(120)).await
+}
+
+/// What the group's settings page shows.
+pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json::Value, String> {
+    use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+    use presage::store::ContentsStore;
+    let (handle, thread) = target(state, buffer)?;
+    let Thread::Group(key) = thread else { return Err("that is not a group".to_string()) };
+    let group = handle.store.group(key).await.ok().flatten().ok_or("that group is not known to this account")?;
+    let own = presage::libsignal_service::protocol::Aci::from(handle.own);
+    let admin = group.members.iter().any(|m| m.aci == own && matches!(m.role, Role::Administrator));
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    let words = |a: Option<&AccessRequired>| match a {
+        Some(AccessRequired::Administrator) => "admins",
+        _ => "all",
+    };
+    let access = group.access_control.as_ref();
+    let link_mode = match access.map(|a| &a.add_from_invite_link) {
+        Some(AccessRequired::Any) => "on",
+        Some(AccessRequired::Administrator) => "approval",
+        _ => "off",
+    };
+    let mut requesting = Vec::new();
+    for r in &group.requesting_members {
+        let who = uuid::Uuid::from(r.aci);
+        requesting.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, &who).await }));
+    }
+    let mut pending = Vec::new();
+    for p in &group.pending_members {
+        pending.push(serde_json::json!({ "userId": p.uuid.to_string(), "nick": super::people::person(&ctx, &p.uuid).await, "mine": p.added_by_aci == own }));
+    }
+    Ok(serde_json::json!({
+        "title": group.title,
+        "description": group.description.clone().unwrap_or_default(),
+        "timer": group.disappearing_messages_timer.as_ref().map(|t| t.duration).unwrap_or(0),
+        "isAdmin": admin,
+        "memberCount": group.members.len(),
+        "linkMode": link_mode,
+        // Only admins are shown the link to hand out; it is a key to the group.
+        "link": if link_mode != "off" && admin && !group.invite_link_password.is_empty() { Some(super::manage::link_of(&key, &group.invite_link_password)) } else { None },
+        "whoMayEdit": words(access.map(|a| &a.attributes)),
+        "whoMayAdd": words(access.map(|a| &a.members)),
+        "requesting": requesting,
+        "pending": pending,
+    }))
+}
+
+/// Makes a group with these people in it; answers its conversation.
+pub async fn create_group(state: &AppState, account_id: &str, title: &str, members: &[String]) -> Result<String, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    if title.trim().is_empty() {
+        return Err("A group needs a name".to_string());
+    }
+    let members: Vec<uuid::Uuid> = members.iter().filter_map(|s| uuid::Uuid::parse_str(s.trim_start_matches("p:")).ok()).collect();
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::CreateGroup { title: title.to_string(), members, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let key = wait(answer, Duration::from_secs(120)).await?;
+    let remote = format!("g:{}", ids::hex(&key));
+    state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())).map(|b| b.id).ok_or_else(|| "the group was made but its conversation did not open".to_string())
+}
+
+/// What a group link leads to.
+pub async fn link_info(state: &AppState, account_id: &str, link: &str) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::LinkInfo { link: link.to_string(), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let (title, members, approval) = wait(answer, Duration::from_secs(60)).await?;
+    Ok(serde_json::json!({ "title": title, "memberCount": members, "needsApproval": approval }))
+}
+
+/// Joins a group through its link: the conversation when in, `None` when an admin has to approve first.
+pub async fn join_link(state: &AppState, account_id: &str, link: &str) -> Result<Option<String>, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::JoinByLink { link: link.to_string(), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let (key, joined) = wait(answer, Duration::from_secs(120)).await?;
+    if !joined {
+        return Ok(None);
+    }
+    let remote = format!("g:{}", ids::hex(&key));
+    Ok(state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())).map(|b| b.id))
+}
+
+/// Sets how long messages last in a conversation (0: they do not disappear). A group's is a change to the group.
+pub async fn set_timer(state: &AppState, buffer: &Buffer, seconds: u32) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    if let Thread::Group(_) = thread {
+        return edit_group(state, buffer, &serde_json::json!({ "action": "timer", "seconds": seconds })).await;
+    }
+    ask(&handle, |done| Command::SetTimer { thread, seconds, done }).await.map(|_| ())
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

@@ -233,6 +233,59 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::EditGroup { key, edit, done } => {
+                let result = edit_group(&mut manager, key, edit).await;
+                if result.is_ok() {
+                    let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
+                    super::inbox::rename_all(&ctx).await;
+                    super::groups::publish_members(&ctx, &key).await;
+                }
+                let _ = done.send(result);
+            }
+            Command::CreateGroup { title, members, done } => {
+                let acis: Vec<presage::libsignal_service::protocol::Aci> = members.into_iter().map(Into::into).collect();
+                let result = manager.create_group(title.trim(), &acis, 0, now_ms()).await.map_err(|e| explain(&e));
+                if let Ok(key) = &result {
+                    let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
+                    super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
+                    super::groups::publish_members(&ctx, key).await;
+                }
+                let _ = done.send(result);
+            }
+            Command::LinkInfo { link, done } => {
+                let result = match super::manage::parse_link(&link) {
+                    None => Err("That is not a Signal group link".to_string()),
+                    Some((key, password)) => manager.group_link_info(key, &password).await.map(|(title, count, approval, _)| (title, count, approval)).map_err(|e| link_error(&e)),
+                };
+                let _ = done.send(result);
+            }
+            Command::JoinByLink { link, done } => {
+                let result = match super::manage::parse_link(&link) {
+                    None => Err("That is not a Signal group link".to_string()),
+                    Some((key, password)) => manager.join_group_by_link(key, &password, now_ms()).await.map(|joined| (key, joined)).map_err(|e| link_error(&e)),
+                };
+                if let Ok((key, true)) = &result {
+                    let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
+                    super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
+                    super::groups::publish_members(&ctx, key).await;
+                }
+                let _ = done.send(result);
+            }
+            Command::SetTimer { thread, seconds, done } => {
+                let at = now_ms();
+                use presage::store::ContentsStore;
+                let version = manager.store().expire_timer(&thread).await.ok().flatten().map(|(_, v)| v).unwrap_or(1) + 1;
+                let dm = DataMessage { flags: Some(2), expire_timer: Some(seconds), expire_timer_version: Some(version), timestamp: Some(at), ..Default::default() };
+                let result = deliver(&mut manager, &thread, dm, at).await;
+                if result.is_ok() {
+                    let mut store = manager.store().clone();
+                    let _ = store.update_expire_timer(&thread, seconds, version).await;
+                }
+                finish(done, result, at);
+            }
             Command::LookUpUsername { name, done } => {
                 let result = match manager.lookup_username(&name).await {
                     Ok(found) => Ok(found.map(uuid::Uuid::from)),
@@ -283,6 +336,48 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
             }
         }
     });
+}
+
+/// Makes one change to a group, after checking it is one the account may make.
+async fn edit_group(manager: &mut Library, key: [u8; 32], edit: super::manage::Edit) -> Result<(), String> {
+    use presage::store::ContentsStore;
+    let own = manager.registration_data().service_ids.aci();
+    let group = manager.store().group(key).await.ok().flatten().ok_or("That group is not known to this account")?;
+    super::manage::allowed(&group, &own, &edit)?;
+    // Adding: each person straight in when their credential can be had, invited otherwise.
+    let mut edit = edit;
+    let mut added = Vec::new();
+    if let super::manage::Edit::Add(people) = &mut edit {
+        let operations = presage::libsignal_service::groups_v2::GroupOperations::new(presage::libsignal_service::zkgroup::groups::GroupSecretParams::derive_from_master_key(
+            presage::libsignal_service::zkgroup::groups::GroupMasterKey::new(key),
+        ));
+        for (who, direct) in people.iter_mut() {
+            if group.is_member(&(*who).into()) {
+                return Err("That person is already in the group".to_string());
+            }
+            match manager.add_member_action((*who).into(), &operations).await {
+                Ok(Some(action)) => {
+                    added.push(action);
+                    *direct = true;
+                }
+                Ok(None) => *direct = false,
+                Err(e) => {
+                    tracing::info!("signal: no credential for somebody being added ({e}); inviting instead");
+                    *direct = false;
+                }
+            }
+        }
+    }
+    let result = manager.change_group(key, |operations, group| super::manage::actions(operations, group, &own, &edit, added), now_ms()).await;
+    result.map(|_| ()).map_err(|e| explain(&e))
+}
+
+/// Words for a group link that did not work.
+fn link_error(error: &PresageError<super::store::SignalStoreError>) -> String {
+    match error {
+        PresageError::ServiceError(ServiceError::Unauthorized) | PresageError::ServiceError(ServiceError::NotFoundError) => "That group link does not work any more: it was reset or turned off".to_string(),
+        other => explain(other),
+    }
 }
 
 /// The identifier Signal's servers know a group by, which is not its master key: typing notices name the group this way.

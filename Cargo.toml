@@ -73,6 +73,8 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c30
 # The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
 async-trait = "0.1"
 uuid = "1"
+# The rand 0.9 generators the Signal library's group encryption takes (the daemon itself is on 0.8).
+rand09 = { package = "rand", version = "0.9" }
 # XMPP backend: the xmpp-rs stack (MPL-2.0, which GPLv3 can include). `ring`, not the default aws-lc-rs, so the one TLS
 # provider main.rs installs is the one these use and no C compiler is needed - see backend/xmpp.
 tokio-xmpp = { version = "6.0", default-features = false, features = ["ring", "starttls", "direct-tls", "rustls-native-certs"] }
@@ -199,8 +201,6 @@ libsignal-service = { path = "vendor/libsignal-service-rs" }
 presage = { path = "vendor/presage" }
 
 [dev-dependencies]
-# libsignal's key generation takes the rand 0.9 generators; the daemon itself is on 0.8.
-rand09 = { package = "rand", version = "0.9" }
 tempfile = "3"
 
 # Local debug builds keep line numbers for backtraces and not the full debug

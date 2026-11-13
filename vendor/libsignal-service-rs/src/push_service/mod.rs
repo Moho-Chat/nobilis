@@ -259,6 +259,91 @@ impl PushService {
     }
 }
 
+/// moho's patch: the requests that change a group, make one, and read a group's link, which upstream does not have yet.
+/// Each is signed in with the group's zero-knowledge authorization (`GroupsManager::get_authorization_for_today`).
+impl PushService {
+    /// Sends a change to a group (`PATCH /v2/groups/`), and answers the change as the server signed it: that is what
+    /// the members are sent. `invite_link_password` is for joining through a link.
+    pub async fn patch_group(
+        &mut self,
+        credentials: HttpAuth,
+        actions: crate::proto::group_change::Actions,
+        invite_link_password: Option<&[u8]>,
+    ) -> Result<crate::proto::GroupChange, ServiceError> {
+        use base64::Engine;
+        use protobuf::ProtobufRequestBuilderExt;
+        let path = match invite_link_password {
+            Some(password) => format!(
+                "/v2/groups/?inviteLinkPassword={}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password)
+            ),
+            None => "/v2/groups/".to_string(),
+        };
+        let response: crate::proto::GroupChangeResponse = self
+            .request(
+                Method::PATCH,
+                Endpoint::storage(path),
+                HttpAuthOverride::Identified(credentials),
+            )?
+            .protobuf(actions).map_err(|_| ServiceError::InvalidFrame { reason: "a group request could not be encoded" })?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .protobuf()
+            .await?;
+        response.group_change.ok_or(ServiceError::InvalidFrame {
+            reason: "the group server answered a change with no change",
+        })
+    }
+
+    /// Makes a group (`PUT /v2/groups/`).
+    pub async fn create_group(
+        &mut self,
+        credentials: HttpAuth,
+        group: crate::proto::Group,
+    ) -> Result<(), ServiceError> {
+        use protobuf::ProtobufRequestBuilderExt;
+        self.request(
+            Method::PUT,
+            Endpoint::storage("/v2/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .protobuf(group).map_err(|_| ServiceError::InvalidFrame { reason: "a group request could not be encoded" })?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?;
+        Ok(())
+    }
+
+    /// What a group link shows before joining (`GET /v1/groups/join/<password>`): the group's title, how many are in it,
+    /// whether an admin must approve.
+    pub async fn group_join_info(
+        &mut self,
+        credentials: HttpAuth,
+        invite_link_password: &[u8],
+    ) -> Result<crate::proto::GroupJoinInfo, ServiceError> {
+        use base64::Engine;
+        let path = format!(
+            "/v1/groups/join/{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(invite_link_password)
+        );
+        self.request(
+            Method::GET,
+            Endpoint::storage(path),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+}
+
 pub(crate) mod protobuf {
     use async_trait::async_trait;
     use prost::{EncodeError, Message};
@@ -272,7 +357,6 @@ pub(crate) mod protobuf {
     {
         /// Set the request payload encoded as protobuf.
         /// Sets the `Content-Type` header to `application/x-protobuf`
-        #[allow(dead_code)]
         fn protobuf<T: Message + Default>(
             self,
             value: T,

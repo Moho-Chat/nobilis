@@ -59,6 +59,9 @@ pub enum Error<S: std::error::Error> {
     ParseContactError(#[from] ParseContactError),
     #[error("failed to decrypt attachment: {0}")]
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
+    /// moho: a change to a group that could not be made, in words.
+    #[error("{0}")]
+    GroupChange(String),
     #[error("unknown group")]
     UnknownGroup,
     #[error("unknown recipient")]

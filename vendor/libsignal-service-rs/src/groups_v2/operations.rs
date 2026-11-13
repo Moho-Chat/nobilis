@@ -67,7 +67,7 @@ impl From<zkgroup::ZkGroupVerificationFailure> for GroupDecodingError {
 }
 
 impl GroupOperations {
-    fn encrypt_service_id(
+    pub fn encrypt_service_id(
         &self,
         service_id: ServiceId,
     ) -> Result<Vec<u8>, GroupDecodingError> {
@@ -89,7 +89,7 @@ impl GroupOperations {
         }
     }
 
-    fn encrypt_aci(&self, aci: Aci) -> Result<Vec<u8>, GroupDecodingError> {
+    pub fn encrypt_aci(&self, aci: Aci) -> Result<Vec<u8>, GroupDecodingError> {
         self.encrypt_service_id(aci.into())
     }
 
@@ -131,7 +131,7 @@ impl GroupOperations {
         }
     }
 
-    fn encrypt_profile_key(
+    pub fn encrypt_profile_key(
         &self,
         profile_key: ProfileKey,
         aci: Aci,
@@ -403,7 +403,7 @@ impl GroupOperations {
         )
     }
 
-    fn decrypt_title(&self, ciphertext: &[u8]) -> String {
+    pub fn decrypt_title(&self, ciphertext: &[u8]) -> String {
         use group_attribute_blob::Content;
         match self.decrypt_blob(ciphertext).content {
             Some(Content::Title(title)) => title,
@@ -411,7 +411,7 @@ impl GroupOperations {
         }
     }
 
-    fn decrypt_description_text(&self, ciphertext: &[u8]) -> Option<String> {
+    pub fn decrypt_description_text(&self, ciphertext: &[u8]) -> Option<String> {
         use group_attribute_blob::Content;
         match self.decrypt_blob(ciphertext).content {
             Some(Content::DescriptionText(d)) => {
@@ -421,7 +421,7 @@ impl GroupOperations {
         }
     }
 
-    fn decrypt_disappearing_messages_timer(
+    pub fn decrypt_disappearing_messages_timer(
         &self,
         ciphertext: &[u8],
     ) -> Option<Timer> {
