@@ -23,7 +23,9 @@ pub mod network;
 pub mod people;
 pub mod profile;
 pub mod ranges;
+pub mod requests;
 pub mod send;
+pub mod storage;
 pub mod store;
 pub mod unlink;
 
@@ -97,6 +99,10 @@ pub enum Command {
     AskPhone(presage::proto::sync_message::request::Type),
     /// Take one of the account's own messages back for everyone.
     Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
+    /// Read the storage service again, if it changed.
+    Storage,
+    /// Answer a message request: tell the account's other devices, and the person when it is accepted.
+    AnswerRequest { thread: presage::store::Thread, answer: requests::Answer, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Change one of the account's own messages.
     Edit { thread: presage::store::Thread, target_ms: u64, body: String, ranges: Vec<presage::proto::BodyRange>, done: Done },
 }

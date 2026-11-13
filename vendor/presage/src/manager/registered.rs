@@ -595,6 +595,18 @@ impl<S: Store> Manager<S, Registered> {
         .await
     }
 
+    /// moho: the account's storage service, signed in, for reading what the phone keeps there (contacts, groups,
+    /// the account's settings). Upstream reads it only for groups.
+    pub async fn storage_service(&self) -> Result<StorageService, Error<S::Error>> {
+        let master_key = self
+            .store
+            .fetch_master_key()
+            .await?
+            .ok_or(Error::MissingKeyError("master_key".into()))?;
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
+        Ok(StorageService::new(self.identified_push_service(), storage_key).await?)
+    }
+
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages

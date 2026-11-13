@@ -54,6 +54,7 @@ fn finish(done: super::Done, result: Result<(), String>, at: u64) {
 
 pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Command) {
     let account_id = handle.account_id.clone();
+    let handle = handle.clone();
     let state = state.clone();
     let mut manager = manager.clone();
     tokio::task::spawn_local(async move {
@@ -203,6 +204,39 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let dm = DataMessage { delete: Some(data_message::Delete { target_sent_timestamp: Some(target_ms) }), timestamp: Some(at), ..Default::default() };
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
+            }
+            Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::AnswerRequest { thread, answer, done } => {
+                let at = now_ms();
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let response = match &thread {
+                    Thread::Contact(id) => {
+                        let who = super::ids::uuid_of(id);
+                        sync_message::MessageRequestResponse {
+                            thread_aci: Some(who.to_string()),
+                            thread_aci_binary: Some(who.as_bytes().to_vec()),
+                            group_id: None,
+                            r#type: Some(answer.response_type() as i32),
+                        }
+                    }
+                    Thread::Group(key) => sync_message::MessageRequestResponse { thread_aci: None, thread_aci_binary: None, group_id: Some(group_identifier(key)), r#type: Some(answer.response_type() as i32) },
+                };
+                let sync = SyncMessage { content: Some(sync_message::Content::MessageRequestResponse(response)), ..Default::default() };
+                let mut result = manager.send_message(own, sync, at).await.map_err(|e| explain(&e));
+                // Accepting a person shares the account's profile with them, as Signal's clients do: the library puts the
+                // profile key on the message.
+                if result.is_ok() && answer == super::requests::Answer::Accept {
+                    if let Thread::Contact(id) = &thread {
+                        let dm = DataMessage { flags: Some(4), timestamp: Some(at + 1), ..Default::default() };
+                        result = manager.send_message(*id, dm, at + 1).await.map_err(|e| explain(&e));
+                    }
+                }
+                if result.is_ok() {
+                    let own_aci = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own_aci);
+                    super::requests::apply(&ctx, &thread, answer).await;
+                }
+                let _ = done.send(result);
             }
             Command::Edit { thread, target_ms, body, ranges, done } => {
                 let at = now_ms();

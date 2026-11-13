@@ -48,6 +48,10 @@ pub async fn person(ctx: &Ctx<'_>, who: &Uuid) -> String {
     if ctx.is_own(who) {
         return ctx.own_name();
     }
+    // A nickname given in Signal, or the name the phone's address book has, as the storage service says.
+    if let Some(name) = super::storage::current(ctx.account_id, &ctx.store).standing(&format!("p:{who}")).and_then(|s| s.name.clone()) {
+        return name;
+    }
     let id = ServiceId::Aci(Aci::from(*who));
     if let Ok(Some(contact)) = ctx.store.contact_by_id(&id).await {
         if !contact.name.trim().is_empty() {
@@ -76,6 +80,9 @@ pub async fn person(ctx: &Ctx<'_>, who: &Uuid) -> String {
 /// Whether the account knows what to call this person: a contact name, or a profile it has fetched.
 pub async fn has_name(ctx: &Ctx<'_>, who: &Uuid) -> bool {
     if ctx.is_own(who) {
+        return true;
+    }
+    if super::storage::current(ctx.account_id, &ctx.store).standing(&format!("p:{who}")).is_some_and(|s| s.name.is_some()) {
         return true;
     }
     let id = ServiceId::Aci(Aci::from(*who));

@@ -185,6 +185,9 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
     let _ = state.accounts.mutate_signal(account_id, |a| a.last_connected = now_seconds());
     // The account's own name, for what it says from here.
     let _ = handle.commands.send(Command::Profile { who: own });
+    // What the phone keeps for every device - names, who is accepted or blocked, mutes, settings - before the waiting
+    // messages are read, so a stranger's is held back as a request rather than shown.
+    super::storage::refresh(state, &handle, &manager).await;
     let mut caught_up = false;
     let mut last_stamp = now_seconds();
     // What fell due while the daemon was away goes first, then the clock keeps watch.

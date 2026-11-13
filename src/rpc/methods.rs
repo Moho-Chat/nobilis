@@ -5948,6 +5948,22 @@ pub async fn dispatch(
             }
         }
 
+        "signalRequests" | "signalAnswerRequest" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            if method == "signalRequests" {
+                return match backend::signal::send::requests(state, account_id).await {
+                    Ok(listing) => (Some(listing), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::signal::send::answer_request(state, account_id, p_str(params, "id", ""), p_str(params, "answer", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "cancelSignalLink" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
                 backend::signal::link::cancel(login_id);

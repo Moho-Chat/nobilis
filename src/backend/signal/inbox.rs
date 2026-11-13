@@ -8,6 +8,7 @@
 use super::ids;
 use super::people::{self, Ctx};
 use super::ranges;
+use super::requests::Gate;
 use super::store::SignalStore;
 use super::Handle;
 use crate::model::{Buffer, ReplyPreview};
@@ -117,6 +118,11 @@ pub async fn contacts_arrived(state: &AppState, handle: &Handle, manager: &Manag
     rename_known(&ctx).await;
 }
 
+/// Gives every open conversation the name it has now (after the storage service was read).
+pub(super) async fn rename_all(ctx: &Ctx<'_>) {
+    rename_known(ctx).await;
+}
+
 /// Gives every open conversation the name it has now.
 async fn rename_known(ctx: &Ctx<'_>) {
     for buffer in ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id) {
@@ -151,12 +157,29 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
     match &content.body {
         ContentBody::DataMessage(dm) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
+            match super::requests::gate(&ctx, &thread, &sender).await {
+                Gate::Drop => return,
+                Gate::Hold => {
+                    // Kept by the library already; the window hears only that somebody is asking. Delivered is said,
+                    // as Signal's own clients say it: read is not, until the request is accepted and read.
+                    if shows_something(dm) {
+                        super::requests::hold(&ctx, &thread, &sender, dm.timestamp.unwrap_or(sent_at), dm.body.as_deref().unwrap_or("")).await;
+                    }
+                    delivered(handle, &content, dm.timestamp.unwrap_or(sent_at));
+                    return;
+                }
+                Gate::Show => {}
+            }
             data_message(&ctx, &thread, sender, sent_at, dm).await;
             delivered(handle, &content, dm.timestamp.unwrap_or(sent_at));
             announce_changed_identities(&ctx, sent_at).await;
         }
         ContentBody::EditMessage(edit) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
+            if super::requests::gate(&ctx, &thread, &sender).await != Gate::Show {
+                // Held edits are played with the rest when the request is accepted.
+                return;
+            }
             edited(&ctx, &thread, sender, edit).await;
             delivered(handle, &content, edit.data_message.as_ref().and_then(|d| d.timestamp).unwrap_or(sent_at));
         }
@@ -198,7 +221,25 @@ async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &
             tracing::info!("signal[{}]: the phone's settings arrived", ctx.account_id);
         }
         Some(Sync::CallEvent(event)) => call_logged(ctx, content, event).await,
-        // Blocked lists and the rest are taken up by the library or by later rounds.
+        Some(Sync::MessageRequestResponse(answer)) => {
+            // Answered on the phone: the same here, without telling the phone again.
+            let thread = match (ids::aci_of(answer.thread_aci.as_deref(), answer.thread_aci_binary.as_deref()), &answer.group_id) {
+                (Some(who), _) => Some(Thread::Contact(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(who)))),
+                (None, Some(group_id)) => thread_of_group_id(ctx, group_id).await,
+                _ => None,
+            };
+            if let (Some(thread), Some(kind)) = (thread, answer.r#type.and_then(super::requests::Answer::from_response)) {
+                super::requests::apply(ctx, &thread, kind).await;
+            }
+        }
+        Some(Sync::Blocked(blocked)) => blocked_on_phone(ctx, blocked).await,
+        Some(Sync::FetchLatest(latest)) => {
+            use presage::proto::sync_message::fetch_latest::Type;
+            if latest.r#type == Some(Type::StorageManifest as i32) {
+                let _ = handle.commands.send(super::Command::Storage);
+            }
+        }
+        // The rest is taken up by the library or by later rounds.
         _ => {}
     }
     if !sync.read.is_empty() {
@@ -343,9 +384,38 @@ async fn read_on_phone(ctx: &Ctx<'_>, reads: &[presage::proto::sync_message::Rea
     }
 }
 
+/// The phone's list of who is blocked, which replaces what was known.
+async fn blocked_on_phone(ctx: &Ctx<'_>, blocked: &presage::proto::sync_message::Blocked) {
+    let mut listed: Vec<String> = blocked.acis.iter().filter_map(|a| Uuid::parse_str(a).ok()).map(|u| format!("p:{u}")).collect();
+    listed.extend(blocked.acis_binary.iter().filter_map(|b| Uuid::from_slice(b).ok()).map(|u| format!("p:{u}")));
+    for group_id in &blocked.group_ids {
+        if let Some(thread) = thread_of_group_id(ctx, group_id).await {
+            listed.push(ids::remote_id(&thread));
+        }
+    }
+    let mut kept = (*super::storage::current(ctx.account_id, &ctx.store)).clone();
+    for (remote, standing) in kept.conversations.iter_mut() {
+        standing.blocked = listed.contains(remote);
+    }
+    for remote in &listed {
+        kept.conversations.entry(remote.clone()).or_default().blocked = true;
+    }
+    super::storage::keep(ctx.account_id, &ctx.store, kept);
+    tracing::info!("signal[{}]: the phone's block list arrived ({} blocked)", ctx.account_id, listed.len());
+}
+
+/// Whether a message is a line in the conversation (text, a file, a sticker...) rather than housekeeping.
+fn shows_something(dm: &DataMessage) -> bool {
+    dm.body.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some() || !dm.contact.is_empty() || dm.poll_create.is_some()
+}
+
 /// What the account said on another device.
 async fn sent_from_phone(ctx: &Ctx<'_>, content: &Content, sent: &Sent) {
     let Ok(thread) = Thread::try_from(content) else { return };
+    // Writing in a conversation answers its request: the phone did, so here it is accepted without telling anybody.
+    if super::requests::is_held(&ctx.store, &ids::remote_id(&thread)) {
+        super::requests::apply(ctx, &thread, super::requests::Answer::Accept).await;
+    }
     let at = sent.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis().max(0) as u64);
     if let Some(dm) = &sent.message {
         data_message(ctx, &thread, ctx.own, at, dm).await;
@@ -366,7 +436,7 @@ fn system(ctx: &Ctx<'_>, buffer: &Buffer, text: &str, at_ms: u64) {
 }
 
 /// A message, a reaction, a delete or a change of timer, from `author`, in `thread`.
-async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm: &DataMessage) {
+pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm: &DataMessage) {
     let at = dm.timestamp.unwrap_or(at);
     let flags = dm.flags.unwrap_or(0);
     if flags & PROFILE_KEY_UPDATE != 0 || flags & END_SESSION != 0 {
@@ -564,7 +634,7 @@ async fn deleted(ctx: &Ctx<'_>, thread: &Thread, buffer: &Buffer, author: &Uuid,
 }
 
 /// A message its author changed.
-async fn edited(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, edit: &EditMessage) {
+pub(super) async fn edited(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, edit: &EditMessage) {
     let (Some(target), Some(dm)) = (edit.target_sent_timestamp, edit.data_message.as_ref()) else { return };
     let buffer = people::buffer_for(ctx, thread).await;
     let id = ids::message_id(target, &author);

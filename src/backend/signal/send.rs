@@ -284,6 +284,27 @@ pub async fn rename_device(state: &AppState, account_id: &str, name: &str) -> Re
     Ok(())
 }
 
+/// The message requests waiting on an account.
+pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    Ok(super::requests::listing_for(state, &handle).await)
+}
+
+/// Accepts, deletes or blocks a message request (`id` is the conversation, `p:<aci>` or `g:<key>`).
+pub async fn answer_request(state: &AppState, account_id: &str, id: &str, answer: &str) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let thread = super::ids::parse_remote_id(id).ok_or("that is not a Signal conversation")?;
+    let answer = super::requests::Answer::parse(answer).ok_or("the answer is accept, delete or block")?;
+    let (done, reply) = oneshot::channel();
+    handle.commands.send(Command::AnswerRequest { thread, answer, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    match tokio::time::timeout(Duration::from_secs(60), reply).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the connection ended before Signal answered".to_string()),
+        Err(_) => Err("Signal did not answer in time".to_string()),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

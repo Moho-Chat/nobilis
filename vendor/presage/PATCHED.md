@@ -11,6 +11,8 @@ What is changed, and nothing else:
   `libsignal_service::push_service::network`) says link previews are allowed.
 - `src/model/previews.rs`, `client_builder`: the preview client goes through the thread's proxy when it has one; its
   test module is removed.
+- `src/manager/registered.rs`, `storage_service`: a public way to the account's storage service, which upstream
+  reads only inside its group sync.
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the
   upstream workspace that are not copied).
 

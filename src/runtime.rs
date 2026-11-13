@@ -3786,6 +3786,16 @@ impl Runtime {
         self.show_notify_level(state, buffer_id, shown, applies);
     }
 
+    /// Lets go of a level the account's service held on a conversation (a mute set on Signal's phone that was lifted
+    /// there), so the one chosen in this daemon applies again.
+    pub fn release_notify_level(&self, state: &AppState, buffer_id: &str) {
+        if self.notify_held.lock().unwrap().remove(buffer_id).is_none() {
+            return;
+        }
+        let local = state.notify_levels.get(buffer_id);
+        self.show_notify_level(state, buffer_id, local, local);
+    }
+
     /// Sets the level of a conversation whose service has nowhere to keep one,
     /// and remembers it across restarts. Says whether anything changed.
     pub fn set_local_notify(&self, state: &AppState, buffer_id: &str, level: crate::notify::NotifyLevel) -> bool {
