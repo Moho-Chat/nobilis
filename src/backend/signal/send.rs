@@ -49,7 +49,9 @@ fn content_type_of(path: &str) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
         Some("mp3") => "audio/mpeg",
-        Some("m4a" | "aac") => "audio/aac",
+        // An .m4a is audio in an MP4 container, as Signal's own clients label it; a bare .aac is the raw stream.
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
         Some("ogg" | "oga" | "opus") => "audio/ogg",
         Some("wav") => "audio/wav",
         Some("pdf") => "application/pdf",
@@ -791,6 +793,8 @@ mod tests {
         assert_eq!(content_type_of("/tmp/Cat.JPG"), "image/jpeg");
         assert_eq!(content_type_of("a.webm"), "video/webm");
         assert_eq!(content_type_of("voice.opus"), "audio/ogg");
+        assert_eq!(content_type_of("song.M4A"), "audio/mp4");
+        assert_eq!(content_type_of("raw.aac"), "audio/aac");
         assert_eq!(content_type_of("noext"), "application/octet-stream");
         assert_eq!(content_type_of("archive.zip"), "application/octet-stream");
     }
