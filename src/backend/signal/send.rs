@@ -133,7 +133,7 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         }
         pointers
     };
-    let quote = reply_to.and_then(|id| commands::quote_of(state, &buffer.id, id));
+    let quote = reply_to.and_then(|id| commands::quote_of(state, &handle.store, &buffer.id, id));
     let reply = reply_to.zip(quote.as_ref()).map(|(id, q)| crate::model::ReplyPreview {
         id: id.to_string(),
         from: q.author_aci.as_deref().and_then(|a| uuid::Uuid::parse_str(a).ok()).map(|a| name_here(state, buffer, &a, &handle)).unwrap_or_default(),
@@ -229,7 +229,9 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
         return Ok(());
     }
     let (handle, thread) = target(state, buffer)?;
-    let (target_ms, target_author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
+    let (sent_ms, target_author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
+    // An edited message is named by its newest revision, as Signal's clients name it.
+    let target_ms = super::revisions::latest_ms(&handle.store, msg_id, sent_ms);
     let emoji_owned = emoji.to_string();
     ask(&handle, |done| Command::React { thread, target_ms, target_author, emoji: emoji_owned, remove: !add, done }).await?;
     // Counted as Signal counts it: the account's new reaction replaces its last, and the same one twice is one.
@@ -240,10 +242,11 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
 /// Takes one of the account's own messages back, for everyone.
 pub async fn delete(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<(), String> {
     let (handle, thread) = target(state, buffer)?;
-    let (target_ms, author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
+    let (sent_ms, author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
     if author != handle.own {
         return Err("Only your own messages can be taken back".to_string());
     }
+    let target_ms = super::revisions::latest_ms(&handle.store, msg_id, sent_ms);
     ask(&handle, |done| Command::Delete { thread, target_ms, done }).await?;
     state.runtime.delete_message(state, &buffer.id, msg_id);
     Ok(())
@@ -261,7 +264,8 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
         return Err("a message cannot be changed to nothing; delete it instead".to_string());
     }
     let (wire_body, wire_ranges) = (plain.clone(), styles);
-    ask(&handle, |done| Command::Edit { thread, target_ms, body: wire_body, ranges: wire_ranges, done }).await?;
+    let revision_ms = ask(&handle, |done| Command::Edit { thread, target_ms, body: wire_body, ranges: wire_ranges, done }).await?;
+    super::revisions::note(&handle.store, &handle.own, revision_ms, msg_id);
     let held = state.store.get_message(&buffer.id, msg_id).ok().flatten();
     let (embeds, attachments) = held.map(|m| (m.embeds, m.attachments)).unwrap_or_default();
     state.runtime.update_message(state, &buffer.id, msg_id, &plain, &embeds, &attachments);

@@ -510,11 +510,12 @@ pub fn recipient(thread: &Thread) -> Option<ServiceId> {
 }
 
 /// The quote a reply to message `id` carries: who said it and what, as the daemon holds it.
-pub fn quote_of(state: &AppState, buffer_id: &str, id: &str) -> Option<data_message::Quote> {
+pub fn quote_of(state: &AppState, signal: &super::store::SignalStore, buffer_id: &str, id: &str) -> Option<data_message::Quote> {
     let (ts, author) = ids::parse_message_id(id)?;
     let held = state.store.get_message(buffer_id, id).ok().flatten();
     Some(data_message::Quote {
-        id: Some(ts),
+        // An edited message is quoted by its newest revision, as Signal's clients name it.
+        id: Some(super::revisions::latest_ms(signal, id, ts)),
         author_aci: Some(author.to_string()),
         author_aci_binary: Some(author.as_bytes().to_vec()),
         text: held.map(|m| m.body),

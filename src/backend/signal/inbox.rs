@@ -790,7 +790,7 @@ async fn quoted(ctx: &Ctx<'_>, quote: &presage::proto::data_message::Quote) -> R
     };
     ReplyPreview {
         id: match (quote.id, author) {
-            (Some(ts), Some(author)) => ids::message_id(ts, &author),
+            (Some(ts), Some(author)) => super::revisions::original(&ctx.store, &ids::message_id(ts, &author)),
             _ => String::new(),
         },
         from,
@@ -806,7 +806,7 @@ async fn quoted(ctx: &Ctx<'_>, quote: &presage::proto::data_message::Quote) -> R
 fn reacted(ctx: &Ctx<'_>, buffer: &Buffer, by: Uuid, reaction: &presage::proto::data_message::Reaction) {
     let (Some(emoji), Some(ts)) = (reaction.emoji.as_deref(), reaction.target_sent_timestamp) else { return };
     let Some(target) = ids::aci_of(reaction.target_author_aci.as_deref(), reaction.target_author_aci_binary.as_deref()) else { return };
-    let id = ids::message_id(ts, &target);
+    let id = super::revisions::original(&ctx.store, &ids::message_id(ts, &target));
     let removing = reaction.remove.unwrap_or(false);
     apply_reaction(ctx.state, &ctx.store, &buffer.id, &id, &by, ctx.is_own(&by), emoji, removing);
 }
@@ -851,17 +851,22 @@ fn reaction_change(by_person: &mut std::collections::BTreeMap<String, String>, b
 
 /// A message taken back by its author.
 async fn deleted(ctx: &Ctx<'_>, thread: &Thread, buffer: &Buffer, author: &Uuid, target_ms: u64) {
-    let id = ids::message_id(target_ms, author);
+    // Named by its newest revision if it was edited; moho and the library keep it under its first send.
+    let id = super::revisions::original(&ctx.store, &ids::message_id(target_ms, author));
+    let first_ms = ids::parse_message_id(&id).map(|(ms, _)| ms).unwrap_or(target_ms);
     ctx.state.runtime.delete_message(ctx.state, &buffer.id, &id);
     let mut store = ctx.store.clone();
-    let _ = presage::store::ContentsStore::delete_message(&mut store, thread, target_ms).await;
+    let _ = presage::store::ContentsStore::delete_message(&mut store, thread, first_ms).await;
 }
 
 /// A message its author changed.
 pub(super) async fn edited(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, edit: &EditMessage) {
     let (Some(target), Some(dm)) = (edit.target_sent_timestamp, edit.data_message.as_ref()) else { return };
     let buffer = people::buffer_for(ctx, thread).await;
-    let id = ids::message_id(target, &author);
+    let id = super::revisions::original(&ctx.store, &ids::message_id(target, &author));
+    if let Some(revision_ms) = dm.timestamp {
+        super::revisions::note(&ctx.store, &author, revision_ms, &id);
+    }
     let shown = describe(ctx, dm).await;
     let held = ctx.state.store.get_message(&buffer.id, &id).ok().flatten();
     let (embeds, attachments) = held.map(|m| (m.embeds, m.attachments)).unwrap_or_default();
@@ -1079,6 +1084,39 @@ mod tests {
         let mut got: Vec<(String, i64)> = backlog(&state, &only_buffer(&state))[0].reactions.iter().map(|r| (r.emoji.clone(), r.count)).collect();
         got.sort();
         assert_eq!(got, vec![("👍".to_string(), 1), ("😂".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn after_an_edit_a_reaction_a_quote_and_a_delete_name_the_newest_revision_and_still_find_it() {
+        let (state, store) = world("edited-names").await;
+        let ctx = ctx(&state, &store);
+        let thread = person(ALICE);
+        data_message(&ctx, &thread, uuid(ALICE), 1_700_000_020_000, &text("first", 1_700_000_020_000)).await;
+        edited(&ctx, &thread, uuid(ALICE), &EditMessage { target_sent_timestamp: Some(1_700_000_020_000), data_message: Some(text("second", 1_700_000_021_000)) }).await;
+        // A second edit names the message by its first send, as edits do.
+        edited(&ctx, &thread, uuid(ALICE), &EditMessage { target_sent_timestamp: Some(1_700_000_020_000), data_message: Some(text("third", 1_700_000_022_000)) }).await;
+        let buffer = only_buffer(&state);
+        let original = format!("1700000020000-{ALICE}");
+        // As seen on the first real account: a heart on the edited message names its newest revision.
+        let heart = DataMessage {
+            reaction: Some(data_message::Reaction { emoji: Some("❤️".into()), remove: Some(false), target_author_aci: Some(ALICE.into()), target_sent_timestamp: Some(1_700_000_022_000), ..Default::default() }),
+            ..Default::default()
+        };
+        data_message(&ctx, &thread, uuid(ME), 1_700_000_023_000, &heart).await;
+        let rows = backlog(&state, &buffer);
+        assert_eq!((rows[0].id.as_str(), rows[0].body.as_str(), rows[0].reactions.len()), (original.as_str(), "third", 1));
+        // A reply quoting it by the same name points at it.
+        let mut reply = text("agreed", 1_700_000_024_000);
+        reply.quote = Some(data_message::Quote { id: Some(1_700_000_022_000), author_aci: Some(ALICE.into()), text: Some("third".into()), ..Default::default() });
+        data_message(&ctx, &thread, uuid(ME), 1_700_000_024_000, &reply).await;
+        let rows = backlog(&state, &buffer);
+        assert_eq!(rows[1].reply_to.as_ref().map(|r| r.id.as_str()), Some(original.as_str()));
+        // moho names it the same way back.
+        assert_eq!(super::super::revisions::latest_ms(&store, &original, 1_700_000_020_000), 1_700_000_022_000);
+        // And taken back by that name, it goes.
+        let take_back = DataMessage { delete: Some(data_message::Delete { target_sent_timestamp: Some(1_700_000_022_000) }), ..Default::default() };
+        data_message(&ctx, &thread, uuid(ALICE), 1_700_000_025_000, &take_back).await;
+        assert!(backlog(&state, &buffer).iter().all(|m| m.id != original));
     }
 
     #[tokio::test]

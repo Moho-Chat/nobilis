@@ -27,6 +27,7 @@ pub mod polls;
 pub mod profile;
 pub mod ranges;
 pub mod requests;
+pub mod revisions;
 pub mod send;
 pub mod storage;
 pub mod store;
