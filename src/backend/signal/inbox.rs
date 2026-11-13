@@ -486,6 +486,15 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         return;
     }
     let buffer = people::buffer_for(ctx, thread).await;
+    // A change to the group, said line by line; the library has already brought the group's state up to date.
+    if let Some(changes) = dm.group_v2.as_ref().and_then(super::groups::change_of) {
+        for line in super::groups::lines_for(ctx, &changes).await {
+            system(ctx, &buffer, &line, at);
+        }
+        if changes.changes.iter().any(|c| matches!(c, presage::libsignal_service::groups_v2::GroupChange::Title(_))) {
+            rename_known(ctx).await;
+        }
+    }
     if flags & EXPIRATION_TIMER_UPDATE != 0 {
         let timer = dm.expire_timer.unwrap_or(0);
         let who = people::person(ctx, &author).await;
@@ -664,7 +673,28 @@ fn reacted(ctx: &Ctx<'_>, buffer: &Buffer, by: Uuid, reaction: &presage::proto::
     let (Some(emoji), Some(ts)) = (reaction.emoji.as_deref(), reaction.target_sent_timestamp) else { return };
     let Some(target) = ids::aci_of(reaction.target_author_aci.as_deref(), reaction.target_author_aci_binary.as_deref()) else { return };
     let id = ids::message_id(ts, &target);
-    ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, emoji, ctx.is_own(&by), !reaction.remove.unwrap_or(false));
+    let mine = ctx.is_own(&by);
+    let removing = reaction.remove.unwrap_or(false);
+    // Signal lets a person have one reaction on a message: a new one replaces theirs. Who reacted with what is kept in
+    // the account's file, so a change after a restart still takes the old one away.
+    let key = format!("reactions:{id}");
+    let mut by_person: std::collections::BTreeMap<String, String> = ctx.store.blob(&key).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let before = by_person.get(&by.to_string()).cloned();
+    if removing {
+        if before.as_deref() == Some(emoji) {
+            by_person.remove(&by.to_string());
+        }
+        ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, emoji, mine, false);
+    } else {
+        if let Some(old) = before.filter(|old| old != emoji) {
+            ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, &old, mine, false);
+        }
+        by_person.insert(by.to_string(), emoji.to_string());
+        ctx.state.runtime.update_reaction(ctx.state, &buffer.id, &id, emoji, mine, true);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&by_person) {
+        let _ = ctx.store.set_blob(&key, &bytes);
+    }
 }
 
 /// A message taken back by its author.
@@ -842,6 +872,24 @@ mod tests {
         assert_eq!((reactions.len(), reactions[0].emoji.as_str(), reactions[0].count, reactions[0].me), (1, "👍", 1, true));
         data_message(&ctx, &person(ALICE), uuid(ME), 1_700_000_008_000, &react(true)).await;
         assert!(backlog(&state, &buffer)[0].reactions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_reaction_from_the_same_person_replaces_theirs() {
+        let (state, store) = world("react-again").await;
+        let ctx = ctx(&state, &store);
+        data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_017_000, &text("news", 1_700_000_017_000)).await;
+        let react = |emoji: &str| DataMessage {
+            reaction: Some(data_message::Reaction { emoji: Some(emoji.into()), remove: Some(false), target_author_aci: Some(ALICE.into()), target_sent_timestamp: Some(1_700_000_017_000), ..Default::default() }),
+            ..Default::default()
+        };
+        data_message(&ctx, &person(ALICE), uuid(BOB), 1_700_000_017_100, &react("😂")).await;
+        data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_017_200, &react("😂")).await;
+        // Bob changes his mind: his laugh goes, Alice's stays.
+        data_message(&ctx, &person(ALICE), uuid(BOB), 1_700_000_017_300, &react("👍")).await;
+        let mut got: Vec<(String, i64)> = backlog(&state, &only_buffer(&state))[0].reactions.iter().map(|r| (r.emoji.clone(), r.count)).collect();
+        got.sort();
+        assert_eq!(got, vec![("👍".to_string(), 1), ("😂".to_string(), 1)]);
     }
 
     #[tokio::test]

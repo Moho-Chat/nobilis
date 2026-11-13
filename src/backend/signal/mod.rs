@@ -13,6 +13,7 @@ pub mod commands;
 pub mod compose;
 pub mod connect;
 pub mod expiry;
+pub mod groups;
 pub mod ids;
 pub mod inbox;
 pub mod link;
