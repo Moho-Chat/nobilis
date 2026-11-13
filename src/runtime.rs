@@ -592,6 +592,8 @@ pub struct Runtime {
     stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
     /// A connected Signal account's way to its thread, by account id (see backend/signal).
     signal_handles: Mutex<HashMap<String, crate::backend::signal::Handle>>,
+    /// A connected XMPP account's stream, by account id (see backend/xmpp).
+    xmpp_handles: Mutex<HashMap<String, crate::backend::xmpp::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -1175,6 +1177,7 @@ impl Runtime {
             telegram_handles: Mutex::new(HashMap::new()),
             stoat_handles: Mutex::new(HashMap::new()),
             signal_handles: Mutex::new(HashMap::new()),
+            xmpp_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -1339,6 +1342,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::signal_account_to_json(cfg, conn)
+        }));
+        out.extend(state.accounts.all_xmpp().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::xmpp_account_to_json(cfg, conn)
         }));
         out
     }
@@ -2874,6 +2882,24 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.encrypted != Some(confirmed) => {
                     b.encrypted = Some(confirmed);
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Says whether a conversation is encrypted, for the services where that is something a person turns on (XMPP's OMEMO), as
+    /// the lock beside the message box.
+    pub fn set_buffer_encrypted(&self, state: &AppState, buffer_id: &str, on: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.encrypted != Some(on) => {
+                    b.encrypted = Some(on);
                     Some(b.clone())
                 }
                 _ => None,
@@ -4532,6 +4558,27 @@ impl Runtime {
         self.stoat_handles.lock().unwrap().insert(account_id.to_string(), handle);
     }
 
+    pub fn set_xmpp_handle(&self, account_id: &str, handle: crate::backend::xmpp::Handle) {
+        self.xmpp_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    /// Forgets the handle only if it is still the one of the connection that owns `session`: a connection being torn down
+    /// must not take its successor's handle with it.
+    pub fn clear_xmpp_handle_of(&self, account_id: &str, session: &std::sync::Arc<std::sync::Mutex<crate::backend::xmpp::session::Session>>) {
+        let mut handles = self.xmpp_handles.lock().unwrap();
+        if handles.get(account_id).is_some_and(|h| h.is_of(session)) {
+            handles.remove(account_id);
+        }
+    }
+
+    pub fn clear_xmpp_handle(&self, account_id: &str) {
+        self.xmpp_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn xmpp_handle(&self, account_id: &str) -> Option<crate::backend::xmpp::Handle> {
+        self.xmpp_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn clear_stoat_handle(&self, account_id: &str) {
         self.stoat_handles.lock().unwrap().remove(account_id);
     }
@@ -4721,7 +4768,6 @@ impl Runtime {
     /// rather than duplicating highlight/store/emit logic (see project
     /// plan's "Architecture" section on why this lives in the daemon core,
     /// not per-backend).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_message(
         &self,
@@ -5845,7 +5891,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, signal_handles, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

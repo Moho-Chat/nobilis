@@ -777,6 +777,13 @@ impl Store {
         Ok(id)
     }
 
+    /// When the oldest message this buffer holds was sent (unix seconds): where an archive that pages by time goes back from.
+    pub fn oldest_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let ts = conn.query_row("SELECT ts FROM messages WHERE buffer_id = ?1 ORDER BY ts ASC LIMIT 1", params![buffer_id], |row| row.get(0)).optional()?;
+        Ok(ts)
+    }
+
     /// The most recent message this buffer holds, and whether it is the account's own.
     pub fn newest_msg(&self, buffer_id: &str) -> Result<Option<(String, bool)>> {
         let conn = self.conn.lock().unwrap();

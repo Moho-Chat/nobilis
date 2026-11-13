@@ -53,6 +53,16 @@ pub fn handle(
     // "somebody else took it" from its own echo.
     let device = content["party_id"].as_str().or_else(|| content["device_id"].as_str());
 
+    // An account routed through Tor takes no calls (their media would go around Tor): nothing rings, and the conversation says
+    // why. The caller's ringing simply runs out.
+    if !mine && event_type == "m.call.invite" && crate::net::route::router().call_refusal(account_id).is_some() {
+        if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+            let words = format!("{sender} called, and the call was not taken. {}", crate::net::route::CALLS_REFUSED);
+            state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, "*", &words, false, "system", None, None, false, None, Vec::new(), Vec::new(), None, None, None, None);
+        }
+        return;
+    }
+
     state.events.emit(
         "matrixCall",
         json!({

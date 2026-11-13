@@ -1,0 +1,642 @@
+//! How an XMPP account reaches its server: where the connection goes, how the server is trusted, and the TLS around it.
+//!
+//! The library's own connectors are not used, for three reasons that all come from this being a client people point at
+//! servers of their own: they trust the system's roots and nothing else (a server with its own CA, or a self-signed
+//! certificate, could never be used), they resolve names themselves (so an account on Tor would leak its lookups, and
+//! could not reach an onion server at all), and they say nothing about why a certificate was refused.
+//!
+//! What is here instead is [`Connector`], which the library takes as its `ServerConnector`:
+//!
+//! - the TCP connection comes from `net::route`, so an account routed over Tor or SOCKS5 is, and its lookups are the
+//!   proxy's;
+//! - DNS SRV is asked (`_xmpp-client._tcp`, or `_xmpps-client._tcp` for direct TLS) only when the connection is direct
+//!   and the account has not named a host;
+//! - the certificate is checked against the system's roots, plus the CAs the account lists, or is accepted when it is
+//!   exactly the one the person pinned - and what the server showed, if it was refused, is kept so the window can offer
+//!   it to be pinned (see [`Seen`]);
+//! - STARTTLS (RFC 6120) or direct TLS (XEP-0368, ALPN `xmpp-client`), TLS 1.2 or later, and nothing else: there is no
+//!   plaintext mode and no switch that accepts any certificate.
+
+use anyhow::{anyhow, Context, Result};
+use futures::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::io;
+use std::sync::{Arc, Mutex};
+use tokio::io::BufStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+use tokio_xmpp::connect::ServerConnector;
+use tokio_xmpp::jid::Jid;
+use tokio_xmpp::parsers::starttls::{self, Request};
+use tokio_xmpp::xmlstream::{initiate_stream, PendingFeaturesRecv, ReadError, StreamHeader, Timeouts, XmppStream, XmppStreamElement};
+use tokio_xmpp::Error;
+
+/// The ports a connection uses when neither DNS nor the account says.
+pub const PORT_STARTTLS: u16 = 5222;
+pub const PORT_DIRECT: u16 = 5223;
+
+/// What the server showed for its certificate on the last attempt, kept whether it was accepted or not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Seen {
+    /// SHA-256 of the certificate (DER), as lower-case hex: what a pin is.
+    pub sha256: String,
+    /// Why it was refused, in the TLS library's words; empty when it was accepted.
+    pub refused: String,
+    /// The certificate itself (DER), for showing its details.
+    pub der: Vec<u8>,
+}
+
+/// Where the last certificate seen is kept, shared between a connector and whoever reports on it.
+pub type SeenSlot = Arc<Mutex<Option<Seen>>>;
+
+/// The certificate each stopped account was refused by, so that the window can show it and the person can pin it. Only
+/// what the server showed is ever pinned from here: a fingerprint the window sends is compared with this one.
+fn refused() -> &'static Mutex<std::collections::HashMap<String, Seen>> {
+    static REFUSED: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Seen>>> = std::sync::OnceLock::new();
+    REFUSED.get_or_init(Default::default)
+}
+
+pub fn remember_refused(account_id: &str, seen: Seen) {
+    refused().lock().unwrap().insert(account_id.to_string(), seen);
+}
+
+pub fn forget_refused(account_id: &str) {
+    refused().lock().unwrap().remove(account_id);
+}
+
+pub fn refused_by(account_id: &str) -> Option<Seen> {
+    refused().lock().unwrap().get(account_id).cloned()
+}
+
+/// The transport settings of one account.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// The key `net::route` knows the account by.
+    pub account_id: String,
+    /// A host to connect to instead of asking DNS; empty to ask.
+    pub host: String,
+    /// A port to use instead of the default; 0 for the default.
+    pub port: u16,
+    /// TLS from the first byte (XEP-0368) rather than STARTTLS.
+    pub direct: bool,
+    /// XMPP over a WebSocket (RFC 7395): `host`, if it is a `wss://` address, is where; else the server's own host-meta says.
+    pub websocket: bool,
+    /// Extra trusted certificates, PEM.
+    pub ca_pem: String,
+    /// One certificate trusted whatever signed it (SHA-256, hex); empty for none.
+    pub pin_sha256: String,
+    /// A client certificate and its key (PEM) to present, for SASL EXTERNAL; empty for none.
+    pub client_cert_pem: String,
+}
+
+/// What a certificate says about itself, for the person deciding whether to trust it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CertDetails {
+    pub subject: String,
+    pub issuer: String,
+    /// RFC 3339.
+    #[serde(rename = "notBefore")]
+    pub not_before: String,
+    #[serde(rename = "notAfter")]
+    pub not_after: String,
+    /// The names it is for (subject alternative names: DNS names and addresses).
+    pub names: Vec<String>,
+    #[serde(rename = "selfSigned")]
+    pub self_signed: bool,
+}
+
+/// Reads a certificate (DER). `None` when it cannot be read.
+pub fn cert_details(der: &[u8]) -> Option<CertDetails> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    let time = |t: x509_parser::time::ASN1Time| chrono::DateTime::from_timestamp(t.timestamp(), 0).map(|d| d.to_rfc3339()).unwrap_or_default();
+    let mut names = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for n in &san.value.general_names {
+            match n {
+                GeneralName::DNSName(d) => names.push(d.to_string()),
+                GeneralName::IPAddress(ip) => names.push(match ip.len() {
+                    4 => std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
+                    16 => <[u8; 16]>::try_from(*ip).map(|b| std::net::Ipv6Addr::from(b).to_string()).unwrap_or_default(),
+                    _ => String::new(),
+                }),
+                GeneralName::OtherName(oid, _) if oid.to_id_string() == "1.3.6.1.5.5.7.8.5" => names.push("(an XMPP address)".to_string()),
+                _ => {}
+            }
+        }
+    }
+    Some(CertDetails {
+        subject: cert.subject().to_string(),
+        issuer: cert.issuer().to_string(),
+        not_before: time(cert.validity().not_before),
+        not_after: time(cert.validity().not_after),
+        names,
+        self_signed: cert.subject() == cert.issuer(),
+    })
+}
+
+/// What changed between the certificate that was pinned and the one shown now, in words; empty when nothing that is shown did.
+pub fn what_changed(before: &CertDetails, now: &CertDetails) -> Vec<String> {
+    let mut out = Vec::new();
+    if before.issuer != now.issuer {
+        out.push(format!("signed by {} (was {})", now.issuer, before.issuer));
+    }
+    if before.subject != now.subject {
+        out.push(format!("issued to {} (was {})", now.subject, before.subject));
+    }
+    if before.names != now.names {
+        out.push(format!("for {} (was {})", now.names.join(", "), before.names.join(", ")));
+    }
+    if before.not_after != now.not_after {
+        out.push(format!("valid until {} (was {})", now.not_after, before.not_after));
+    }
+    out
+}
+
+pub fn sha256_hex(der: &[u8]) -> String {
+    Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A pin as typed or pasted: hex, with or without colons or spaces, any case. `None` when it is not 32 bytes of hex.
+pub fn normalise_pin(pin: &str) -> Option<String> {
+    let hex: String = pin.chars().filter(|c| !c.is_whitespace() && *c != ':').collect::<String>().to_ascii_lowercase();
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// The system's roots, or the bundled ones when the system has none (a container, a minimal install).
+fn base_roots() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    roots.add_parsable_certificates(native.certs);
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    roots
+}
+
+/// Checks a certificate as the account asks: the pin if it matches, otherwise the chain against the roots. What was
+/// shown is written down either way.
+#[derive(Debug)]
+struct Trust {
+    chain: Arc<WebPkiServerVerifier>,
+    pin: Option<String>,
+    seen: SeenSlot,
+}
+
+impl ServerCertVerifier for Trust {
+    fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server_name: &ServerName<'_>, ocsp: &[u8], now: UnixTime) -> Result<ServerCertVerified, TlsError> {
+        let sha256 = sha256_hex(end_entity);
+        let pinned = self.pin.as_deref() == Some(sha256.as_str());
+        let verdict = if pinned { Ok(ServerCertVerified::assertion()) } else { self.chain.verify_server_cert(end_entity, intermediates, server_name, ocsp, now) };
+        let refused = verdict.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        *self.seen.lock().unwrap() = Some(Seen { sha256, refused, der: end_entity.as_ref().to_vec() });
+        verdict
+    }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+        self.chain.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+        self.chain.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.chain.supported_verify_schemes()
+    }
+}
+
+/// The TLS configuration for an account.
+pub fn tls_config(settings: &Settings, seen: &SeenSlot) -> Result<Arc<ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = base_roots();
+    if !settings.ca_pem.trim().is_empty() {
+        let mut added = 0;
+        for cert in CertificateDer::pem_slice_iter(settings.ca_pem.as_bytes()) {
+            let cert = cert.map_err(|e| anyhow!("the certificate authority file for this account is not PEM: {e}"))?;
+            roots.add(cert).map_err(|e| anyhow!("a certificate authority listed for this account is not usable: {e}"))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(anyhow!("the certificate authority text for this account holds no certificate"));
+        }
+    }
+    let chain = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build().context("building the certificate checker")?;
+    let pin = match settings.pin_sha256.trim() {
+        "" => None,
+        pin => Some(normalise_pin(pin).ok_or_else(|| anyhow!("the pinned certificate is not a SHA-256 fingerprint"))?),
+    };
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("TLS versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Trust { chain, pin, seen: seen.clone() }));
+    let mut config = if settings.client_cert_pem.trim().is_empty() {
+        config.with_no_client_auth()
+    } else {
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(settings.client_cert_pem.as_bytes()).collect::<Result<_, _>>().map_err(|e| anyhow!("the client certificate is not PEM: {e}"))?;
+        if certs.is_empty() {
+            return Err(anyhow!("the client certificate text holds no certificate"));
+        }
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(settings.client_cert_pem.as_bytes()).map_err(|_| anyhow!("the client certificate text holds no private key (paste the certificate and its key together)"))?;
+        config.with_client_auth_cert(certs, key).map_err(|e| anyhow!("the client certificate and key do not go together: {e}"))?
+    };
+    if settings.direct {
+        // XEP-0368: how a server that shares its port with something else knows this is XMPP.
+        config.alpn_protocols = vec![b"xmpp-client".to_vec()];
+    }
+    Ok(Arc::new(config))
+}
+
+/// The connector the library takes: made again for each connection, from the account as it is.
+#[derive(Clone)]
+pub struct Connector {
+    pub settings: Settings,
+    /// With ALPN `xmpp-client` (direct TLS, XEP-0368) and without (after STARTTLS).
+    tls_direct: Arc<ClientConfig>,
+    tls_starttls: Arc<ClientConfig>,
+    /// Where stream-level elements are queued to be written (client state indication).
+    pub tap: Arc<super::tap::Tap>,
+}
+
+impl std::fmt::Debug for Connector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connector").field("settings", &self.settings).finish()
+    }
+}
+
+impl Connector {
+    pub fn new(settings: Settings, seen: &SeenSlot) -> Result<Self> {
+        let tls_direct = tls_config(&Settings { direct: true, ..settings.clone() }, seen)?;
+        let tls_starttls = tls_config(&Settings { direct: false, ..settings.clone() }, seen)?;
+        Ok(Self { settings, tls_direct, tls_starttls, tap: Arc::new(super::tap::Tap::default()) })
+    }
+
+    /// Where to try, in order. A named host (or a routed account, whose lookups are the proxy's) is the one place; otherwise
+    /// DNS SRV for both direct TLS and STARTTLS (XEP-0368), and the domain itself when it publishes neither.
+    async fn targets(&self, domain: &str) -> Vec<Target> {
+        let s = &self.settings;
+        let router = crate::net::route::router();
+        let default_port = |direct| if direct { PORT_DIRECT } else { PORT_STARTTLS };
+        if !s.host.is_empty() || s.port != 0 || router.routed(&s.account_id) {
+            // Named, or routed: the proxy resolves the name (an onion address cannot be resolved at all), and SRV is not
+            // asked, since asking would be a lookup that does not go through the proxy.
+            let host = if s.host.is_empty() { domain.to_string() } else { s.host.clone() };
+            let port = if s.port != 0 { s.port } else { default_port(s.direct) };
+            return vec![Target { host, port, direct: s.direct }];
+        }
+        if domain.parse::<std::net::IpAddr>().is_ok() {
+            return vec![Target { host: domain.to_string(), port: default_port(s.direct), direct: s.direct }];
+        }
+        let srv = lookup_srv(domain).await;
+        if !srv.is_empty() {
+            tracing::info!("xmpp[{}]: DNS says {}", s.account_id, srv.iter().map(|t| format!("{}:{}{}", t.host, t.port, if t.direct { " (TLS)" } else { "" })).collect::<Vec<_>>().join(", "));
+            return srv;
+        }
+        // No SRV: the domain itself, the mode the account prefers first.
+        let mut out = vec![Target { host: domain.to_string(), port: default_port(s.direct), direct: s.direct }];
+        if s.direct {
+            out.push(Target { host: domain.to_string(), port: PORT_STARTTLS, direct: false });
+        }
+        out
+    }
+}
+
+/// One place to try connecting: a host, a port, and whether TLS starts at once there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub host: String,
+    pub port: u16,
+    pub direct: bool,
+}
+
+/// A record as SRV gives it, for ordering.
+#[derive(Clone, Debug)]
+pub struct SrvRecord {
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub target: String,
+    pub direct: bool,
+}
+
+/// RFC 2782's order: lowest priority first; within a priority, a weighted random draw (a weight of 0 still gets drawn,
+/// last). XEP-0368: direct TLS (`_xmpps-client`) and STARTTLS (`_xmpp-client`) records go in one list, and of the same
+/// priority, direct TLS comes first. A service whose only record has the target "." is not offered at all.
+pub fn order_srv(mut records: Vec<SrvRecord>, mut random: impl FnMut(u32) -> u32) -> Vec<Target> {
+    for direct in [true, false] {
+        let of_kind: Vec<&SrvRecord> = records.iter().filter(|r| r.direct == direct).collect();
+        if of_kind.len() == 1 && (of_kind[0].target == "." || of_kind[0].target.is_empty()) {
+            records.retain(|r| r.direct != direct);
+        }
+    }
+    records.retain(|r| r.target != "." && !r.target.is_empty());
+    records.sort_by_key(|r| (r.priority, !r.direct));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < records.len() {
+        let key = (records[i].priority, records[i].direct);
+        let mut group: Vec<SrvRecord> = records[i..].iter().take_while(|r| (r.priority, r.direct) == key).cloned().collect();
+        i += group.len();
+        while !group.is_empty() {
+            let total: u32 = group.iter().map(|r| r.weight as u32 + 1).sum();
+            let mut pick = random(total);
+            let mut at = 0;
+            for (k, r) in group.iter().enumerate() {
+                let w = r.weight as u32 + 1;
+                if pick < w {
+                    at = k;
+                    break;
+                }
+                pick -= w;
+            }
+            let r = group.remove(at);
+            out.push(Target { host: r.target.trim_end_matches('.').to_string(), port: r.port, direct: r.direct });
+        }
+    }
+    out
+}
+
+/// The SRV records of both XMPP client services for a domain, ordered (see [`order_srv`]). Empty when DNS has none.
+async fn lookup_srv(domain: &str) -> Vec<Target> {
+    use hickory_resolver::proto::rr::RData;
+    let Ok(ascii) = ascii_domain(domain) else { return Vec::new() };
+    let Ok(builder) = hickory_resolver::TokioResolver::builder_tokio() else { return Vec::new() };
+    let Ok(resolver) = builder.build() else { return Vec::new() };
+    let mut records = Vec::new();
+    for (service, direct) in [("_xmpps-client._tcp", true), ("_xmpp-client._tcp", false)] {
+        let Ok(found) = resolver.srv_lookup(format!("{service}.{ascii}.")).await else { continue };
+        for record in found.answers() {
+            if let RData::SRV(srv) = &record.data {
+                records.push(SrvRecord { priority: srv.priority, weight: srv.weight, port: srv.port, target: srv.target.to_ascii(), direct });
+            }
+        }
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    order_srv(records, |n| rng.gen_range(0..n.max(1)))
+}
+
+/// A domain as DNS and TLS name it: IDNA (UTS 46) to its ASCII form, so `bücher.example` is `xn--bcher-kva.example`.
+pub fn ascii_domain(domain: &str) -> Result<String, Error> {
+    idna::domain_to_ascii(domain.trim_end_matches('.')).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("{domain:?} is not a domain name: {e}"))))
+}
+
+impl Connector {
+
+    /// TLS over `stream`, the certificate checked against `domain` (the account's own domain, whichever host was reached:
+    /// RFC 6125 - a host named by DNS without DNSSEC is not a name to trust).
+    async fn tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, stream: S, domain: &str, direct: bool) -> Result<(TlsStream<S>, super::sasl::Bindings), Error> {
+        let name = ServerName::try_from(ascii_domain(domain)?).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+        let config = if direct { self.tls_direct.clone() } else { self.tls_starttls.clone() };
+        let tls = TlsConnector::from(config).connect(name, stream).await.map_err(Error::Io)?;
+        Ok(bindings_of(tls))
+    }
+}
+
+/// The channel bindings a TLS connection offers SCRAM-*-PLUS and FAST: `tls-exporter` (RFC 9266) on TLS 1.3, and
+/// `tls-server-end-point` (RFC 5929) from the server's certificate. TLS 1.2's `tls-unique` is not offered (rustls has no
+/// such value, and RFC 9266 retired it).
+fn bindings_of<S>(tls: TlsStream<S>) -> (TlsStream<S>, super::sasl::Bindings) {
+    let conn = tls.get_ref().1;
+    let exporter = match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => conn.export_keying_material(vec![0u8; 32], b"EXPORTER-Channel-Binding", None).ok(),
+        _ => None,
+    };
+    let endpoint = conn.peer_certificates().and_then(|c| c.first()).and_then(|c| super::sasl::endpoint_binding(c.as_ref()));
+    (tls, super::sasl::Bindings { exporter, endpoint })
+}
+
+/// A connection with TLS up and nothing said on it yet (or, for STARTTLS, nothing since TLS came up).
+pub trait Raw: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Raw for T {}
+
+impl Connector {
+    /// Reaches the server and brings TLS up: the route, DNS, STARTTLS or direct TLS, or a WebSocket. Signing in is the caller's.
+    pub async fn open(&self, jid: &Jid) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
+        let domain = jid.domain().as_str();
+        if self.settings.websocket {
+            return self.websocket_raw(jid).await;
+        }
+        let mut last = Error::Disconnected;
+        for target in self.targets(domain).await {
+            match self.open_at(domain, &target).await {
+                Ok(opened) => {
+                    tracing::info!("xmpp[{}]: reached {}:{} ({})", self.settings.account_id, target.host, target.port, if target.direct { "direct TLS" } else { "STARTTLS" });
+                    return Ok(opened);
+                }
+                Err(e) => {
+                    tracing::info!("xmpp[{}]: {}:{} did not work: {e}", self.settings.account_id, target.host, target.port);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn open_at(&self, domain: &str, target: &Target) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
+        let host = ascii_domain(&target.host).unwrap_or_else(|_| target.host.clone());
+        let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, target.port).await.map_err(|e| Error::Io(io::Error::other(format!("{e:#}"))))?;
+        if target.direct {
+            let (tls, bindings) = self.tls(tcp, domain, true).await?;
+            return Ok((Box::new(BufStream::new(tls)), bindings));
+        }
+        // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
+        // listener could use (no address, no credentials, until TLS is up), and a server that does not offer it is refused.
+        let plain = initiate_stream(BufStream::new(tcp), tokio_xmpp::parsers::ns::JABBER_CLIENT, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, Timeouts::default()).await?;
+        let (features, mut plain): (_, XmppStream<_>) = plain.recv_features().await?;
+        if !features.can_starttls() {
+            return Err(Error::Io(io::Error::other("the server does not offer STARTTLS, and moho does not connect without encryption")));
+        }
+        plain.send(&XmppStreamElement::Starttls(starttls::Nonza::Request(Request))).await?;
+        loop {
+            match plain.next().await.map(|v| v.and_then(|v| v.into_read_error())) {
+                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Proceed(_)))) => break,
+                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Failure(_)))) => return Err(Error::Io(io::Error::other("the server refused STARTTLS"))),
+                Some(Ok(_)) | Some(Err(ReadError::SoftTimeout)) => {}
+                Some(Err(ReadError::HardError(e))) => return Err(e.into()),
+                Some(Err(ReadError::ParseError(e))) => return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidData, e))),
+                None | Some(Err(ReadError::StreamFooterReceived)) => return Err(Error::Disconnected),
+            }
+        }
+        let raw = plain.into_inner().into_inner();
+        let (tls, bindings) = self.tls(raw, domain, false).await?;
+        Ok((Box::new(BufStream::new(tls)), bindings))
+    }
+}
+
+type Stream = Box<dyn tokio_xmpp::connect::AsyncReadAndWrite>;
+
+/// Where an account's WebSocket is, as the server publishes it (XEP-0156: `host-meta` in JSON or XML).
+pub async fn discover_websocket(account_id: &str, ca_pem: &str, domain: &str) -> Result<String, String> {
+    let client = super::media::http_client(account_id, ca_pem);
+    if let Ok(r) = client.get(format!("https://{domain}/.well-known/host-meta.json")).send().await {
+        if let Ok(v) = r.json::<serde_json::Value>().await {
+            if let Some(href) = v["links"].as_array().into_iter().flatten().find(|l| l["rel"] == "urn:xmpp:alt-connections:websocket").and_then(|l| l["href"].as_str()) {
+                return Ok(href.to_string());
+            }
+        }
+    }
+    if let Ok(r) = client.get(format!("https://{domain}/.well-known/host-meta")).send().await {
+        if let Ok(text) = r.text().await {
+            if let Some(href) = websocket_in_xml(&text) {
+                return Ok(href);
+            }
+        }
+    }
+    Err(format!("{domain} does not say where its WebSocket is: give the address (wss://...) in the account's settings"))
+}
+
+/// The WebSocket address in a `host-meta` document.
+pub fn websocket_in_xml(text: &str) -> Option<String> {
+    let link = regex::Regex::new(r#"<Link\b[^>]*>"#).ok()?;
+    let href = regex::Regex::new(r#"href=['"]([^'"]+)['"]"#).ok()?;
+    let tag = link.find_iter(text).map(|m| m.as_str()).find(|t| t.contains("urn:xmpp:alt-connections:websocket"))?;
+    let found = href.captures(tag).map(|c| c[1].to_string());
+    found
+}
+
+impl ServerConnector for Connector {
+    type Stream = Stream;
+
+    /// The library's way in (in-band registration uses it): TLS up, then the stream opened as the library expects.
+    async fn connect(&self, jid: &Jid, ns: &'static str, timeouts: Timeouts) -> Result<(PendingFeaturesRecv<Self::Stream>, sasl::common::ChannelBinding), Error> {
+        let (raw, bindings) = self.open(jid).await?;
+        let domain = jid.domain().as_str();
+        let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(raw), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        let binding = match bindings.exporter {
+            Some(data) => sasl::common::ChannelBinding::TlsExporter(data),
+            None => sasl::common::ChannelBinding::None,
+        };
+        Ok((pending, binding))
+    }
+}
+
+impl Connector {
+    /// The WebSocket: found (or named), connected through the account's route, TLS as for any connection, then the translation
+    /// of `websocket.rs`, so everything above it reads and writes the TCP form.
+    async fn websocket_raw(&self, jid: &Jid) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let io_err = |m: String| Error::Io(io::Error::other(m));
+        let domain = jid.domain().as_str();
+        let ca = self.settings.ca_pem.clone();
+        let address = if self.settings.host.starts_with("wss://") { self.settings.host.clone() } else { discover_websocket(&self.settings.account_id, &ca, domain).await.map_err(io_err)? };
+        let url = url::Url::parse(&address).map_err(|e| io_err(format!("{address:?} is not an address: {e}")))?;
+        if url.scheme() != "wss" {
+            return Err(io_err("only wss:// addresses are used: moho does not connect without encryption".to_string()));
+        }
+        let host = url.host_str().ok_or_else(|| io_err("the WebSocket address has no host".to_string()))?.to_string();
+        let port = url.port().unwrap_or(443);
+        let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, port).await.map_err(|e| io_err(format!("{e:#}")))?;
+        // The TLS here may end at a proxy in front of the XMPP server, which then cannot see it: no channel binding is offered.
+        let (tls, _) = self.tls(tcp, &host, false).await?;
+        let bindings = super::sasl::Bindings::default();
+        let mut request = address.as_str().into_client_request().map_err(|e| io_err(e.to_string()))?;
+        request.headers_mut().insert("Sec-WebSocket-Protocol", "xmpp".parse().expect("a header value"));
+        let (ws, _) = tokio_tungstenite::client_async(request, tls).await.map_err(|e| io_err(format!("the WebSocket: {e}")))?;
+        Ok((Box::new(BufStream::new(super::websocket::WsIo::new(ws))), bindings))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_websocket_address_is_found_in_host_meta() {
+        let xml = "<XRD xmlns='http://docs.oasis-open.org/ns/xri/xrd-1.0'><Link rel=\"urn:xmpp:alt-connections:xbosh\" href=\"https://e.org/bosh\"/><Link rel='urn:xmpp:alt-connections:websocket' href='wss://e.org:5443/ws'/></XRD>";
+        assert_eq!(websocket_in_xml(xml).as_deref(), Some("wss://e.org:5443/ws"));
+        assert_eq!(websocket_in_xml("<XRD/>"), None);
+    }
+
+    fn rec(priority: u16, weight: u16, target: &str, direct: bool) -> SrvRecord {
+        SrvRecord { priority, weight, port: if direct { 5223 } else { 5222 }, target: target.into(), direct }
+    }
+
+    #[test]
+    fn srv_records_are_tried_by_priority_with_direct_tls_first_on_a_tie() {
+        let order = order_srv(vec![rec(20, 0, "b.example.", false), rec(10, 0, "a.example.", false), rec(10, 0, "a.example.", true), rec(5, 0, "first.example.", false)], |_| 0);
+        let hosts: Vec<(String, bool)> = order.iter().map(|t| (t.host.clone(), t.direct)).collect();
+        assert_eq!(hosts, vec![("first.example".into(), false), ("a.example".into(), true), ("a.example".into(), false), ("b.example".into(), false)]);
+    }
+
+    #[test]
+    fn weight_decides_within_a_priority() {
+        let records = vec![rec(10, 0, "light.", false), rec(10, 100, "heavy.", false)];
+        // The draw lands in the heavy record's share (1 + 101 = 102; 50 is past the light one's 1).
+        assert_eq!(order_srv(records.clone(), |_| 50)[0].host, "heavy");
+        assert_eq!(order_srv(records, |_| 0)[0].host, "light");
+    }
+
+    #[test]
+    fn a_dot_target_says_the_service_is_not_offered() {
+        let order = order_srv(vec![rec(0, 0, ".", true), rec(10, 0, "xmpp.example.", false)], |_| 0);
+        assert_eq!(order, vec![Target { host: "xmpp.example".into(), port: 5222, direct: false }]);
+    }
+
+    #[test]
+    fn a_domain_is_given_to_dns_and_tls_in_its_ascii_form() {
+        assert_eq!(ascii_domain("bücher.example").unwrap(), "xn--bcher-kva.example");
+        assert_eq!(ascii_domain("Example.ORG.").unwrap(), "example.org");
+        assert!(ascii_domain("a..b").is_err() || ascii_domain("a..b").unwrap() != "a.b");
+    }
+
+    #[test]
+    fn a_pin_is_hex_whatever_way_it_was_written() {
+        let hex = "ab".repeat(32);
+        assert_eq!(normalise_pin(&hex).as_deref(), Some(hex.as_str()));
+        let colons = (0..32).map(|_| "AB").collect::<Vec<_>>().join(":");
+        assert_eq!(normalise_pin(&colons).as_deref(), Some(hex.as_str()));
+        assert_eq!(normalise_pin(&format!("  {}  ", hex.to_uppercase())).as_deref(), Some(hex.as_str()));
+        assert_eq!(normalise_pin("abcd"), None);
+        assert_eq!(normalise_pin(&"zz".repeat(32)), None);
+    }
+
+    #[test]
+    fn the_test_servers_certificate_is_read_and_a_change_is_said() {
+        let Ok(pem) = std::fs::read("/1tb/xmpp-test/pki/server.crt") else { return };
+        let der = CertificateDer::from_pem_slice(&pem).expect("PEM");
+        let d = cert_details(der.as_ref()).expect("readable");
+        assert!(d.names.iter().any(|n| n == "localhost"), "{d:?}");
+        assert!(!d.self_signed && d.not_after.starts_with("20"), "{d:?}");
+        let mut other = d.clone();
+        other.issuer = "CN=Somebody Else".into();
+        let said = what_changed(&d, &other);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("Somebody Else"));
+        assert!(cert_details(b"not a certificate").is_none());
+    }
+
+    #[test]
+    fn a_certificate_has_the_fingerprint_a_pin_is_compared_with() {
+        // SHA-256 of the empty string, as any tool prints it.
+        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    fn settings(ca: &str, pin: &str) -> Settings {
+        Settings { account_id: "xmpp:a@example.org".into(), host: String::new(), port: 0, direct: false, websocket: false, ca_pem: ca.into(), pin_sha256: pin.into(), client_cert_pem: String::new() }
+    }
+
+    #[test]
+    fn a_config_is_made_with_nothing_extra_and_refuses_a_bad_pin_or_a_file_that_is_not_a_certificate() {
+        let seen: SeenSlot = Default::default();
+        assert!(tls_config(&settings("", ""), &seen).is_ok());
+        assert!(tls_config(&settings("", &"cd".repeat(32)), &seen).is_ok());
+        assert!(tls_config(&settings("", "not a fingerprint"), &seen).is_err());
+        assert!(tls_config(&settings("this is not PEM", ""), &seen).is_err());
+        assert!(tls_config(&settings("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", ""), &seen).is_err());
+        let not_pem = Settings { client_cert_pem: "nothing".into(), ..settings("", "") };
+        assert!(tls_config(&not_pem, &seen).is_err(), "a client certificate that is not one is said at once");
+    }
+
+    #[test]
+    fn direct_tls_says_xmpp_client_in_alpn_and_starttls_says_nothing() {
+        let seen: SeenSlot = Default::default();
+        let direct = Settings { direct: true, ..settings("", "") };
+        assert_eq!(tls_config(&direct, &seen).unwrap().alpn_protocols, vec![b"xmpp-client".to_vec()]);
+        assert!(tls_config(&settings("", ""), &seen).unwrap().alpn_protocols.is_empty());
+    }
+}

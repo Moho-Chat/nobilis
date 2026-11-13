@@ -108,6 +108,11 @@ pub fn held_on_account(account_id: &str) -> bool {
 pub async fn set_level(state: &crate::state::AppState, buffer: &crate::model::Buffer, level: NotifyLevel) -> Result<(), String> {
     use crate::backend;
     let account = buffer.account_id.as_str();
+    // An XMPP room keeps it in its bookmark, for every client of the account (XEP-0492); a conversation with a person has no
+    // such place and keeps it here.
+    if account.starts_with("xmpp:") && buffer.kind == "channel" {
+        return backend::xmpp::bookmarks::set_notify(state, buffer, level).await;
+    }
     if !held_on_account(account) {
         state.runtime.set_local_notify(state, &buffer.id, level);
         return Ok(());
