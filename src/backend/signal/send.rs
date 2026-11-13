@@ -356,7 +356,20 @@ pub fn edit_of(params: &serde_json::Value) -> Result<super::manage::Edit, String
 pub async fn edit_group(state: &AppState, buffer: &Buffer, params: &serde_json::Value) -> Result<(), String> {
     let (handle, thread) = target(state, buffer)?;
     let Thread::Group(key) = thread else { return Err("that is not a group".to_string()) };
-    let edit = edit_of(params)?;
+    // People to add may be named by username or a known number as well as by id.
+    let mut params = params.clone();
+    if let Some(named) = params.get("userIds").and_then(|v| v.as_array()).cloned() {
+        let mut ids = Vec::new();
+        for name in named.iter().filter_map(|v| v.as_str()) {
+            let id = match uuid::Uuid::parse_str(name.trim().trim_start_matches("p:")) {
+                Ok(id) => id,
+                Err(_) => super::inbox::find_person(state, &handle, name.trim()).await.map_err(|e| e.to_string())?,
+            };
+            ids.push(serde_json::Value::String(id.to_string()));
+        }
+        params["userIds"] = serde_json::Value::Array(ids);
+    }
+    let edit = edit_of(&params)?;
     let (done, answer) = oneshot::channel();
     handle.commands.send(Command::EditGroup { key, edit, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     wait(answer, Duration::from_secs(120)).await
@@ -367,7 +380,14 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
     use presage::libsignal_service::groups_v2::{AccessRequired, Role};
     use presage::store::ContentsStore;
     let (handle, thread) = target(state, buffer)?;
-    let Thread::Group(key) = thread else { return Err("that is not a group".to_string()) };
+    let key = match &thread {
+        Thread::Group(key) => *key,
+        // A conversation with one person has only its timer to show.
+        Thread::Contact(_) => {
+            let timer = handle.store.expire_timer(&thread).await.ok().flatten().map(|(seconds, _)| seconds).unwrap_or(0);
+            return Ok(serde_json::json!({ "dm": true, "timer": timer }));
+        }
+    };
     let group = handle.store.group(key).await.ok().flatten().ok_or("that group is not known to this account")?;
     let own = presage::libsignal_service::protocol::Aci::from(handle.own);
     let admin = group.members.iter().any(|m| m.aci == own && matches!(m.role, Role::Administrator));
@@ -387,11 +407,17 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         let who = uuid::Uuid::from(r.aci);
         requesting.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, &who).await }));
     }
+    let mut members = Vec::new();
+    for m in &group.members {
+        let who = uuid::Uuid::from(m.aci);
+        members.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, &who).await, "admin": matches!(m.role, Role::Administrator), "me": m.aci == own }));
+    }
     let mut pending = Vec::new();
     for p in &group.pending_members {
         pending.push(serde_json::json!({ "userId": p.uuid.to_string(), "nick": super::people::person(&ctx, &p.uuid).await, "mine": p.added_by_aci == own }));
     }
     Ok(serde_json::json!({
+        "dm": false,
         "title": group.title,
         "description": group.description.clone().unwrap_or_default(),
         "timer": group.disappearing_messages_timer.as_ref().map(|t| t.duration).unwrap_or(0),
@@ -402,6 +428,7 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         "link": if link_mode != "off" && admin && !group.invite_link_password.is_empty() { Some(super::manage::link_of(&key, &group.invite_link_password)) } else { None },
         "whoMayEdit": words(access.map(|a| &a.attributes)),
         "whoMayAdd": words(access.map(|a| &a.members)),
+        "members": members,
         "requesting": requesting,
         "pending": pending,
     }))
@@ -413,7 +440,15 @@ pub async fn create_group(state: &AppState, account_id: &str, title: &str, membe
     if title.trim().is_empty() {
         return Err("A group needs a name".to_string());
     }
-    let members: Vec<uuid::Uuid> = members.iter().filter_map(|s| uuid::Uuid::parse_str(s.trim_start_matches("p:")).ok()).collect();
+    // Named by id, username or a known number.
+    let mut ids = Vec::new();
+    for name in members.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        ids.push(match uuid::Uuid::parse_str(name.trim_start_matches("p:")) {
+            Ok(id) => id,
+            Err(_) => super::inbox::find_person(state, &handle, name).await.map_err(|e| format!("{name}: {e}"))?,
+        });
+    }
+    let members = ids;
     let (done, answer) = oneshot::channel();
     handle.commands.send(Command::CreateGroup { title: title.to_string(), members, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     let key = wait(answer, Duration::from_secs(120)).await?;

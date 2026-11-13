@@ -101,7 +101,7 @@ pub async fn open_dm(state: &AppState, handle: &Handle, user_id: &str) -> anyhow
 }
 
 /// Who a username or number names.
-async fn find_person(state: &AppState, handle: &Handle, wanted: &str) -> anyhow::Result<Uuid> {
+pub(super) async fn find_person(state: &AppState, handle: &Handle, wanted: &str) -> anyhow::Result<Uuid> {
     let kept = super::storage::current(&handle.account_id, &handle.store);
     let looks_like_number = wanted.starts_with('+') || wanted.chars().all(|c| c.is_ascii_digit() || " -().".contains(c));
     if looks_like_number {
