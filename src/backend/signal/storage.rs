@@ -318,7 +318,8 @@ pub async fn fetch(manager: &presage::Manager<SignalStore, presage::manager::Reg
 pub async fn refresh(state: &crate::state::AppState, handle: &super::Handle, manager: &presage::Manager<SignalStore, presage::manager::Registered>) {
     let account_id = handle.account_id.as_str();
     let store = manager.store().clone();
-    let known = current(account_id, &store).version;
+    let before = current(account_id, &store);
+    let known = before.version;
     let fetched = tokio::time::timeout(std::time::Duration::from_secs(30), fetch(manager, known)).await;
     let kept = match fetched {
         Ok(Ok(Some(kept))) => keep(account_id, &store, kept),
@@ -337,11 +338,23 @@ pub async fn refresh(state: &crate::state::AppState, handle: &super::Handle, man
     };
     tracing::info!("signal[{account_id}]: the storage service was read (version {}, {} conversations)", kept.version, kept.conversations.len());
     let ctx = super::people::Ctx::new(state, account_id, store, handle.own);
-    arrived(&ctx, handle, &kept).await;
+    arrived(&ctx, handle, &kept, &before).await;
+}
+
+/// Whether the phone's unread mark on a conversation is something to act on: `Some(true)` while it is marked (and on
+/// the first reading), `Some(false)` when the mark was just taken off, `None` when there is nothing to do.
+fn marked_unread_now(before: &Kept, now: &Kept, remote: &str) -> Option<bool> {
+    let was = before.standing(remote).is_some_and(|s| s.marked_unread);
+    let is = now.standing(remote).is_some_and(|s| s.marked_unread);
+    match (was, is) {
+        (_, true) => Some(true),
+        (true, false) => Some(false),
+        (false, false) => None,
+    }
 }
 
 /// Acts on what was read.
-async fn arrived(ctx: &super::people::Ctx<'_>, handle: &super::Handle, kept: &Kept) {
+async fn arrived(ctx: &super::people::Ctx<'_>, handle: &super::Handle, kept: &Kept, before: &Kept) {
     // The account's settings, where the phone keeps them for every device: more current than a configuration sync.
     if let Some(account) = kept.account {
         let synced = super::memory::Synced {
@@ -359,9 +372,12 @@ async fn arrived(ctx: &super::people::Ctx<'_>, handle: &super::Handle, kept: &Ke
     let now = now_ms();
     for buffer in ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id) {
         let Some(remote) = buffer.remote_id.as_deref() else { continue };
-        // Marked unread on the phone: counted as one waiting here, as Signal's clients draw it.
-        if kept.standing(remote).is_some_and(|s| s.marked_unread) && buffer.unread_seed == 0 {
+        // Marked unread on the phone: counted as one waiting here, as Signal's clients draw it; and read there (the mark
+        // taken off) is read here too - it stayed at one before (seen on the first real account).
+        if marked_unread_now(before, kept, remote) == Some(true) && buffer.unread_seed == 0 {
             ctx.state.runtime.set_buffer_unread(ctx.state, &buffer.id, 1, 0);
+        } else if marked_unread_now(before, kept, remote) == Some(false) {
+            ctx.state.runtime.set_buffer_unread(ctx.state, &buffer.id, 0, 0);
         }
         let muted = kept.standing(remote).is_some_and(|s| s.muted(now));
         if muted {
@@ -395,6 +411,18 @@ pub fn identity_verified(record: &ContactRecord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phones_unread_mark_counts_while_it_is_there_and_is_taken_off_when_it_goes() {
+        let marked = |on: bool| Kept { conversations: [("g:aa".to_string(), Standing { marked_unread: on, ..Default::default() })].into_iter().collect(), ..Default::default() };
+        let none = Kept::default();
+        assert_eq!(marked_unread_now(&none, &marked(true), "g:aa"), Some(true));
+        assert_eq!(marked_unread_now(&marked(true), &marked(true), "g:aa"), Some(true));
+        // Read on the phone: the mark comes off (seen on the first real account, where moho stayed at one).
+        assert_eq!(marked_unread_now(&marked(true), &marked(false), "g:aa"), Some(false));
+        assert_eq!(marked_unread_now(&marked(false), &marked(false), "g:aa"), None);
+        assert_eq!(marked_unread_now(&none, &none, "g:aa"), None);
+    }
     use presage::libsignal_service::proto::{account_record::PinnedConversation, contact_record::Name};
     use presage::model::identity::OnNewIdentity;
 
