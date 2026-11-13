@@ -171,6 +171,7 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
     // Who this account's own messages are signed as, and the groups it is in, before anything is heard.
     inbox::announce_self(state, config, &manager).await;
     inbox::open_groups(state, account_id, &manager).await;
+    inbox::open_people(state, account_id, &manager).await;
 
     let (commands, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Command>();
     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());

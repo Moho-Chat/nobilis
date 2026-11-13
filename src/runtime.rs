@@ -1436,6 +1436,12 @@ impl Runtime {
         }
     }
 
+    /// Whether a conversation put back from the last run is still waiting for its service to confirm it.
+    #[cfg(test)]
+    pub fn awaiting_confirmation(&self, buffer_id: &str) -> bool {
+        self.restored_buffers.lock().unwrap().contains_key(buffer_id)
+    }
+
     /// Marks a restored entry as seen again from its service.
     fn confirm_restored(&self, account_id: &str, id: &str, group: bool) {
         let map = if group { &self.restored_groups } else { &self.restored_buffers };

@@ -48,6 +48,22 @@ fn thread_id(conn: &Connection, thread: &Thread) -> Result<Option<i64>> {
     Ok(found)
 }
 
+impl SignalStore {
+    /// The people the account has a one-to-one conversation with that still holds a message (the account itself among
+    /// them, for Note to Self). Signal keeps no list of conversations on its server; this is what there is of one.
+    pub fn people_with_messages(&self) -> Result<Vec<uuid::Uuid>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT t.recipient_id FROM threads t
+                 WHERE t.recipient_id IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM thread_messages m WHERE m.thread_id = t.id)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            Ok(rows.filter_map(|r| r.ok()).filter_map(|bytes| uuid::Uuid::from_slice(&bytes).ok()).collect())
+        })
+    }
+}
+
 /// The id of the row for a conversation, made if it is the first time it is spoken of.
 fn ensure_thread_id(conn: &Connection, thread: &Thread) -> Result<i64> {
     Ok(match thread {

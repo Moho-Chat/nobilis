@@ -149,6 +149,25 @@ pub async fn open_groups(state: &AppState, account_id: &str, manager: &Manager<S
     }
 }
 
+/// Opens the one-to-one conversations (Note to Self among them) the account's store still holds a message of, and keeps
+/// Stories if it was open. Signal has no list of conversations on its server, so the store is the list: one emptied
+/// since (deleted on the phone, every message expired) is not opened, and if it was put back from the last run it goes.
+pub async fn open_people(state: &AppState, account_id: &str, manager: &Manager<SignalStore, Registered>) {
+    let ctx = ctx_for(state, account_id, manager);
+    match manager.store().people_with_messages() {
+        Ok(people) => {
+            for who in people {
+                people::buffer_for(&ctx, &Thread::Contact(ServiceId::Aci(who.into()))).await;
+            }
+        }
+        Err(e) => tracing::warn!("signal[{account_id}]: listing the conversations: {e:#}"),
+    }
+    let stories_open = state.runtime.list_buffers().iter().any(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(super::stories::REMOTE));
+    if stories_open {
+        super::stories::buffer(&ctx);
+    }
+}
+
 fn ctx_for<'a>(state: &'a AppState, account_id: &'a str, manager: &Manager<SignalStore, Registered>) -> Ctx<'a> {
     let own = Uuid::from(manager.registration_data().service_ids.aci());
     Ctx::new(state, account_id, manager.store().clone(), own)
@@ -921,6 +940,30 @@ mod tests {
         let mut rows = state.store.get_backlog(&buffer.id, i64::MAX, 100).unwrap();
         rows.sort_by_key(|m| m.ts);
         rows
+    }
+
+    #[tokio::test]
+    async fn a_conversation_put_back_from_the_last_run_is_confirmed_when_signal_finds_it_again() {
+        let (state, store) = world("restored").await;
+        state.accounts.add_signal(crate::accounts::SignalAccountConfig { aci: ME.to_string(), ..Default::default() }).unwrap();
+        let ctx = ctx(&state, &store);
+        // Last run: Note to Self and a conversation with Alice were open.
+        for thread in [person(ME), person(ALICE)] {
+            people::buffer_for(&ctx, &thread).await;
+        }
+        state.runtime.save_layout(&state);
+        let ids: Vec<String> = state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ACCOUNT).map(|b| b.id).collect();
+        for id in &ids {
+            state.runtime.remove_buffer(&state, id);
+        }
+        // This run: both are put back, waiting for Signal to say they still exist.
+        state.runtime.restore_layout(&state);
+        assert!(ids.iter().all(|id| state.runtime.awaiting_confirmation(id)), "{ids:?}");
+        // Signal finds Note to Self again (as at connect); Alice's is not found, so it stays unconfirmed and goes.
+        let found = people::buffer_for(&ctx, &person(ME)).await;
+        assert_eq!(found.name, "Note to Self");
+        assert!(!state.runtime.awaiting_confirmation(&found.id));
+        assert!(ids.iter().any(|id| *id != found.id && state.runtime.awaiting_confirmation(id)));
     }
 
     #[tokio::test]

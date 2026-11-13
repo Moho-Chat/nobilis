@@ -368,6 +368,21 @@ async fn a_message_can_be_deleted_and_a_conversation_cleared() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_conversations_with_people_that_still_hold_a_message_are_listed() -> TestResult {
+    let mut s = store();
+    // Note to Self (the account is 99), Alice (2), a group, and Bob (3) whose only message is gone again.
+    s.save_message(&Thread::Contact(aci(99)), text(aci(99), 10, "note")).await?;
+    s.save_message(&Thread::Contact(aci(2)), text(aci(2), 20, "hi")).await?;
+    s.save_message(&Thread::Group([9; 32]), text(aci(2), 30, "group")).await?;
+    s.save_message(&Thread::Contact(aci(3)), text(aci(3), 40, "gone")).await?;
+    s.delete_message(&Thread::Contact(aci(3)), 40).await?;
+    let mut people = s.people_with_messages()?;
+    people.sort();
+    assert_eq!(people, vec![Uuid::from_u128(2), Uuid::from_u128(99)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn contacts_are_listed_in_inbox_order_and_keep_their_verification_through_a_resave() -> TestResult {
     let mut s = store();
     s.save_contact(&contact(2, "Zed", 1)).await?;

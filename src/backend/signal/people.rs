@@ -122,7 +122,9 @@ pub async fn buffer_for(ctx: &Ctx<'_>, thread: &Thread) -> Buffer {
     let remote = ids::remote_id(thread);
     let mine: Vec<Buffer> = ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id).collect();
     if let Some(found) = mine.iter().find(|b| b.remote_id.as_deref() == Some(remote.as_str())) {
-        return found.clone();
+        // Through ensure_buffer, which confirms one put back from the last run's layout: found here without it, a
+        // restored conversation was taken away again half a minute after connecting, as one the service no longer has.
+        return ctx.state.runtime.ensure_buffer(ctx.state, ctx.account_id, &found.name, &found.kind);
     }
     let (title, kind) = match thread {
         Thread::Contact(id) if ids::uuid_of(id) == ctx.own => ("Note to Self".to_string(), "dm"),

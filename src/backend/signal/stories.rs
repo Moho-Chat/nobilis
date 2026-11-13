@@ -23,7 +23,8 @@ pub const LIFE_SECONDS: u32 = 24 * 60 * 60;
 /// The Stories conversation, made if it is not there yet.
 pub fn buffer(ctx: &Ctx<'_>) -> Buffer {
     if let Some(found) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(REMOTE)) {
-        return found;
+        // Confirmed, as people::buffer_for does, so a restored one is not taken away after connecting.
+        return ctx.state.runtime.ensure_buffer(ctx.state, ctx.account_id, &found.name, &found.kind);
     }
     let buffer = ctx.state.runtime.ensure_buffer(ctx.state, ctx.account_id, NAME, "dm");
     ctx.state.runtime.set_buffer_remote_id(ctx.state, &buffer.id, REMOTE);
