@@ -79,6 +79,9 @@ pub fn start(state: AppState, login_id: String) {
         waiting().lock().unwrap().remove(&login_id);
         match outcome {
             Ok(Some(config)) => {
+                // Connected straight away, as a signed-in Telegram account is: otherwise a new link stays at
+                // "connecting" until the daemon is next started.
+                super::connect::spawn(state.clone(), config.clone());
                 let account = crate::accounts::signal_account_to_json(&config, "connecting");
                 state.events.emit("signalLinkResult", json!({ "loginId": login_id, "success": true, "account": account }));
             }
