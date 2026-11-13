@@ -124,6 +124,8 @@ pub enum Command {
     SetProfile { given: String, family: String, about: String, emoji: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Vote in a poll (a DataMessage carrying the vote).
     Vote { thread: presage::store::Thread, vote: presage::proto::data_message::PollVote, done: Done },
+    /// The end of a poll the account asked, sent at `target_ms`.
+    EndPoll { thread: presage::store::Thread, target_ms: u64, done: Done },
     /// A new poll, asked in the conversation.
     Poll { thread: presage::store::Thread, create: presage::proto::data_message::PollCreate, done: Done },
     /// Answer a story: a reply in words or a reaction, sent to its author naming the story.

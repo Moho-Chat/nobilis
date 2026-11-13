@@ -711,6 +711,19 @@ pub async fn start_poll(state: &AppState, buffer: &Buffer, question: &str, answe
     Ok(())
 }
 
+/// Ends a poll the account asked: nobody can vote in it after, here or on the other devices.
+pub async fn end_poll(state: &AppState, buffer: &Buffer, poll_id: &str) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let (target_ms, author) = ids::parse_message_id(poll_id).ok_or("that is not a Signal poll")?;
+    if author != handle.own {
+        return Err("Only whoever asked a poll can end it".to_string());
+    }
+    ask(&handle, |done| Command::EndPoll { thread, target_ms, done }).await?;
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    super::polls::ended(&ctx, buffer, &handle.own, &presage::proto::data_message::PollTerminate { target_sent_timestamp: Some(target_ms) });
+    Ok(())
+}
+
 /// The most a GIF picked from the picker may weigh: they are short loops, and a bigger one is not one.
 const BIGGEST_GIF: usize = 25 * 1024 * 1024;
 

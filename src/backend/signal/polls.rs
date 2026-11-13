@@ -78,6 +78,8 @@ impl Poll {
             "resultDisplayDuration": 0,
             "hasVoted": mine.is_some(),
             "votedOptionId": mine,
+            // Only whoever asked a Signal poll can end it, so nobody else is offered the button.
+            "noEnd": ids::parse_message_id(poll_id).is_none_or(|(_, author)| author != *own),
         })
     }
 }
@@ -195,5 +197,15 @@ mod tests {
         let card = p.card("buf", "1-x", &me);
         assert_eq!((card["title"].as_str(), card["hasVoted"].as_bool(), card["votedOptionId"].as_str(), card["open"].as_bool()), (Some("Lunch?"), Some(true), Some("1"), Some(true)));
         assert_eq!(card["options"][1]["votes"], 1);
+    }
+
+    #[test]
+    fn only_the_account_s_own_poll_offers_ending_it() {
+        let p = poll(false);
+        let me = Uuid::from_u128(7);
+        let mine = ids::message_id(1_700_000_000_000, &me);
+        let theirs = ids::message_id(1_700_000_000_000, &Uuid::from_u128(8));
+        assert_eq!(p.card("buf", &mine, &me)["noEnd"], false);
+        assert_eq!(p.card("buf", &theirs, &me)["noEnd"], true);
     }
 }

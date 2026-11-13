@@ -283,6 +283,13 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
+            Command::EndPoll { thread, target_ms, done } => {
+                let at = now_ms();
+                let end = data_message::PollTerminate { target_sent_timestamp: Some(target_ms) };
+                let dm = DataMessage { poll_terminate: Some(end), timestamp: Some(at), ..Default::default() };
+                let result = deliver(&mut manager, &thread, dm, at).await;
+                finish(done, result, at);
+            }
             Command::Poll { thread, create, done } => {
                 let at = now_ms();
                 let dm = DataMessage { poll_create: Some(create), timestamp: Some(at), ..Default::default() };

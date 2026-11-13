@@ -6949,6 +6949,15 @@ pub async fn dispatch(
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("endPoll requires \"bufferId\"".to_string()));
             };
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("signal:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("endPoll requires \"pollId\" for a Signal poll".to_string()));
+                };
+                return match backend::signal::send::end_poll(state, &buffer, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("matrix:")) {
                 let Some(poll_id) = p_str_opt(params, "pollId") else {
                     return (None, Some("ending a Matrix poll needs its \"pollId\"".to_string()));
