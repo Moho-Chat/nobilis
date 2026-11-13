@@ -538,6 +538,31 @@ pub async fn set_profile(state: &AppState, account_id: &str, params: &serde_json
     wait(answer, Duration::from_secs(60)).await
 }
 
+/// The account's settings as the phone keeps them, and who it blocks: for the account card. Changed on the phone.
+pub async fn settings(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let synced = handle.memory.synced();
+    let kept = super::storage::current(account_id, &handle.store);
+    let ctx = super::people::Ctx::new(state, account_id, handle.store.clone(), handle.own);
+    let mut blocked = Vec::new();
+    for (remote, _) in kept.conversations.iter().filter(|(_, s)| s.blocked) {
+        let name = match ids::parse_remote_id(remote) {
+            Some(Thread::Contact(id)) => super::people::person(&ctx, &ids::uuid_of(&id)).await,
+            Some(Thread::Group(key)) => super::people::group_title(&ctx, &key).await,
+            None => continue,
+        };
+        blocked.push(serde_json::json!({ "id": remote, "name": name }));
+    }
+    Ok(serde_json::json!({
+        "readReceipts": synced.read_receipts,
+        "typingIndicators": synced.typing_indicators,
+        "linkPreviews": synced.link_previews,
+        "sealedSenderIndicators": synced.unidentified_delivery_indicators,
+        "defaultTimer": kept.account.map(|a| a.default_timer),
+        "blocked": blocked,
+    }))
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
