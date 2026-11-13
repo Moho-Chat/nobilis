@@ -21,6 +21,7 @@ What is changed, and nothing else:
   link): unset, the server answers HTTP 400.
   A change (and a join by link) leaves the actions' `group_id` empty: the server fills it in and refuses a change
   that sets it (HTTP 400).
+  `change_group` also answers the change as the server signed it, so the caller can say it in its own conversation.
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

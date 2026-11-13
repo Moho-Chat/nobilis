@@ -1026,6 +1026,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_change_the_account_made_from_here_is_said_in_the_group_as_its_own() {
+        use presage::libsignal_service::groups_v2::GroupOperations;
+        use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        let (state, store) = world("own-change").await;
+        let writer = store.clone();
+        let key = [5u8; 32];
+        writer
+            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None })
+            .await
+            .unwrap();
+        let ctx = ctx(&state, &store);
+        // The change as the server answers it: the actions moho built for a rename, with the server's own fields.
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key)));
+        let mut actions = presage::proto::group_change::Actions::default();
+        actions.source_user_id = operations.encrypt_aci(Aci::from(uuid(ME))).unwrap();
+        actions.version = 2;
+        actions.group_id = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key)).get_group_identifier().to_vec();
+        actions.modify_title = Some(presage::proto::group_change::actions::ModifyTitleAction { title: operations.encrypt_title("Bouldering", &mut rand09::rng()) });
+        let signed = presage::proto::GroupChange { actions: prost::Message::encode_to_vec(&actions), server_signature: Vec::new(), change_epoch: 0 };
+        super::super::groups::say_own_change(&ctx, key, &signed).await;
+        let buffer = only_buffer(&state);
+        assert_eq!(backlog(&state, &buffer).iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["You changed the group name to “Bouldering”"]);
+    }
+
+    #[tokio::test]
     async fn a_group_message_goes_to_the_group_by_its_title() {
         let (state, store) = world("group").await;
         let writer = store.clone();

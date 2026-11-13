@@ -139,9 +139,22 @@ pub fn lines(changes: &GroupChanges, name: &dyn Fn(&ServiceId) -> String) -> Vec
     out
 }
 
-/// The lines a group message's change makes, with everybody named.
+/// Says a change the account made from here in the group's conversation, in the words a change from anywhere else gets:
+/// nothing comes back to say it.
+pub async fn say_own_change(ctx: &Ctx<'_>, key: [u8; 32], signed: &presage::libsignal_service::proto::GroupChange) {
+    let context = GroupContextV2 { master_key: Some(key.to_vec()), revision: None, group_change: Some(prost::Message::encode_to_vec(signed)) };
+    let Some(changes) = change_of(&context) else { return };
+    let buffer = people::buffer_for(ctx, &presage::store::Thread::Group(key)).await;
+    let at = super::commands::now_ms();
+    for line in lines_for(ctx, &changes).await {
+        super::inbox::system(ctx, &buffer, &line, at);
+    }
+}
+
+/// The lines a group message's change makes, with everybody named: the account itself as "You", as Signal says it.
 pub async fn lines_for(ctx: &Ctx<'_>, changes: &GroupChanges) -> Vec<String> {
     let mut names: HashMap<Uuid, String> = HashMap::new();
+    names.insert(ctx.own, "You".to_string());
     for who in people_in(changes) {
         if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(who) {
             slot.insert(people::person(ctx, &who).await);

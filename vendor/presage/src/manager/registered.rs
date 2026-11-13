@@ -609,10 +609,11 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// moho: changes a group. `build` makes the change's actions from the group as it is now and the group's
-    /// operations (which encrypt what has to be encrypted); the revision and the group's id are filled in here. The
-    /// change goes to the group server, the group's new state is saved, and every member - and anybody the change took
-    /// out - is sent it, so their clients apply it. Answers the new state, or `None` when the change took the account
-    /// itself out (leaving): the group is then marked left.
+    /// operations (which encrypt what has to be encrypted); the revision is filled in here (the group's id is the
+    /// server's). The change goes to the group server, the group's new state is saved, and every member - and anybody the
+    /// change took out - is sent it, so their clients apply it. Answers the new state, or `None` when the change took the
+    /// account itself out (leaving): the group is then marked left; and the change as the server signed it, which the
+    /// caller can say in its own conversation (nothing comes back to say it).
     pub async fn change_group(
         &mut self,
         master_key: [u8; 32],
@@ -621,7 +622,7 @@ impl<S: Store> Manager<S, Registered> {
             &crate::model::groups::Group,
         ) -> Result<libsignal_service::proto::group_change::Actions, String>,
         timestamp: u64,
-    ) -> Result<Option<crate::model::groups::Group>, Error<S::Error>> {
+    ) -> Result<(Option<crate::model::groups::Group>, libsignal_service::proto::GroupChange), Error<S::Error>> {
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let before = upsert_group(&self.store, &mut groups_manager, &master_key, &0)
             .await?
@@ -639,8 +640,10 @@ impl<S: Store> Manager<S, Registered> {
             .identified_push_service()
             .patch_group(authorization, actions, None)
             .await?;
-        self.after_group_change(&mut groups_manager, master_key, Some(&before), signed, timestamp)
-            .await
+        let after = self
+            .after_group_change(&mut groups_manager, master_key, Some(&before), signed.clone(), timestamp)
+            .await?;
+        Ok((after, signed))
     }
 
     /// moho: saves a group's state after a change and tells everybody concerned.

@@ -350,13 +350,16 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
             }
             Command::EditGroup { key, edit, done } => {
                 let result = edit_group(&mut manager, key, edit).await;
-                if result.is_ok() {
+                if let Ok(signed) = &result {
                     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
                     let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
                     super::inbox::rename_all(&ctx).await;
+                    // Said here as the members' clients say it (seen on the first real account: the phone showed each
+                    // change made from moho, and moho showed none).
+                    super::groups::say_own_change(&ctx, key, signed).await;
                     super::groups::publish_members(&ctx, &key).await;
                 }
-                let _ = done.send(result);
+                let _ = done.send(result.map(|_| ()));
             }
             Command::CreateGroup { title, members, done } => {
                 let acis: Vec<presage::libsignal_service::protocol::Aci> = members.into_iter().map(Into::into).collect();
@@ -364,7 +367,8 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 if let Ok(key) = &result {
                     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
                     let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
-                    super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
+                    let buffer = super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
+                    super::inbox::system(&ctx, &buffer, "You created the group", now_ms());
                     super::groups::publish_members(&ctx, key).await;
                 }
                 let _ = done.send(result);
@@ -454,7 +458,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
 }
 
 /// Makes one change to a group, after checking it is one the account may make.
-async fn edit_group(manager: &mut Library, key: [u8; 32], edit: super::manage::Edit) -> Result<(), String> {
+async fn edit_group(manager: &mut Library, key: [u8; 32], edit: super::manage::Edit) -> Result<presage::proto::GroupChange, String> {
     use presage::store::ContentsStore;
     let own = manager.registration_data().service_ids.aci();
     let group = manager.store().group(key).await.ok().flatten().ok_or("That group is not known to this account")?;
@@ -484,7 +488,7 @@ async fn edit_group(manager: &mut Library, key: [u8; 32], edit: super::manage::E
         }
     }
     let result = manager.change_group(key, |operations, group| super::manage::actions(operations, group, &own, &edit, added), now_ms()).await;
-    result.map(|_| ()).map_err(|e| explain(&e))
+    result.map(|(_, signed)| signed).map_err(|e| explain(&e))
 }
 
 /// Words for a group link that did not work.
