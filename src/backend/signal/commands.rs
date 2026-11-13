@@ -36,11 +36,38 @@ pub fn explain(error: &PresageError<super::store::SignalStoreError>) -> String {
     }
 }
 
+/// Puts the group's context on a message for a group: its master key and the revision the account knows. Without it
+/// the members' clients take the message for a one-to-one one (the library leaves this to its caller).
+pub fn in_group(body: ContentBody, key: &[u8; 32], revision: u32) -> ContentBody {
+    let context = || Some(presage::proto::GroupContextV2 { master_key: Some(key.to_vec()), revision: Some(revision), group_change: None });
+    match body {
+        ContentBody::DataMessage(mut dm) => {
+            if dm.group_v2.is_none() {
+                dm.group_v2 = context();
+            }
+            ContentBody::DataMessage(dm)
+        }
+        ContentBody::EditMessage(mut edit) => {
+            if let Some(dm) = edit.data_message.as_mut() {
+                if dm.group_v2.is_none() {
+                    dm.group_v2 = context();
+                }
+            }
+            ContentBody::EditMessage(edit)
+        }
+        other => other,
+    }
+}
+
 /// Sends `body` to `thread`. The error is already in words.
 async fn deliver(manager: &mut Library, thread: &Thread, body: impl Into<ContentBody>, at: u64) -> Result<(), String> {
     let sent = match thread {
         Thread::Contact(id) => manager.send_message(*id, body, at).await,
-        Thread::Group(key) => manager.send_message_to_group(key, body, at).await,
+        Thread::Group(key) => {
+            use presage::store::ContentsStore;
+            let revision = manager.store().group(*key).await.ok().flatten().map(|g| g.revision).unwrap_or(0);
+            manager.send_message_to_group(key, in_group(body.into(), key, revision), at).await
+        }
     };
     sent.map_err(|e| {
         tracing::info!("signal: a send failed: {e}");
@@ -284,3 +311,23 @@ pub fn quote_of(state: &AppState, buffer_id: &str, id: &str) -> Option<data_mess
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_for_a_group_carries_the_group_and_an_edit_does_too() {
+        let key = [3u8; 32];
+        let ContentBody::DataMessage(dm) = in_group(ContentBody::DataMessage(DataMessage { body: Some("hi".into()), ..Default::default() }), &key, 7) else { panic!() };
+        let context = dm.group_v2.unwrap();
+        assert_eq!((context.master_key.unwrap(), context.revision), (key.to_vec(), Some(7)));
+        let edit = EditMessage { target_sent_timestamp: Some(1), data_message: Some(DataMessage::default()) };
+        let ContentBody::EditMessage(edit) = in_group(ContentBody::EditMessage(edit), &key, 7) else { panic!() };
+        assert!(edit.data_message.unwrap().group_v2.is_some());
+        // A typing notice names its group its own way, and is left alone.
+        let typing = TypingMessage { timestamp: Some(1), action: Some(0), group_id: Some(vec![1]) };
+        assert!(matches!(in_group(ContentBody::TypingMessage(typing.clone()), &key, 7), ContentBody::TypingMessage(t) if t == typing));
+    }
+}
+
