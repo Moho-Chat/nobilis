@@ -887,6 +887,12 @@ impl AccountStore {
             || self.get_sneedchat(account_id).is_some()
             || self.get_matrix(account_id).is_some()
             || self.get_kick(account_id).is_some()
+            || self.get_steam(account_id).is_some()
+            || self.get_twitch(account_id).is_some()
+            || self.get_telegram(account_id).is_some()
+            || self.get_stoat(account_id).is_some()
+            || self.get_xmpp(account_id).is_some()
+            || self.get_signal(account_id).is_some()
     }
 
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
@@ -2826,5 +2832,30 @@ mod signal_account_tests {
         assert_eq!(mask_number(""), "");
         assert_eq!(mask_number("+1234"), "•••••");
         assert_eq!(mask_number("+4915112345678"), "+49•••••••••78");
+    }
+}
+
+#[cfg(test)]
+mod has_account_tests {
+    use super::*;
+
+    #[test]
+    fn every_service_s_account_is_known_so_its_conversations_are_put_back_at_start() {
+        let path = std::env::temp_dir().join(format!("nobilis-has-account-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = AccountStore::open(path.clone()).unwrap();
+        let ids = [
+            s.add_steam(SteamAccountConfig { username: "steamer".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_twitch(TwitchAccountConfig { login: "twitcher".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_telegram(TelegramAccountConfig { user_id: 42, ..Default::default() }).unwrap().account_id(),
+            s.add_stoat(StoatAccountConfig { user_id: "01STOAT".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_xmpp(XmppAccountConfig { jid: "alice@example.org".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_signal(SignalAccountConfig { aci: "00000000-0000-4000-8000-000000000009".into(), ..Default::default() }).unwrap().account_id(),
+        ];
+        for id in &ids {
+            assert!(s.has_account(id), "{id} is not known, so the layout restore drops its conversations");
+        }
+        assert!(!s.has_account("xmpp:nobody@example.org"));
+        let _ = std::fs::remove_file(&path);
     }
 }
