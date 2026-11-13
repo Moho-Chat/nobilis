@@ -5948,6 +5948,16 @@ pub async fn dispatch(
             }
         }
 
+        "sendSignalGif" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("sendSignalGif requires a Signal \"bufferId\"".to_string()));
+            };
+            match backend::signal::send::gif(state, &buffer, p_str(params, "url", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "signalGroup" | "signalGroupInfo" | "signalSetTimer" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
                 return (None, Some(format!("{method} requires a Signal \"bufferId\"")));

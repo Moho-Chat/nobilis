@@ -574,6 +574,62 @@ pub async fn vote(state: &AppState, buffer: &Buffer, choice: u32) -> Result<(), 
     Ok(())
 }
 
+/// The most a GIF picked from the picker may weigh: they are short loops, and a bigger one is not one.
+const BIGGEST_GIF: usize = 25 * 1024 * 1024;
+
+/// Sends a GIF from the window's picker the way Signal's clients do: the video itself, as an attachment marked GIF so
+/// it loops without sound, rather than a link to it. Fetched through the account's route.
+pub async fn gif(state: &AppState, buffer: &Buffer, url: &str) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let parsed = url::Url::parse(url).map_err(|_| "that is not a GIF's address".to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("that is not a GIF's address".to_string());
+    }
+    let router = crate::net::route::router();
+    let routed = router.routed(&buffer.account_id);
+    if routed {
+        router.ready(|_| {}).await.map_err(|e| format!("the route is not ready: {e:#}"))?;
+    }
+    let http = router.client_if("signal-gifs", routed, |b| b.timeout(Duration::from_secs(60)).user_agent(super::network::USER_AGENT));
+    let response = http.get(parsed).send().await.map_err(|e| format!("the GIF could not be fetched: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("the GIF could not be fetched ({})", response.status()));
+    }
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").split(';').next().unwrap_or("").trim().to_string();
+    let bytes = response.bytes().await.map_err(|e| format!("the GIF could not be fetched: {e}"))?;
+    if bytes.len() > BIGGEST_GIF {
+        return Err("that GIF is too big to send".to_string());
+    }
+    let content_type = match content_type.as_str() {
+        "video/mp4" | "image/gif" | "image/webp" | "video/webm" => content_type,
+        _ if url.ends_with(".mp4") => "video/mp4".to_string(),
+        _ => "image/gif".to_string(),
+    };
+    let name = if content_type == "video/mp4" { "gif.mp4" } else { "gif.gif" }.to_string();
+    let (done, answer) = oneshot::channel();
+    let upload = super::Upload { name, content_type, bytes: bytes.to_vec(), width: None, height: None };
+    handle.commands.send(Command::Upload { files: vec![upload], done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let mut pointers = wait(answer, Duration::from_secs(300)).await?;
+    for pointer in &mut pointers {
+        pointer.flags = Some(pointer.flags.unwrap_or(0) | 8);
+    }
+    let at = ask(&handle, |done| Command::Send { thread: thread.clone(), body: String::new(), ranges: Vec::new(), quote: None, attachments: pointers.clone(), done }).await?;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    let attachments = super::media::attachments_of(&buffer.account_id, &thread, &handle.own, at, &pointers);
+    // The file is on hand: it goes into the cache where the attachment will be looked for, so it is not fetched back.
+    if let Some(to) = attachments.first().and_then(|a| a.path.as_deref()).and_then(|p| p.strip_prefix("file://")) {
+        if let Some(parent) = std::path::Path::new(to).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(to, &bytes);
+    }
+    state.runtime.record_message_at(
+        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, "", false, "chat", None, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), attachments,
+        Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
+    );
+    Ok(())
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
