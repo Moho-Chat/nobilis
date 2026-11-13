@@ -99,6 +99,8 @@ pub enum Command {
     AskPhone(presage::proto::sync_message::request::Type),
     /// Take one of the account's own messages back for everyone.
     Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
+    /// Find who has a username.
+    LookUpUsername { name: String, done: tokio::sync::oneshot::Sender<Result<Option<uuid::Uuid>, String>> },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

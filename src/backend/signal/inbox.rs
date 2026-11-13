@@ -85,12 +85,54 @@ pub async fn want_profile(ctx: &Ctx<'_>, handle: &Handle, who: &Uuid) {
     }
 }
 
-/// Opens (or finds) the conversation with a person, named by their ACI.
+/// Opens (or finds) the conversation with a person, named by their ACI, their username (`name.42`, with or without an
+/// `@`), or a number the phone already knows. A number nobody has given the account is not looked up: that needs
+/// Signal's contact discovery, which moho does not do (see the plan's Round 12).
 pub async fn open_dm(state: &AppState, handle: &Handle, user_id: &str) -> anyhow::Result<String> {
-    let who = Uuid::parse_str(user_id.trim()).map_err(|_| anyhow::anyhow!("Signal needs the person's id, not their name"))?;
+    let wanted = user_id.trim();
+    let wanted = wanted.strip_prefix("p:").unwrap_or(wanted);
+    let who = match Uuid::parse_str(wanted) {
+        Ok(who) => who,
+        Err(_) => find_person(state, handle, wanted).await?,
+    };
     let ctx = Ctx::new(state, &handle.account_id, handle.store.clone(), handle.own);
     let thread = Thread::Contact(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(who)));
     Ok(people::buffer_for(&ctx, &thread).await.id)
+}
+
+/// Who a username or number names.
+async fn find_person(state: &AppState, handle: &Handle, wanted: &str) -> anyhow::Result<Uuid> {
+    let kept = super::storage::current(&handle.account_id, &handle.store);
+    let looks_like_number = wanted.starts_with('+') || wanted.chars().all(|c| c.is_ascii_digit() || " -().".contains(c));
+    if looks_like_number {
+        if let Some(who) = kept.person_with_number(wanted) {
+            return Ok(who);
+        }
+        // The old contact sync carries numbers too.
+        let digits: String = wanted.chars().filter(char::is_ascii_digit).collect();
+        if let Ok(contacts) = handle.store.contacts().await {
+            for contact in contacts.filter_map(Result::ok) {
+                if contact.phone_number.as_ref().is_some_and(|n| n.to_string().chars().filter(char::is_ascii_digit).collect::<String>() == digits) {
+                    return Ok(contact.uuid);
+                }
+            }
+        }
+        anyhow::bail!("Nobody with that number is in this account's contacts. Signal finds a number only through its contact discovery, which moho does not use: ask them for their username, or add them on your phone first");
+    }
+    let name = wanted.trim_start_matches('@');
+    if let Some(who) = kept.person_with_username(name) {
+        return Ok(who);
+    }
+    let (done, answer) = tokio::sync::oneshot::channel();
+    handle.commands.send(super::Command::LookUpUsername { name: name.to_string(), done }).map_err(|_| anyhow::anyhow!("that Signal account is not connected"))?;
+    let _ = state;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), answer).await {
+        Ok(Ok(Ok(Some(who)))) => Ok(who),
+        Ok(Ok(Ok(None))) => anyhow::bail!("Nobody on Signal has the username {name}. A username has a number after a dot, like name.42"),
+        Ok(Ok(Err(e))) => anyhow::bail!("{e}"),
+        Ok(Err(_)) => anyhow::bail!("the connection ended before Signal answered"),
+        Err(_) => anyhow::bail!("Signal did not answer in time"),
+    }
 }
 
 /// Opens a conversation for each group the account is in, so a quiet group is on the list too.

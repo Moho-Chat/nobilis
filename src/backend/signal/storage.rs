@@ -23,6 +23,9 @@ pub struct Standing {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// The person's number, when the phone knows it (international form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
     /// A note the account keeps about the person (Signal's "Note" on a contact).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -103,6 +106,7 @@ fn contact_standing(record: &ContactRecord) -> Standing {
     Standing {
         name: nickname.or(system),
         username: text(&record.username),
+        number: text(&record.e164),
         note: text(&record.note),
         blocked: record.blocked,
         accepted: record.whitelisted,
@@ -207,6 +211,22 @@ impl Kept {
             // Nobody the phone knows: a stranger.
             None => true,
         }
+    }
+
+    /// The person the phone knows by this number (digits compared, so spaces and dashes do not matter).
+    pub fn person_with_number(&self, number: &str) -> Option<Uuid> {
+        let digits = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>();
+        let wanted = digits(number);
+        if wanted.len() < 6 {
+            return None;
+        }
+        self.conversations.iter().find(|(remote, s)| remote.starts_with("p:") && s.number.as_deref().is_some_and(|n| digits(n) == wanted)).and_then(|(remote, _)| Uuid::parse_str(&remote[2..]).ok())
+    }
+
+    /// The person with this username, if the phone has them.
+    pub fn person_with_username(&self, username: &str) -> Option<Uuid> {
+        let wanted = username.trim_start_matches('@').to_lowercase();
+        self.conversations.iter().find(|(remote, s)| remote.starts_with("p:") && s.username.as_deref().is_some_and(|u| u.to_lowercase() == wanted)).and_then(|(remote, _)| Uuid::parse_str(&remote[2..]).ok())
     }
 
     /// The pinned position of a conversation, if it is pinned.
@@ -322,6 +342,10 @@ async fn arrived(ctx: &super::people::Ctx<'_>, handle: &super::Handle, kept: &Ke
     let now = now_ms();
     for buffer in ctx.state.runtime.list_buffers().into_iter().filter(|b| b.account_id == ctx.account_id) {
         let Some(remote) = buffer.remote_id.as_deref() else { continue };
+        // Marked unread on the phone: counted as one waiting here, as Signal's clients draw it.
+        if kept.standing(remote).is_some_and(|s| s.marked_unread) && buffer.unread_seed == 0 {
+            ctx.state.runtime.set_buffer_unread(ctx.state, &buffer.id, 1, 0);
+        }
         let muted = kept.standing(remote).is_some_and(|s| s.muted(now));
         if muted {
             ctx.state.runtime.set_notify_level(ctx.state, &buffer.id, crate::notify::NotifyLevel::Mute, crate::notify::NotifyLevel::Mute);
@@ -376,6 +400,7 @@ mod tests {
                 c.whitelisted = true;
                 c.muted_until_timestamp = u64::MAX;
                 c.username = "sam.01".into();
+                c.e164 = "+15550100123".into();
             }),
             contact(B, |c| {
                 c.system_nickname = "Bee".into();
@@ -389,6 +414,9 @@ mod tests {
         let b = kept.standing(&format!("p:{B}")).unwrap();
         assert_eq!((b.name.as_deref(), b.blocked, b.archived, b.accepted), (Some("Bee"), true, true, false));
         assert!(kept.blocked(&format!("p:{B}")));
+        assert_eq!(kept.person_with_number("+1 555-010-0123"), Some(Uuid::parse_str(A).unwrap()));
+        assert_eq!(kept.person_with_number("0123"), None, "too short to mean anybody");
+        assert_eq!(kept.person_with_username("@Sam.01"), Some(Uuid::parse_str(A).unwrap()));
     }
 
     #[test]

@@ -206,6 +206,15 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::LookUpUsername { name, done } => {
+                let result = match manager.lookup_username(&name).await {
+                    Ok(found) => Ok(found.map(uuid::Uuid::from)),
+                    // A name that cannot be a username at all is said as such, not as a network failure.
+                    Err(PresageError::InvalidUsername(_)) => Err(format!("{name} is not a Signal username: one is a name, a dot and a number, like name.42")),
+                    Err(e) => Err(explain(&e)),
+                };
+                let _ = done.send(result);
+            }
             Command::AnswerRequest { thread, answer, done } => {
                 let at = now_ms();
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
