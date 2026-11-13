@@ -14,5 +14,8 @@ What is changed, and nothing else:
 - `src/groups_v2/operations.rs`: a few encryption helpers made public (`encrypt_aci`, `encrypt_service_id`,
   `encrypt_profile_key`, `decrypt_title`, `decrypt_description_text`, `decrypt_disappearing_messages_timer`).
 - `Cargo.toml`: reqwest's `socks` feature.
+- `src/account_manager.rs`, `update_device_name`: the name is encrypted to the account's own identity key (from the
+  identity key pair), as Signal's clients do; upstream looked the account up among the identities it had seen, which
+  a freshly linked device has not yet, so renaming it failed.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

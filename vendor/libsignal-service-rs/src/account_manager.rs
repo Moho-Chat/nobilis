@@ -616,13 +616,14 @@ impl AccountManager {
         aci_identity_store: &dyn IdentityKeyStore,
         csprng: &mut R,
     ) -> Result<(), ServiceError> {
-        let addr = aci.to_protocol_address(device_id).unwrap();
-        let public_key = aci_identity_store.get_identity(&addr).await?;
-        let Some(public_key) = public_key else {
-            return Err(ServiceError::SendError {
-                reason: format!("public key for device {addr:?} not found"),
-            });
-        };
+        // moho: encrypted to the account's own identity key, as Signal's clients do. Upstream looked the account up
+        // among the identities it has seen, which a freshly linked device has not yet - so renaming it failed ("public
+        // key for device ... not found") until a message from the account's own phone had been saved.
+        let _ = aci;
+        let public_key = *aci_identity_store
+            .get_identity_key_pair()
+            .await?
+            .identity_key();
         let encrypted_device_name =
             encrypt_device_name(csprng, device_name, &public_key)?;
 
