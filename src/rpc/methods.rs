@@ -115,6 +115,12 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_stoat(id) {
             backend::stoat::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("signal:") {
+        // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
+        // where an account set to strict Tor stayed on its direct connection).
+        if let Some(cfg) = state.accounts.get_signal(id) {
+            backend::signal::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
