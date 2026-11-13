@@ -630,7 +630,8 @@ impl<S: Store> Manager<S, Registered> {
         let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
         let mut actions = build(&operations, &before).map_err(Error::GroupChange)?;
         actions.version = before.revision + 1;
-        actions.group_id = secret_params.get_group_identifier().to_vec();
+        // The group id is the server's to fill in: a change that sets it is refused (HTTP 400, "requested actions must not
+        // set group id", seen on the first real account).
         let authorization = groups_manager
             .get_authorization_for_today(&mut rng(), secret_params)
             .await?;
@@ -852,7 +853,7 @@ impl<S: Store> Manager<S, Registered> {
         let direct = info.add_from_invite_link() == AccessRequired::Any;
         let mut change = libsignal_service::proto::group_change::Actions {
             version: info.version + 1,
-            group_id: secret_params.get_group_identifier().to_vec(),
+            // Not group_id: the server fills it in, and refuses a change that sets it.
             ..Default::default()
         };
         if direct {

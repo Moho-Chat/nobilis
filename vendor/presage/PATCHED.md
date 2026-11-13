@@ -19,6 +19,8 @@ What is changed, and nothing else:
   `profile_key_credential` (adding somebody directly), `group_link_info` and `join_group_by_link`.
   `create_group` sends the access rules Signal's clients make a group with (members edit and add, no joining by
   link): unset, the server answers HTTP 400.
+  A change (and a join by link) leaves the actions' `group_id` empty: the server fills it in and refuses a change
+  that sets it (HTTP 400).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the
