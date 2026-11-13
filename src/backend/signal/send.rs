@@ -506,6 +506,38 @@ pub async fn verify(state: &AppState, account_id: &str, user_id: &str, verified:
     wait(answer, Duration::from_secs(60)).await
 }
 
+/// The account's own profile as Signal has it: name parts, about, about emoji, username.
+pub async fn own_profile(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    use presage::store::ContentsStore;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let id = presage::libsignal_service::protocol::ServiceId::Aci(handle.own.into());
+    let profile = match handle.store.profile_key(&id).await.ok().flatten() {
+        Some(key) => handle.store.profile(handle.own, key).await.ok().flatten(),
+        None => None,
+    };
+    let kept = super::storage::current(account_id, &handle.store);
+    let (given, family) = profile.as_ref().and_then(|p| p.name.as_ref()).map(|n| (n.given_name.clone(), n.family_name.clone().unwrap_or_default())).unwrap_or_default();
+    Ok(serde_json::json!({
+        "given": given,
+        "family": family,
+        "about": profile.as_ref().and_then(|p| p.about.clone()).unwrap_or_default(),
+        "emoji": profile.as_ref().and_then(|p| p.about_emoji.clone()).unwrap_or_default(),
+        "username": kept.own_username,
+    }))
+}
+
+/// Changes the account's own profile.
+pub async fn set_profile(state: &AppState, account_id: &str, params: &serde_json::Value) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let text = |name: &str| params.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if text("given").trim().is_empty() {
+        return Err("Signal needs at least a first name".to_string());
+    }
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::SetProfile { given: text("given"), family: text("family"), about: text("about"), emoji: text("emoji"), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(60)).await
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

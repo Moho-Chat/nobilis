@@ -117,6 +117,8 @@ pub enum Command {
     Block { thread: presage::store::Thread, blocked: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Mark a person's safety number verified (or take that back), on every device of the account.
     Verify { who: uuid::Uuid, verified: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Change the account's own profile (the name and about others see); the phone is told to fetch it.
+    SetProfile { given: String, family: String, about: String, emoji: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

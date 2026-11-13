@@ -5981,6 +5981,21 @@ pub async fn dispatch(
             }
         }
 
+        "signalOwnProfile" | "signalSetProfile" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let result = if method == "signalOwnProfile" {
+                backend::signal::send::own_profile(state, account_id).await
+            } else {
+                backend::signal::send::set_profile(state, account_id, params).await.map(|()| ok_node())
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "signalBlock" | "signalVerify" => {
             let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
                 return (None, Some(format!("{method} requires a Signal \"accountId\"")));

@@ -233,6 +233,23 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::SetProfile { given, family, about, emoji, done } => {
+                use presage::libsignal_service::profile_name::ProfileName;
+                let name = ProfileName { given_name: given.trim().to_string(), family_name: Some(family.trim().to_string()).filter(|f| !f.is_empty()) };
+                let text = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+                let mut result = manager.update_profile(name, text(about), text(emoji)).await.map_err(|e| explain(&e));
+                if result.is_ok() {
+                    // The account's other devices fetch the profile again, as Signal's clients ask them to.
+                    let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32) };
+                    let sync = SyncMessage { content: Some(sync_message::Content::FetchLatest(fetch)), ..Default::default() };
+                    let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                    result = manager.send_message(own, sync, now_ms()).await.map_err(|e| explain(&e));
+                    let own_aci = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own_aci);
+                    super::inbox::profile_arrived(&ctx, &own_aci).await;
+                }
+                let _ = done.send(result);
+            }
             Command::Block { thread, blocked, done } => {
                 let remote = super::ids::remote_id(&thread);
                 let store = manager.store().clone();
