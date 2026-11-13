@@ -41,7 +41,8 @@ pub fn extension_of(name: Option<&str>, content_type: Option<&str>) -> String {
         "video/webm" => "webm",
         "audio/mpeg" => "mp3",
         "audio/ogg" | "audio/opus" => "ogg",
-        "audio/mp4" | "audio/aac" => "m4a",
+        "audio/mp4" => "m4a",
+        "audio/aac" => "aac",
         "audio/webm" => "webm",
         "application/pdf" => "pdf",
         _ => "bin",
@@ -192,6 +193,8 @@ mod tests {
         assert_eq!(extension_of(Some("cat.JPG"), None), "jpg");
         assert_eq!(extension_of(None, Some("image/webp")), "webp");
         assert_eq!(extension_of(Some("noext"), Some("audio/ogg")), "ogg");
+        assert_eq!(extension_of(None, Some("audio/mp4")), "m4a");
+        assert_eq!(extension_of(None, Some("audio/aac")), "aac");
         assert_eq!(extension_of(Some("a.way-too-long-extension"), None), "bin");
     }
 }

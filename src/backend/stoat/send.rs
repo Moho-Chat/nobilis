@@ -84,6 +84,9 @@ pub fn content_type_of(name: &str) -> &'static str {
         "webm" => "video/webm",
         "mp3" => "audio/mpeg",
         "ogg" | "opus" => "audio/ogg",
+        // An .m4a is audio in an MP4 container; a bare .aac is the raw stream.
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
         "wav" => "audio/wav",
         "txt" => "text/plain",
         "pdf" => "application/pdf",
@@ -259,6 +262,8 @@ mod tests {
         assert_eq!(sent_name("/home/me/SPOILER_cat.png", true), "SPOILER_cat.png", "not twice");
         assert_eq!(content_type_of("a.JPG"), "image/jpeg");
         assert_eq!(content_type_of("a.unknown"), "application/octet-stream");
+        assert_eq!(content_type_of("song.m4a"), "audio/mp4");
+        assert_eq!(content_type_of("raw.AAC"), "audio/aac");
     }
 
     #[test]
