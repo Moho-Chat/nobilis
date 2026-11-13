@@ -71,6 +71,9 @@ fn dimensions_of(path: &str, content_type: &str) -> (Option<u32>, Option<u32>) {
 
 /// Sends text and files: `paths` are put on Signal's servers first, then the message carries them.
 pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+    if buffer.remote_id.as_deref() == Some(super::stories::REMOTE) {
+        return story_reply(state, buffer, body, paths, reply_to).await;
+    }
     let (handle, thread) = target(state, buffer)?;
     // In a group, `@Name` for a member is a mention, which Signal carries as a character and a range over it.
     let (body, mentioned) = match &thread {
@@ -174,8 +177,48 @@ fn name_here(state: &AppState, buffer: &Buffer, author: &uuid::Uuid, handle: &Ha
         .unwrap_or_default()
 }
 
+/// Answers a story in words: the reply goes to the person who posted it, in the conversation with them, and is shown
+/// there as Signal's clients show it.
+async fn story_reply(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
+    let story = reply_to.ok_or("Stories are answered one at a time: reply to the story you mean")?;
+    if !paths.is_empty() {
+        return Err("A story is answered in words or with a reaction, not with a file".to_string());
+    }
+    let (thread, context) = super::stories::context_of(story).ok_or("that is not a story")?;
+    if ids::uuid_of(match &thread {
+        Thread::Contact(id) => id,
+        Thread::Group(_) => return Err("that is not a story".to_string()),
+    }) == handle.own
+    {
+        return Err("That is your own story".to_string());
+    }
+    let (plain, _) = compose::parse(body);
+    if plain.trim().is_empty() {
+        return Err("there is nothing to send".to_string());
+    }
+    let words = plain.clone();
+    let at = ask(&handle, |done| Command::StoryAnswer { thread: thread.clone(), context, body: Some(words), emoji: None, done }).await?;
+    // Drawn in the conversation with them, where Signal's clients put it, saying what it answers.
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    let theirs = super::people::buffer_for(&ctx, &thread).await;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    state.runtime.record_message_at(
+        state, &theirs.account_id, &theirs.name, &theirs.kind, &own, &format!("[Reply to a story]\n{plain}"), false, "chat", None, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(),
+        Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
+    );
+    Ok(())
+}
+
 /// Reacts to message `msg_id`, or takes the reaction back.
 pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str, add: bool) -> Result<(), String> {
+    if buffer.remote_id.as_deref() == Some(super::stories::REMOTE) {
+        let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
+        let (thread, context) = super::stories::context_of(msg_id).ok_or("that is not a story")?;
+        ask(&handle, |done| Command::StoryAnswer { thread, context, body: None, emoji: Some((emoji.to_string(), !add)), done }).await?;
+        state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
+        return Ok(());
+    }
     let (handle, thread) = target(state, buffer)?;
     let (target_ms, target_author) = ids::parse_message_id(msg_id).ok_or("that is not a Signal message")?;
     let emoji_owned = emoji.to_string();

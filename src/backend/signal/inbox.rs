@@ -231,7 +231,14 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         ContentBody::ReceiptMessage(receipt) => receipt_seen(&ctx, handle, &content, receipt).await,
         ContentBody::NullMessage(_) => {}
         ContentBody::CallMessage(_) => tracing::debug!("signal[{}]: a call message (calls are not handled yet)", ctx.account_id),
-        ContentBody::StoryMessage(_) => tracing::debug!("signal[{}]: a story (stories are not handled yet)", ctx.account_id),
+        ContentBody::StoryMessage(story) => {
+            // Nothing from somebody blocked; a story is otherwise shown whoever posted it, as Signal's clients do for
+            // the people the account has accepted (a stranger's do not reach it).
+            let blocked = super::storage::current(ctx.account_id, &ctx.store).blocked(&format!("p:{sender}"));
+            if !blocked {
+                super::stories::arrived(&ctx, sender, sent_at, story).await;
+            }
+        }
         ContentBody::DecryptionErrorMessage(_) => {}
     }
 }
@@ -518,6 +525,11 @@ async fn sent_from_phone(ctx: &Ctx<'_>, content: &Content, sent: &Sent) {
         super::requests::apply(ctx, &thread, super::requests::Answer::Accept).await;
     }
     let at = sent.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis().max(0) as u64);
+    if let Some(story) = &sent.story_message {
+        // A story the account posted from the phone.
+        super::stories::arrived(ctx, ctx.own, at, story).await;
+        return;
+    }
     if let Some(dm) = &sent.message {
         data_message(ctx, &thread, ctx.own, at, dm).await;
     } else if let Some(edit) = &sent.edit_message {
@@ -564,6 +576,17 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         system(ctx, &buffer, &words, at);
         let mut store = ctx.store.clone();
         let _ = presage::store::ContentsStore::update_expire_timer(&mut store, thread, timer, dm.expire_timer_version.unwrap_or(1)).await;
+        return;
+    }
+    if let (Some(reaction), Some(_)) = (&dm.reaction, &dm.story_context) {
+        // A reaction to a story: on the story, and said in the conversation, as Signal's clients say it.
+        let stories = super::stories::buffer(ctx);
+        reacted(ctx, &stories, author, reaction);
+        if !reaction.remove.unwrap_or(false) {
+            let who = people::person(ctx, &author).await;
+            let whose = if reaction.target_author_aci.as_deref() == Some(ctx.own.to_string().as_str()) { "your" } else { "a" };
+            system(ctx, &buffer, &format!("{who} reacted {} to {whose} story", reaction.emoji.as_deref().unwrap_or("")), at);
+        }
         return;
     }
     if let Some(reaction) = &dm.reaction {

@@ -30,6 +30,7 @@ pub mod requests;
 pub mod send;
 pub mod storage;
 pub mod store;
+pub mod stories;
 pub mod unlink;
 
 pub use connect::spawn;
@@ -122,6 +123,8 @@ pub enum Command {
     SetProfile { given: String, family: String, about: String, emoji: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Vote in a poll (a DataMessage carrying the vote).
     Vote { thread: presage::store::Thread, vote: presage::proto::data_message::PollVote, done: Done },
+    /// Answer a story: a reply in words or a reaction, sent to its author naming the story.
+    StoryAnswer { thread: presage::store::Thread, context: presage::proto::data_message::StoryContext, body: Option<String>, emoji: Option<(String, bool)>, done: Done },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

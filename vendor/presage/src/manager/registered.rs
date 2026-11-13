@@ -253,7 +253,8 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                // moho: stories are shown (see the application's stories view), so the server is told to deliver them.
+                let headers = &[("X-Signal-Receive-Stories", "true")];
                 let ws = self
                     .identified_push_service()
                     .ws(

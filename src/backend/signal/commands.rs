@@ -233,6 +233,19 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
+            Command::StoryAnswer { thread, context, body, emoji, done } => {
+                let at = now_ms();
+                let reaction = emoji.map(|(emoji, remove)| data_message::Reaction {
+                    emoji: Some(emoji),
+                    remove: Some(remove),
+                    target_author_aci: context.author_aci.clone(),
+                    target_author_aci_binary: context.author_aci_binary.clone(),
+                    target_sent_timestamp: context.sent_timestamp,
+                });
+                let dm = DataMessage { body, reaction, story_context: Some(context), timestamp: Some(at), ..Default::default() };
+                let result = deliver(&mut manager, &thread, dm, at).await;
+                finish(done, result, at);
+            }
             Command::Vote { thread, vote, done } => {
                 let at = now_ms();
                 let dm = DataMessage { poll_vote: Some(vote), timestamp: Some(at), ..Default::default() };

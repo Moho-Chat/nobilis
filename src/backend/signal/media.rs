@@ -206,8 +206,9 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
     let thread = source["thread"].as_str().and_then(ids::parse_remote_id).context("no conversation was recorded for this file")?;
     let ts = source["ts"].as_u64().context("no time was recorded for this file")?;
     let index = source["index"].as_u64().unwrap_or(0) as usize;
+    let author = source["author"].as_str().and_then(|a| Uuid::parse_str(a).ok());
     let handle = state.runtime.signal_handle(account).ok_or_else(|| anyhow!("that Signal account is not connected"))?;
-    let bytes = fetch(&handle, thread, ts, index).await?;
+    let bytes = fetch(&handle, thread, ts, index, author).await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -217,8 +218,13 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-async fn fetch(handle: &Handle, thread: Thread, ts: u64, index: usize) -> Result<Vec<u8>> {
-    let pointer = pointer_for(&handle.store, &thread, ts, index).await.ok_or_else(|| anyhow!("the message that carried this file is no longer kept"))?;
+async fn fetch(handle: &Handle, thread: Thread, ts: u64, index: usize, author: Option<Uuid>) -> Result<Vec<u8>> {
+    // A story's picture is kept by moho, the library keeping no stories.
+    let pointer = match pointer_for(&handle.store, &thread, ts, index).await {
+        Some(pointer) => Some(pointer),
+        None => author.and_then(|a| super::stories::pointer(&handle.store, ts, &a)),
+    };
+    let pointer = pointer.ok_or_else(|| anyhow!("the message that carried this file is no longer kept"))?;
     let (done, answer) = oneshot::channel();
     handle.commands.send(Command::Fetch { pointer: Box::new(pointer), done }).map_err(|_| anyhow!("that Signal account is not connected"))?;
     match tokio::time::timeout(PATIENCE, answer).await {
