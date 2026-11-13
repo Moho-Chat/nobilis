@@ -105,6 +105,16 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_xmpp(id) {
             backend::xmpp::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("telegram:") {
+        // Telegram and Stoat were missing here, so changing their route (or restarting Tor) left the old connection
+        // running on the old path until the next restart.
+        if let Some(cfg) = state.accounts.get_telegram(id) {
+            backend::telegram::connect::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("stoat:") {
+        if let Some(cfg) = state.accounts.get_stoat(id) {
+            backend::stoat::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
