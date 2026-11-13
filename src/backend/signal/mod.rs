@@ -23,6 +23,7 @@ pub mod media;
 pub mod memory;
 pub mod network;
 pub mod people;
+pub mod polls;
 pub mod profile;
 pub mod ranges;
 pub mod requests;
@@ -119,6 +120,8 @@ pub enum Command {
     Verify { who: uuid::Uuid, verified: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Change the account's own profile (the name and about others see); the phone is told to fetch it.
     SetProfile { given: String, family: String, about: String, emoji: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Vote in a poll (a DataMessage carrying the vote).
+    Vote { thread: presage::store::Thread, vote: presage::proto::data_message::PollVote, done: Done },
     /// Read the storage service again, if it changed.
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.

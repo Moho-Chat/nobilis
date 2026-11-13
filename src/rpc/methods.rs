@@ -6638,6 +6638,17 @@ pub async fn dispatch(
                     };
                 }
 
+                // A Signal poll is a message too; the vote is a message naming it.
+                if buffer.account_id.starts_with("signal:") {
+                    return match u32::try_from(option_id) {
+                        Ok(choice) => match backend::signal::send::vote(state, &buffer, choice).await {
+                            Ok(()) => (Some(ok_node()), None),
+                            Err(e) => (None, Some(e)),
+                        },
+                        Err(_) => (None, Some("votePoll requires \"optionId\"".to_string())),
+                    };
+                }
+
                 // Discord's poll is part of a message, so the card's id is
                 // the message id and the vote is addressed to it. Nothing
                 // comes back but an acknowledgement: the recounted tally

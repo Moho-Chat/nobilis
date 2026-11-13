@@ -570,6 +570,17 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         reacted(ctx, &buffer, author, reaction);
         return;
     }
+    if let Some(vote) = &dm.poll_vote {
+        super::polls::voted(ctx, &buffer, &author, vote);
+        return;
+    }
+    if let Some(end) = &dm.poll_terminate {
+        super::polls::ended(ctx, &buffer, &author, end);
+        return;
+    }
+    if let Some(create) = &dm.poll_create {
+        super::polls::created(ctx, &buffer, &author, at, create);
+    }
     if let Some(delete) = &dm.delete {
         if let Some(target) = delete.target_sent_timestamp {
             // Only the author can take a message back.

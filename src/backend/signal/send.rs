@@ -563,6 +563,17 @@ pub async fn settings(state: &AppState, account_id: &str) -> Result<serde_json::
     }))
 }
 
+/// Votes for option `choice` of the conversation's open poll.
+pub async fn vote(state: &AppState, buffer: &Buffer, choice: u32) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let poll_id = state.runtime.live_card(&buffer.id, "poll").and_then(|c| c["id"].as_str().map(String::from)).ok_or("there is no poll open here")?;
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    let (vote, poll) = super::polls::own_vote(&ctx, &poll_id, choice)?;
+    ask(&handle, |done| Command::Vote { thread, vote, done }).await?;
+    super::polls::keep_own(&ctx, buffer, &poll_id, &poll);
+    Ok(())
+}
+
 /// The message requests waiting on an account.
 pub async fn requests(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
