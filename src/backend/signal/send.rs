@@ -676,6 +676,41 @@ pub async fn vote(state: &AppState, buffer: &Buffer, choice: u32) -> Result<(), 
     Ok(())
 }
 
+/// The most answers a poll takes, as Signal's clients allow.
+pub const MOST_POLL_ANSWERS: usize = 10;
+
+/// What a poll asks, checked: a question and from two to ten answers, none empty.
+pub fn poll_of(question: &str, answers: &[String], multiple: bool) -> Result<presage::proto::data_message::PollCreate, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("A poll needs a question".to_string());
+    }
+    let options: Vec<String> = answers.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+    if options.len() < 2 {
+        return Err("A poll needs at least two answers".to_string());
+    }
+    if options.len() > MOST_POLL_ANSWERS {
+        return Err(format!("A Signal poll takes at most {MOST_POLL_ANSWERS} answers"));
+    }
+    Ok(presage::proto::data_message::PollCreate { question: Some(question.to_string()), options, allow_multiple: Some(multiple) })
+}
+
+/// Asks a poll in the conversation, drawn here on the poll card at once as it is on the other devices.
+pub async fn start_poll(state: &AppState, buffer: &Buffer, question: &str, answers: &[String], multiple: bool) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let create = poll_of(question, answers, multiple)?;
+    let sent = create.clone();
+    let at = ask(&handle, |done| Command::Poll { thread, create: sent, done }).await?;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    let line = format!("[Poll: {}]", create.question.clone().unwrap_or_default());
+    state.runtime.record_message_at(
+        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &line, false, "chat", None, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
+    );
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    super::polls::created(&ctx, buffer, &handle.own, at, &create);
+    Ok(())
+}
+
 /// The most a GIF picked from the picker may weigh: they are short loops, and a bigger one is not one.
 const BIGGEST_GIF: usize = 25 * 1024 * 1024;
 
@@ -817,6 +852,18 @@ pub async fn answer_request(state: &AppState, account_id: &str, id: &str, answer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_poll_asks_a_question_with_two_to_ten_answers() {
+        let answers = |n: usize| (1..=n).map(|i| format!(" answer {i} ")).collect::<Vec<_>>();
+        let poll = poll_of(" Lunch? ", &answers(3), true).unwrap();
+        assert_eq!((poll.question.as_deref(), poll.options.len(), poll.options[0].as_str(), poll.allow_multiple), (Some("Lunch?"), 3, "answer 1", Some(true)));
+        assert!(poll_of("", &answers(2), false).is_err());
+        assert!(poll_of("Lunch?", &answers(1), false).is_err());
+        assert!(poll_of("Lunch?", &[" ".to_string(), "Soup".to_string()], false).is_err(), "an empty answer is not one");
+        assert!(poll_of("Lunch?", &answers(10), false).is_ok());
+        assert!(poll_of("Lunch?", &answers(11), false).is_err());
+    }
 
     #[test]
     fn a_change_of_timer_is_said_as_signal_says_it() {

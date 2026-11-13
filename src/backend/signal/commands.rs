@@ -283,6 +283,12 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
+            Command::Poll { thread, create, done } => {
+                let at = now_ms();
+                let dm = DataMessage { poll_create: Some(create), timestamp: Some(at), ..Default::default() };
+                let result = deliver(&mut manager, &thread, dm, at).await;
+                finish(done, result, at);
+            }
             Command::SetProfile { given, family, about, emoji, done } => {
                 use presage::libsignal_service::profile_name::ProfileName;
                 let name = ProfileName { given_name: given.trim().to_string(), family_name: Some(family.trim().to_string()).filter(|f| !f.is_empty()) };
