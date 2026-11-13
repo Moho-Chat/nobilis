@@ -513,10 +513,14 @@ async fn deleted_on_phone(ctx: &Ctx<'_>, deletes: &presage::proto::sync_message:
         let remote = ids::remote_id(&thread);
         let buffer = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str()));
         for (sent, author) in delete.messages.iter().filter_map(addressed) {
+            // An edited message is named by its newest revision (seen on the first real account); moho and the library
+            // keep it under its first send.
+            let id = super::revisions::original(&ctx.store, &ids::message_id(sent, &author));
+            let first = ids::parse_message_id(&id).map(|(ms, _)| ms).unwrap_or(sent);
             if let Some(buffer) = &buffer {
-                ctx.state.runtime.delete_message(ctx.state, &buffer.id, &ids::message_id(sent, &author));
+                ctx.state.runtime.delete_message(ctx.state, &buffer.id, &id);
             }
-            let _ = presage::store::ContentsStore::delete_message(&mut store, &thread, sent).await;
+            let _ = presage::store::ContentsStore::delete_message(&mut store, &thread, first).await;
         }
     }
     let whole = deletes.conversation_deletes.iter().filter_map(|d| d.conversation.as_ref()).chain(deletes.local_only_conversation_deletes.iter().filter_map(|d| d.conversation.as_ref()));
@@ -1117,6 +1121,29 @@ mod tests {
         let take_back = DataMessage { delete: Some(data_message::Delete { target_sent_timestamp: Some(1_700_000_022_000) }), ..Default::default() };
         data_message(&ctx, &thread, uuid(ALICE), 1_700_000_025_000, &take_back).await;
         assert!(backlog(&state, &buffer).iter().all(|m| m.id != original));
+    }
+
+    #[tokio::test]
+    async fn an_edited_message_deleted_on_the_phone_by_its_newest_revision_goes_here_too() {
+        use presage::proto::{addressable_message::Author, conversation_identifier::Identifier, sync_message::delete_for_me::MessageDeletes, sync_message::DeleteForMe, AddressableMessage, ConversationIdentifier};
+        let (state, store) = world("delete-for-me").await;
+        let ctx = ctx(&state, &store);
+        let thread = person(ME);
+        data_message(&ctx, &thread, uuid(ME), 1_700_000_030_000, &text("first", 1_700_000_030_000)).await;
+        edited(&ctx, &thread, uuid(ME), &EditMessage { target_sent_timestamp: Some(1_700_000_030_000), data_message: Some(text("second", 1_700_000_031_000)) }).await;
+        data_message(&ctx, &thread, uuid(ME), 1_700_000_032_000, &text("stays", 1_700_000_032_000)).await;
+        let buffer = only_buffer(&state);
+        // As the phone sent it on the first real account: Note to Self, the message named by its edit's time.
+        let deletes = DeleteForMe {
+            message_deletes: vec![MessageDeletes {
+                conversation: Some(ConversationIdentifier { identifier: Some(Identifier::ThreadServiceId(ME.into())) }),
+                messages: vec![AddressableMessage { author: Some(Author::AuthorServiceId(ME.into())), sent_timestamp: Some(1_700_000_031_000) }],
+            }],
+            ..Default::default()
+        };
+        deleted_on_phone(&ctx, &deletes).await;
+        let rows = backlog(&state, &buffer);
+        assert_eq!(rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["stays"]);
     }
 
     #[tokio::test]
