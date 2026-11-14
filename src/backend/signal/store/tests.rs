@@ -83,6 +83,8 @@ fn group(title: &str) -> Group {
         requesting_members: vec![],
         invite_link_password: vec![1, 2, 3],
         description: Some("about".into()),
+        announcements_only: true,
+        banned: vec![presage::model::groups::BannedMember { uuid: uuid::Uuid::from_u128(7), service_id_type: Default::default(), timestamp: 12 }],
     }
 }
 
@@ -438,6 +440,8 @@ async fn groups_are_saved_and_listed_and_leaving_is_forgotten_when_one_is_saved_
     let back = s.group(key).await?.unwrap();
     assert_eq!((back.title.as_str(), back.revision, back.invite_link_password.as_slice()), ("Hikers", 3, &[1, 2, 3][..]));
     assert_eq!(back.description.as_deref(), Some("about"));
+    assert!(back.announcements_only);
+    assert_eq!((back.banned.len(), back.banned[0].uuid, back.banned[0].timestamp), (1, uuid::Uuid::from_u128(7), 12));
 
     s.save_group_avatar(key, &vec![9, 9]).await?;
     // Saving the group again (a newer revision) does not lose the picture kept for it.
@@ -587,7 +591,7 @@ fn a_store_made_before_disappearing_messages_gets_the_table() {
     let s = SignalStore::open(&path, OnNewIdentity::Trust).unwrap();
     assert_eq!(s.expiry_count().unwrap(), 0);
     let version: i64 = s.read(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?)).unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, schema::KNOWN_VERSION);
 }
 
 #[tokio::test]

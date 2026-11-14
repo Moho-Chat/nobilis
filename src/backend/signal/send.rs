@@ -83,6 +83,11 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         return story_reply(state, buffer, body, paths, reply_to).await;
     }
     let (handle, thread) = target(state, buffer)?;
+    if let Thread::Group(key) = &thread {
+        if let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, *key).await {
+            may_send(&group, &handle.own)?;
+        }
+    }
     // In a group, `@Name` for a member is a mention, which Signal carries as a character and a range over it.
     let (body, mentioned) = match &thread {
         Thread::Group(key) => compose::mentions(body, &members_of(state, buffer, &handle, key).await),
@@ -181,6 +186,16 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     if let Some(seconds) = timer {
         let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
         super::expiry::from_sent(&ctx, &buffer.id, &noted_thread, &ids::message_id(at, &handle.own), at, seconds);
+    }
+    Ok(())
+}
+
+/// Whether the account may say something in a group: only admins may when the group is set so.
+fn may_send(group: &presage::model::groups::Group, own: &uuid::Uuid) -> Result<(), String> {
+    use presage::libsignal_service::groups_v2::Role;
+    let admin = group.members.iter().any(|m| uuid::Uuid::from(m.aci) == *own && matches!(m.role, Role::Administrator));
+    if group.announcements_only && !admin {
+        return Err("Only admins can send messages in this group".to_string());
     }
     Ok(())
 }
@@ -421,6 +436,8 @@ pub fn edit_of(params: &serde_json::Value) -> Result<super::manage::Edit, String
             Edit::Add(people)
         }
         "remove" => Edit::Remove(uuid_param(params, "userId")?),
+        "ban" => Edit::Ban(uuid_param(params, "userId")?),
+        "unban" => Edit::Unban(uuid_param(params, "userId")?),
         "admin" => Edit::Admin(uuid_param(params, "userId")?, flag("admin")),
         "uninvite" => Edit::Uninvite(uuid_param(params, "userId")?),
         "approve" => Edit::Approve(uuid_param(params, "userId")?, flag("accept")),
@@ -528,6 +545,10 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         let who = uuid::Uuid::from(m.aci);
         members.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, &who).await, "admin": matches!(m.role, Role::Administrator), "me": m.aci == own }));
     }
+    let mut banned = Vec::new();
+    for b in &group.banned {
+        banned.push(serde_json::json!({ "userId": b.uuid.to_string(), "nick": super::people::person(&ctx, &b.uuid).await }));
+    }
     let mut pending = Vec::new();
     for p in &group.pending_members {
         pending.push(serde_json::json!({ "userId": p.uuid.to_string(), "nick": super::people::person(&ctx, &p.uuid).await, "mine": p.added_by_aci == own }));
@@ -547,6 +568,8 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         "members": members,
         "requesting": requesting,
         "pending": pending,
+        "banned": banned,
+        "announcementsOnly": group.announcements_only,
     }))
 }
 

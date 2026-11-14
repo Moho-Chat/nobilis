@@ -1063,7 +1063,7 @@ mod tests {
         let writer = store.clone();
         let key = [7u8; 32];
         writer
-            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None })
+            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None, announcements_only: false, banned: Vec::new() })
             .await
             .unwrap();
         let ctx = ctx(&state, &store);
@@ -1091,7 +1091,7 @@ mod tests {
         let writer = store.clone();
         let key = [5u8; 32];
         writer
-            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None })
+            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None, announcements_only: false, banned: Vec::new() })
             .await
             .unwrap();
         let ctx = ctx(&state, &store);
@@ -1114,7 +1114,7 @@ mod tests {
         let writer = store.clone();
         let key = [9u8; 32];
         writer
-            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None })
+            .save_group(key, Group { title: "Climbing".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 1, members: Vec::new(), pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None, announcements_only: false, banned: Vec::new() })
             .await
             .unwrap();
         let ctx = ctx(&state, &store);

@@ -350,18 +350,21 @@ impl ContentsStore for SignalStore {
         let pending = serde_json::to_string(&group.pending_members)?;
         let requesting = serde_json::to_string(&group.requesting_members)?;
         let timer = group.disappearing_messages_timer.map(|t| t.duration as i64);
+        let banned = serde_json::to_string(&group.banned)?;
         self.write(|tx| {
             // An upsert, so the avatar kept for the group (which goes with the group row) survives a refresh of it.
             tx.execute(
                 "INSERT INTO groups (master_key, title, revision, invite_link_password, access_control, avatar,
-                    description, members, pending_members, requesting_members, disappearing_messages_timer)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    description, members, pending_members, requesting_members, disappearing_messages_timer,
+                    announcements_only, banned_members)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT (master_key) DO UPDATE SET
                     title = excluded.title, revision = excluded.revision,
                     invite_link_password = excluded.invite_link_password, access_control = excluded.access_control,
                     avatar = excluded.avatar, description = excluded.description, members = excluded.members,
                     pending_members = excluded.pending_members, requesting_members = excluded.requesting_members,
-                    disappearing_messages_timer = excluded.disappearing_messages_timer",
+                    disappearing_messages_timer = excluded.disappearing_messages_timer,
+                    announcements_only = excluded.announcements_only, banned_members = excluded.banned_members",
                 params![
                     master_key.as_slice(),
                     group.title,
@@ -373,7 +376,9 @@ impl ContentsStore for SignalStore {
                     members,
                     pending,
                     requesting,
-                    timer
+                    timer,
+                    group.announcements_only,
+                    banned
                 ],
             )?;
             tx.execute("DELETE FROM left_groups WHERE master_key = ?1", [master_key.as_slice()])?;

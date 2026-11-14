@@ -171,6 +171,12 @@ impl SignalStore {
             tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
+        if found < 3 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(schema::V3)?;
+            tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
+        }
         Ok(())
     }
 

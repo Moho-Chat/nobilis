@@ -63,6 +63,11 @@ pub enum Edit {
     /// Lets in, or turns down, somebody who asked through the link.
     Approve(Uuid, bool),
     Leave,
+    /// Puts somebody out (a member, an invitation, a request to join) and keeps them out: they cannot come back by the
+    /// link or ask to.
+    Ban(Uuid),
+    /// Lifts a ban.
+    Unban(Uuid),
     Link(Link),
     ResetLink,
     DetailsRights(Who),
@@ -94,7 +99,7 @@ pub fn allowed(group: &Group, own: &Aci, edit: &Edit) -> Result<(), String> {
     match edit {
         Edit::Rename(_) | Edit::Describe(_) | Edit::Picture(_) | Edit::Timer(_) if attributes_by_admins && !admin => Err("Only an admin can change this group's details".to_string()),
         Edit::Add(_) if members_by_admins && !admin => Err("Only an admin can add people to this group".to_string()),
-        Edit::Remove(_) | Edit::Admin(..) | Edit::Approve(..) | Edit::Link(_) | Edit::ResetLink | Edit::DetailsRights(_) | Edit::AddRights(_) | Edit::AnnouncementsOnly(_) if !admin => {
+        Edit::Remove(_) | Edit::Ban(_) | Edit::Unban(_) | Edit::Admin(..) | Edit::Approve(..) | Edit::Link(_) | Edit::ResetLink | Edit::DetailsRights(_) | Edit::AddRights(_) | Edit::AnnouncementsOnly(_) if !admin => {
             Err("Only an admin can do that".to_string())
         }
         Edit::Uninvite(who) => {
@@ -116,6 +121,9 @@ pub fn allowed(group: &Group, own: &Aci, edit: &Edit) -> Result<(), String> {
         }
         Edit::Rename(title) if title.trim().is_empty() => Err("A group needs a name".to_string()),
         Edit::Remove(who) if Aci::from(*who) == *own => Err("Leave the group instead".to_string()),
+        Edit::Ban(who) if Aci::from(*who) == *own => Err("You cannot ban yourself".to_string()),
+        Edit::Ban(who) if group.banned.iter().any(|b| b.uuid == *who) => Err("That person is already banned".to_string()),
+        Edit::Unban(who) if !group.banned.iter().any(|b| b.uuid == *who) => Err("That person is not banned".to_string()),
         _ => Ok(()),
     }
 }
@@ -149,6 +157,28 @@ pub fn actions(operations: &GroupOperations, group: &Group, own: &Aci, edit: &Ed
         }
         Edit::Remove(who) => change.delete_members.push(operations.build_remove_member_action(Aci::from(*who)).map_err(fail)?),
         Edit::Leave => change.delete_members.push(operations.build_remove_member_action(*own).map_err(fail)?),
+        Edit::Ban(who) => {
+            // Out of wherever they are first, as Signal's clients do it, then on the list.
+            let aci = Aci::from(*who);
+            if group.is_member(&aci) {
+                change.delete_members.push(operations.build_remove_member_action(aci).map_err(fail)?);
+            }
+            if group.requesting_members.iter().any(|r| r.aci == aci) {
+                change.delete_members_pending_admin_approval.push(actions::DeleteMemberPendingAdminApprovalAction { deleted_user_id: operations.encrypt_aci(aci).map_err(fail)? });
+            }
+            if group.pending_members.iter().any(|p| p.uuid == *who) {
+                change.delete_members_pending_profile_key.push(operations.build_remove_pending_member_action(aci.into()).map_err(fail)?);
+            }
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let banned = presage::libsignal_service::proto::MemberBanned { user_id: operations.encrypt_service_id(aci.into()).map_err(fail)?, timestamp: at };
+            change.add_members_banned.push(actions::AddMemberBannedAction { added: Some(banned) });
+        }
+        Edit::Unban(who) => {
+            use presage::libsignal_service::protocol::{Pni, ServiceId};
+            let pni = group.banned.iter().any(|b| b.uuid == *who && b.service_id_type == presage::model::ServiceIdType::PhoneNumberIdentity);
+            let id: ServiceId = if pni { Pni::from(*who).into() } else { Aci::from(*who).into() };
+            change.delete_members_banned.push(actions::DeleteMemberBannedAction { deleted_user_id: operations.encrypt_service_id(id).map_err(fail)? });
+        }
         Edit::Admin(who, admin) => change.modify_member_roles.push(actions::ModifyMemberRoleAction { user_id: operations.encrypt_aci(Aci::from(*who)).map_err(fail)?, role: wire_role(*admin) }),
         Edit::Uninvite(who) => change.delete_members_pending_profile_key.push(operations.build_remove_pending_member_action(Aci::from(*who).into()).map_err(fail)?),
         Edit::Approve(who, true) => change.promote_members_pending_admin_approval.push(actions::PromoteMemberPendingAdminApprovalAction { user_id: operations.encrypt_aci(Aci::from(*who)).map_err(fail)?, role: wire_role(false) }),
@@ -210,7 +240,7 @@ mod tests {
     }
 
     fn group(members: Vec<Member>) -> Group {
-        Group { title: "G".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 4, members, pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None }
+        Group { title: "G".into(), avatar: String::new(), disappearing_messages_timer: None, access_control: None, revision: 4, members, pending_members: Vec::new(), requesting_members: Vec::new(), invite_link_password: Vec::new(), description: None, announcements_only: false, banned: Vec::new() }
     }
 
     fn operations() -> GroupOperations {
@@ -247,6 +277,25 @@ mod tests {
         assert_eq!(invite.add_members_pending_profile_key.len(), 1);
         let timer = actions(&ops, &g, &aci(1), &Edit::Timer(3600), Vec::new()).unwrap();
         assert!(timer.modify_disappearing_message_timer.is_some());
+    }
+
+    #[test]
+    fn a_ban_puts_a_member_out_and_keeps_them_out_and_can_be_lifted() {
+        let ops = operations();
+        let mut g = group(vec![member(1, true), member(2, false)]);
+        let ban = actions(&ops, &g, &aci(1), &Edit::Ban(Uuid::from(aci(2))), Vec::new()).unwrap();
+        assert_eq!((ban.delete_members.len(), ban.add_members_banned.len()), (1, 1));
+        // Somebody not in the group is only put on the list.
+        let outsider = actions(&ops, &g, &aci(1), &Edit::Ban(Uuid::from(aci(3))), Vec::new()).unwrap();
+        assert_eq!((outsider.delete_members.len(), outsider.add_members_banned.len()), (0, 1));
+        assert_eq!(allowed(&g, &aci(2), &Edit::Ban(Uuid::from(aci(1)))).unwrap_err(), "Only an admin can do that");
+        assert!(allowed(&g, &aci(1), &Edit::Ban(Uuid::from(aci(1)))).is_err());
+        assert!(allowed(&g, &aci(1), &Edit::Unban(Uuid::from(aci(3)))).is_err(), "not banned");
+        g.banned.push(presage::model::groups::BannedMember { uuid: Uuid::from(aci(3)), service_id_type: Default::default(), timestamp: 1 });
+        assert!(allowed(&g, &aci(1), &Edit::Unban(Uuid::from(aci(3)))).is_ok());
+        assert!(allowed(&g, &aci(1), &Edit::Ban(Uuid::from(aci(3)))).is_err(), "already banned");
+        let lift = actions(&ops, &g, &aci(1), &Edit::Unban(Uuid::from(aci(3))), Vec::new()).unwrap();
+        assert_eq!(lift.delete_members_banned.len(), 1);
     }
 
     #[test]

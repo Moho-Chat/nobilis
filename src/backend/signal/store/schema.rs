@@ -11,7 +11,13 @@
 //! `user_version` records which of these has been applied; a new step is added as a new constant and a new arm in
 //! `migrate`, never an edit of an old one.
 
-pub(super) const KNOWN_VERSION: i64 = 2;
+pub(super) const KNOWN_VERSION: i64 = 3;
+
+/// What a group keeps beyond presage's columns: whether only admins may send, and who it has banned (JSON).
+pub(super) const V3: &str = "
+ALTER TABLE groups ADD COLUMN announcements_only INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE groups ADD COLUMN banned_members TEXT NOT NULL DEFAULT '[]';
+";
 
 /// Messages that will disappear, and when. Kept in the account's own file so a daemon that was down when one fell due
 /// removes it as soon as it is up, instead of forgetting the promise made to the sender.

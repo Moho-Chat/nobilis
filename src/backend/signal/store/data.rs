@@ -80,7 +80,7 @@ pub(super) fn verified_flag(verified: &Verified) -> Option<bool> {
 }
 
 pub(super) const GROUP_COLUMNS: &str = "master_key, title, revision, invite_link_password, access_control, avatar, \
-     description, members, pending_members, requesting_members, disappearing_messages_timer";
+     description, members, pending_members, requesting_members, disappearing_messages_timer, announcements_only, banned_members";
 
 pub(super) fn group_from_row(row: &Row<'_>) -> Result<(GroupMasterKeyBytes, Group)> {
     let master_key: Vec<u8> = row.get(0)?;
@@ -101,6 +101,8 @@ pub(super) fn group_from_row(row: &Row<'_>) -> Result<(GroupMasterKeyBytes, Grou
         pending_members: serde_json::from_str(&pending_members)?,
         requesting_members: serde_json::from_str(&requesting_members)?,
         disappearing_messages_timer: row.get::<_, Option<i64>>(10)?.map(|t| Timer { duration: t as u32 }),
+        announcements_only: row.get::<_, i64>(11)? != 0,
+        banned: serde_json::from_str(&row.get::<_, String>(12)?)?,
     };
     Ok((master_key, group))
 }

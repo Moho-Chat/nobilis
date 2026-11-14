@@ -25,6 +25,8 @@ What is changed, and nothing else:
 - `src/manager/registered.rs`: `upload_group_avatar` (encrypts and uploads a group's picture, answering the CDN key a
   change names it by) and `group_avatar_at` (a group's picture by that key, without the per-group copy that outlives a
   change).
+- `src/model/groups.rs`: `Group` keeps `announcements_only` and `banned` (`BannedMember`), both `serde(default)`, so
+  who may send and who is banned can be shown and changed; `ServiceIdType` is `Clone + Copy`.
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

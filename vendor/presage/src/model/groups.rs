@@ -34,6 +34,21 @@ pub struct Group {
     pub requesting_members: Vec<RequestingMember>,
     pub invite_link_password: Vec<u8>,
     pub description: Option<String>,
+    /// Only admins may send messages. (moho)
+    #[serde(default)]
+    pub announcements_only: bool,
+    /// People the group has banned: they cannot join through the link or ask to. (moho)
+    #[serde(default)]
+    pub banned: Vec<BannedMember>,
+}
+
+/// Somebody a group has banned. (moho)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BannedMember {
+    pub uuid: Uuid,
+    #[serde(default)]
+    pub service_id_type: ServiceIdType,
+    pub timestamp: u64,
 }
 
 impl Group {
@@ -96,6 +111,16 @@ impl From<libsignal_service::groups_v2::Group> for Group {
                 .collect(),
             invite_link_password: val.invite_link_password,
             description: val.description_text,
+            announcements_only: val.announcements_only,
+            banned: val
+                .members_banned
+                .into_iter()
+                .map(|b| BannedMember {
+                    uuid: b.user_id.raw_uuid(),
+                    service_id_type: b.user_id.kind().into(),
+                    timestamp: b.timestamp,
+                })
+                .collect(),
         }
     }
 }
