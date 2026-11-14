@@ -123,8 +123,9 @@ pub enum Command {
     Block { thread: presage::store::Thread, blocked: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Mark a person's safety number verified (or take that back), on every device of the account.
     Verify { who: uuid::Uuid, verified: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
-    /// Change the account's own profile (the name and about others see); the phone is told to fetch it.
-    SetProfile { given: String, family: String, about: String, emoji: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Change the account's own profile (the name and about others see); the phone is told to fetch it. `picture` is left
+    /// alone when `None`, and replaced (`Some(Some)`) or taken away (`Some(None)`) otherwise.
+    SetProfile { given: String, family: String, about: String, emoji: String, picture: Option<Option<Vec<u8>>>, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Vote in a poll (a DataMessage carrying the vote).
     Vote { thread: presage::store::Thread, vote: presage::proto::data_message::PollVote, done: Done },
     /// The end of a poll the account asked, sent at `target_ms`.

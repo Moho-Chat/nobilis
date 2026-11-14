@@ -471,6 +471,37 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// moho: like `update_profile`, with a new profile picture (`Some`) or none (`None`) instead of keeping it.
+    pub async fn update_profile_with_picture(
+        &mut self,
+        name: libsignal_service::profile_name::ProfileName<String>,
+        about: Option<String>,
+        emoji: Option<String>,
+        picture: Option<&[u8]>,
+    ) -> Result<(), Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+        match picture {
+            Some(bytes) => {
+                account_manager
+                    .upload_versioned_profile_with_new_avatar(aci, name, about, emoji, bytes, &mut rand::rng())
+                    .await?;
+            }
+            None => {
+                account_manager
+                    .upload_versioned_profile_without_avatar::<_, String>(aci, name, about, emoji, false, &mut rand::rng())
+                    .await?;
+            }
+        }
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self.store.save_profile(aci.into(), self.state.data.profile_key, profile).await;
+        Ok(())
+    }
+
     pub async fn retrieve_group_avatar(
         &mut self,
         context: GroupContextV2,

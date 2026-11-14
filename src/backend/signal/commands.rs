@@ -297,11 +297,28 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
-            Command::SetProfile { given, family, about, emoji, done } => {
+            Command::SetProfile { given, family, about, emoji, picture, done } => {
                 use presage::libsignal_service::profile_name::ProfileName;
                 let name = ProfileName { given_name: given.trim().to_string(), family_name: Some(family.trim().to_string()).filter(|f| !f.is_empty()) };
                 let text = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
-                let mut result = manager.update_profile(name, text(about), text(emoji)).await.map_err(|e| explain(&e));
+                let mut result = match &picture {
+                    None => manager.update_profile(name, text(about), text(emoji)).await,
+                    Some(bytes) => manager.update_profile_with_picture(name, text(about), text(emoji), bytes.as_deref()).await,
+                }
+                .map_err(|e| explain(&e));
+                if result.is_ok() {
+                    // The account's own picture, as moho shows it, is the one just set.
+                    let own_aci = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                    match &picture {
+                        Some(Some(bytes)) => {
+                            let _ = super::media::keep_avatar(&account_id, &own_aci, bytes).await;
+                        }
+                        Some(None) => {
+                            let _ = std::fs::remove_file(super::media::avatar_path(&account_id, &own_aci));
+                        }
+                        None => {}
+                    }
+                }
                 if result.is_ok() {
                     // The account's other devices fetch the profile again, as Signal's clients ask them to.
                     let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32) };

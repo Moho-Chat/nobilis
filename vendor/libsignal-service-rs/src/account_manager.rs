@@ -597,6 +597,62 @@ impl AccountManager {
             .await?)
     }
 
+    /// moho: writes the profile with a new picture, encrypted with the profile key and put on CDN 0 with the form the
+    /// write answers. Answers the picture's path on the CDN.
+    pub async fn upload_versioned_profile_with_new_avatar<
+        R: Rng + CryptoRng,
+        S: AsRef<str>,
+    >(
+        &mut self,
+        aci: libsignal_protocol::Aci,
+        name: ProfileName<S>,
+        about: Option<String>,
+        about_emoji: Option<String>,
+        avatar: &[u8],
+        csprng: &mut R,
+    ) -> Result<String, ProfileManagerError> {
+        let profile_key =
+            self.profile_key.expect("set profile key in AccountManager");
+        let profile_cipher = ProfileCipher::new(profile_key);
+        let name = profile_cipher.encrypt_name(name.as_ref(), csprng)?;
+        let about = profile_cipher
+            .encrypt_about(about.unwrap_or_default(), csprng)?;
+        let about_emoji = profile_cipher
+            .encrypt_emoji(about_emoji.unwrap_or_default(), csprng)?;
+        let sealed = profile_cipher.encrypt_avatar(avatar, csprng)?;
+        let commitment = profile_key.get_commitment(aci);
+        let version = profile_key.get_profile_key_version(aci);
+        let form = self
+            .websocket
+            .write_profile_with_new_avatar(
+                &version,
+                &name,
+                &about,
+                &about_emoji,
+                &commitment,
+            )
+            .await?;
+        let key = form.key.clone();
+        let attributes = crate::push_service::cdn::AttachmentV2UploadAttributes {
+            key: form.key,
+            credential: form.credential,
+            acl: form.acl,
+            algorithm: form.algorithm,
+            date: form.date,
+            policy: form.policy,
+            signature: form.signature,
+        };
+        self.service
+            .upload_to_cdn0(
+                "",
+                attributes,
+                "file".to_string(),
+                std::io::Cursor::new(sealed),
+            )
+            .await?;
+        Ok(key)
+    }
+
     /// Set profile attributes
     ///
     /// Signal Android does not allow unsetting voice/video.

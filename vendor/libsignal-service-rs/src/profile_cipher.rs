@@ -171,6 +171,17 @@ impl ProfileCipher {
         self.decrypt_and_unpad(bytes)
     }
 
+    /// moho: a profile picture, as `decrypt_avatar` reads it: the nonce, then the sealed bytes, unpadded as Signal's
+    /// clients send it.
+    pub fn encrypt_avatar<R: RngCore + CryptoRng>(
+        &self,
+        bytes: &[u8],
+        csprng: &mut R,
+    ) -> Result<Vec<u8>, ProfileCipherError> {
+        let brackets = [bytes.len()];
+        self.pad_and_encrypt(bytes.to_vec(), &brackets, csprng)
+    }
+
     pub fn encrypt_name<'inp, R: RngCore + CryptoRng>(
         &self,
         name: impl std::borrow::Borrow<ProfileName<&'inp str>>,
@@ -241,6 +252,16 @@ mod tests {
     use crate::profile_name::ProfileName;
     use rand::Rng;
     use zkgroup::profiles::ProfileKey;
+
+    #[test]
+    fn roundtrip_avatar() {
+        let mut rng = rand::rng();
+        let cipher = ProfileCipher::new(ProfileKey::generate(rng.random()));
+        let picture = [0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 0xFF, 0xD9];
+        let sealed = cipher.encrypt_avatar(&picture, &mut rng).unwrap();
+        assert_eq!(sealed.len(), 12 + picture.len() + 16);
+        assert_eq!(cipher.decrypt_avatar(&sealed).unwrap(), picture);
+    }
 
     #[test]
     fn roundtrip_name() {

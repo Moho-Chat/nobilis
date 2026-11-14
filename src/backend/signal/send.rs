@@ -548,7 +548,7 @@ const BIGGEST_GROUP_PICTURE: u64 = 2 * 1024 * 1024;
 fn group_picture(path: &str) -> Result<Vec<u8>, String> {
     let size = std::fs::metadata(path).map_err(|e| format!("that picture could not be read: {e}"))?.len();
     if size > BIGGEST_GROUP_PICTURE {
-        return Err("That picture is too big for a group: pick one under 2 MB".to_string());
+        return Err("That picture is too big: pick one under 2 MB".to_string());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("that picture could not be read: {e}"))?;
     if !is_picture(&bytes) {
@@ -733,6 +733,7 @@ pub async fn own_profile(state: &AppState, account_id: &str) -> Result<serde_jso
         "about": profile.as_ref().and_then(|p| p.about.clone()).unwrap_or_default(),
         "emoji": profile.as_ref().and_then(|p| p.about_emoji.clone()).unwrap_or_default(),
         "username": kept.own_username,
+        "avatar": super::media::avatar_of(account_id, &handle.own),
     }))
 }
 
@@ -743,8 +744,14 @@ pub async fn set_profile(state: &AppState, account_id: &str, params: &serde_json
     if text("given").trim().is_empty() {
         return Err("Signal needs at least a first name".to_string());
     }
+    // "picturePath": absent leaves the picture, empty takes it away, a file replaces it.
+    let picture = match params.get("picturePath").and_then(|v| v.as_str()).map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(path) => Some(Some(group_picture(path)?)),
+    };
     let (done, answer) = oneshot::channel();
-    handle.commands.send(Command::SetProfile { given: text("given"), family: text("family"), about: text("about"), emoji: text("emoji"), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    handle.commands.send(Command::SetProfile { given: text("given"), family: text("family"), about: text("about"), emoji: text("emoji"), picture, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     wait(answer, Duration::from_secs(60)).await
 }
 

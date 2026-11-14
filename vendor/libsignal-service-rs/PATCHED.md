@@ -23,5 +23,8 @@ What is changed, and nothing else:
 - Stories: a `StoryMessage` is sent with `?story=true` (`OutgoingPushMessages::story`), and its sent copy is synced to
   the account's other devices with `story_message` and a `StoryMessageRecipient` per member (upstream syncs only data
   and edit messages).
+- Profile pictures: `ProfileCipher::encrypt_avatar`, `SignalWebSocket::write_profile_with_new_avatar` (the profile write
+  that answers the CDN form; upstream's `write_profile` panics on a new avatar) and
+  `AccountManager::upload_versioned_profile_with_new_avatar`; the `cdn` module is crate-visible.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

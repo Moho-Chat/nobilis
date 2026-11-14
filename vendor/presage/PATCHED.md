@@ -27,6 +27,7 @@ What is changed, and nothing else:
   change).
 - `src/model/groups.rs`: `Group` keeps `announcements_only` and `banned` (`BannedMember`), both `serde(default)`, so
   who may send and who is banned can be shown and changed; `ServiceIdType` is `Clone + Copy`.
+- `src/manager/registered.rs`: `update_profile_with_picture` (a new profile picture, or none).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

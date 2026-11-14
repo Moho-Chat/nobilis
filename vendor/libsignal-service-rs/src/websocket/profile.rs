@@ -247,6 +247,51 @@ impl SignalWebSocket<websocket::Identified> {
     }
 }
 
+/// moho: what the server answers a profile write that brings a new picture: the form for putting it on CDN 0.
+#[derive(Debug, Deserialize)]
+pub struct ProfileAvatarUploadAttributes {
+    pub key: String,
+    pub credential: String,
+    pub acl: String,
+    pub algorithm: String,
+    pub date: String,
+    pub policy: String,
+    pub signature: String,
+}
+
+impl SignalWebSocket<websocket::Identified> {
+    /// moho: writes a profile that brings a new picture, answering the form to upload it with (`write_profile` cannot).
+    pub async fn write_profile_with_new_avatar(
+        &mut self,
+        version: &ProfileKeyVersion,
+        name: &[u8],
+        about: &[u8],
+        emoji: &[u8],
+        commitment: &ProfileKeyCommitment,
+    ) -> Result<ProfileAvatarUploadAttributes, ServiceError> {
+        let version = bincode::serialize(version)?;
+        let version = std::str::from_utf8(&version)
+            .expect("profile_key_version is hex encoded string");
+        let commitment = bincode::serialize(commitment)?;
+        let command = SignalServiceProfileWrite {
+            version,
+            name,
+            about,
+            about_emoji: emoji,
+            avatar: true,
+            same_avatar: false,
+            commitment: &commitment,
+        };
+        self.http_request(Method::PUT, "/v1/profile")?
+            .send_json(&command)
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await
+    }
+}
+
 impl SignalWebSocket<websocket::Unidentified> {
     pub async fn retrieve_profile_avatar(
         &mut self,
