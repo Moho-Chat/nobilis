@@ -341,6 +341,9 @@ pub fn typing(state: &AppState, buffer: &Buffer, started: bool) -> Result<(), St
 /// phone is told so it does not keep the conversation unread.
 pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     use presage::libsignal_service::protocol::{Aci, ServiceId};
+    if buffer.remote_id.as_deref() == Some(super::stories::REMOTE) {
+        return stories_viewed(state, buffer);
+    }
     let (handle, _) = target(state, buffer)?;
     // Looking at a conversation is what starts the clock on what was waiting to disappear in it.
     super::expiry::started(&handle.store, &buffer.id);
@@ -370,6 +373,29 @@ pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     Ok(())
 }
 
+/// The Stories conversation looked at: each story there not yet told about is viewed, on the other devices and, when the
+/// account's story setting says so, to its author.
+fn stories_viewed(state: &AppState, buffer: &Buffer) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
+    let rows = state.store.get_backlog(&buffer.id, i64::MAX, 100).map_err(|e| e.to_string())?;
+    let mut views = Vec::new();
+    {
+        let mut done = handle.memory.receipted.lock().unwrap_or_else(|e| e.into_inner());
+        for row in rows.iter().filter(|m| !m.is_own && m.kind == "chat") {
+            if let Some((ts, author)) = ids::parse_message_id(&row.id) {
+                if done.insert(row.id.clone()) {
+                    views.push((author, ts));
+                }
+            }
+        }
+    }
+    if views.is_empty() {
+        return Ok(());
+    }
+    let receipt = super::storage::current(&buffer.account_id, &handle.store).account.is_some_and(|a| a.tells_story_views());
+    let _ = handle.commands.send(Command::StoriesViewed { views, receipt });
+    Ok(())
+}
 
 /// The account's devices, newest link last, as the phone lists them.
 pub async fn devices(state: &AppState, account_id: &str) -> Result<Vec<super::DeviceRow>, String> {

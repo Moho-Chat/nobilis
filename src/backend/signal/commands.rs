@@ -486,6 +486,25 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 });
                 finish(done, result, at);
             }
+            Command::StoriesViewed { views, receipt } => {
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let viewed = views.iter().map(|(sender, ts)| sync_message::Viewed { sender_aci: Some(sender.to_string()), timestamp: Some(*ts), sender_aci_binary: Some(sender.as_bytes().to_vec()) }).collect();
+                if let Err(e) = manager.send_message(own, SyncMessage { viewed, ..Default::default() }, now_ms()).await {
+                    tracing::debug!("signal[{account_id}]: the other devices were not told stories were viewed: {e}");
+                }
+                if receipt {
+                    let mut by_author: std::collections::HashMap<uuid::Uuid, Vec<u64>> = std::collections::HashMap::new();
+                    for (sender, ts) in views {
+                        by_author.entry(sender).or_default().push(ts);
+                    }
+                    for (author, timestamps) in by_author {
+                        let receipt = ReceiptMessage { r#type: Some(presage::proto::receipt_message::Type::Viewed as i32), timestamp: timestamps };
+                        if let Err(e) = manager.send_message(ServiceId::Aci(author.into()), receipt, now_ms()).await {
+                            tracing::debug!("signal[{account_id}]: a story view was not told to its author: {e}");
+                        }
+                    }
+                }
+            }
             Command::ViewOnceOpened { sender, sent_ms, receipt } => {
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
                 let open = sync_message::ViewOnceOpen { sender_aci: Some(sender.to_string()), timestamp: Some(sent_ms), sender_aci_binary: Some(sender.as_bytes().to_vec()) };

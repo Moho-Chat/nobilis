@@ -2,8 +2,9 @@
 //! Stories, each as a message from whoever posted it, and taken away 24 hours after it was posted. A reply or a
 //! reaction made on one there goes to its author as Signal's clients send it: a message to them that names the story.
 //!
-//! Posting a story is not built: it goes to "My Story" or a custom list, which live in the storage service's
-//! distribution lists, and those are not written from here.
+//! A story can be posted to a group (see `send::post_story`). Posting to "My Story" or a custom list is not built: those
+//! lists live in the storage service's distribution lists. Stories the phone hides (a person's or a group's) are not
+//! shown, and looking at Stories tells the authors they were viewed when the account's setting says so.
 
 use super::ids;
 use super::people::{self, Ctx};
@@ -90,6 +91,15 @@ pub async fn arrived(ctx: &Ctx<'_>, author: Uuid, at: u64, story: &StoryMessage)
         return;
     }
     let group_master = story.group.as_ref().and_then(|g| g.master_key.as_deref()).and_then(|k| <[u8; 32]>::try_from(k).ok());
+    // Hidden on the phone (the person's stories, or the group's): not shown here either.
+    let kept = super::storage::current(ctx.account_id, &ctx.store);
+    let remote = match group_master {
+        Some(key) => format!("g:{}", ids::hex(&key)),
+        None => format!("p:{author}"),
+    };
+    if author != ctx.own && kept.conversations.get(&remote).is_some_and(|c| c.hide_story) {
+        return;
+    }
     let group = match group_master {
         Some(key) => Some(people::group_title(ctx, &key).await),
         None => None,

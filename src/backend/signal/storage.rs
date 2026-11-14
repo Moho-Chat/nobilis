@@ -47,6 +47,9 @@ pub struct Standing {
     /// Signal said this person is no longer registered.
     #[serde(default)]
     pub unregistered: bool,
+    /// Their stories (or the group's) are hidden on the phone.
+    #[serde(default)]
+    pub hide_story: bool,
 }
 
 impl Standing {
@@ -64,6 +67,15 @@ pub struct AccountSettings {
     pub sealed_sender_indicators: bool,
     /// The disappearing-message timer a new conversation starts with, in seconds (0 is off).
     pub default_timer: u32,
+    /// Whether authors are told their stories were viewed; unset follows `read_receipts`, as on the phone.
+    #[serde(default)]
+    pub story_view_receipts: Option<bool>,
+}
+
+impl AccountSettings {
+    pub fn tells_story_views(&self) -> bool {
+        self.story_view_receipts.unwrap_or(self.read_receipts)
+    }
 }
 
 /// Everything read, as of one manifest version.
@@ -115,6 +127,7 @@ fn contact_standing(record: &ContactRecord) -> Standing {
         muted_until: record.muted_until_timestamp,
         hidden: record.hidden,
         unregistered: record.unregistered_at_timestamp > 0,
+        hide_story: record.hide_story,
     }
 }
 
@@ -125,6 +138,7 @@ fn group_standing(record: &GroupV2Record) -> Standing {
         archived: record.archived,
         marked_unread: record.marked_unread,
         muted_until: record.muted_until_timestamp,
+        hide_story: record.hide_story,
         ..Default::default()
     }
 }
@@ -148,6 +162,11 @@ fn account_settings(record: &AccountRecord) -> AccountSettings {
         link_previews: record.link_previews,
         sealed_sender_indicators: record.sealed_sender_indicators,
         default_timer: record.universal_expire_timer,
+        story_view_receipts: match record.story_view_receipts_enabled {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        },
     }
 }
 
@@ -433,6 +452,16 @@ mod tests {
         let mut c = ContactRecord { aci: aci.into(), ..Default::default() };
         change(&mut c);
         StorageRecord { record: Some(storage_record::Record::Contact(c)) }
+    }
+
+    #[test]
+    fn story_views_follow_read_receipts_unless_set() {
+        let mut a = AccountSettings { read_receipts: true, ..Default::default() };
+        assert!(a.tells_story_views());
+        a.story_view_receipts = Some(false);
+        assert!(!a.tells_story_views());
+        let record = AccountRecord { read_receipts: false, story_view_receipts_enabled: 1, ..Default::default() };
+        assert!(account_settings(&record).tells_story_views());
     }
 
     #[test]
