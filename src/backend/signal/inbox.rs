@@ -766,6 +766,26 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
     }
 }
 
+/// A shared contact card as a line: the name, then each number, email address and organisation it carries.
+fn contact_words(card: &presage::proto::data_message::Contact) -> String {
+    let name = card.name.as_ref().map(|n| {
+        let parts = [n.prefix.as_deref(), n.given_name.as_deref(), n.middle_name.as_deref(), n.family_name.as_deref(), n.suffix.as_deref()];
+        let joined = parts.iter().flatten().map(|p| p.trim()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ");
+        if joined.is_empty() { n.nickname.clone().unwrap_or_default() } else { joined }
+    });
+    let mut details: Vec<String> = Vec::new();
+    details.extend(card.number.iter().filter_map(|p| p.value.clone()));
+    details.extend(card.email.iter().filter_map(|e| e.value.clone()));
+    details.extend(card.organization.clone());
+    let name = name.filter(|n| !n.is_empty());
+    match (name, details.is_empty()) {
+        (None, true) => "[Contact]".to_string(),
+        (Some(name), true) => format!("[Contact: {name}]"),
+        (None, false) => format!("[Contact: {}]", details.join(" · ")),
+        (Some(name), false) => format!("[Contact: {name} · {}]", details.join(" · ")),
+    }
+}
+
 /// A view-once message moho has no picture for.
 const VIEW_ONCE_ELSEWHERE: &str = "[View-once media: open it in Signal on your phone]";
 
@@ -802,8 +822,7 @@ async fn describe(ctx: &Ctx<'_>, dm: &DataMessage) -> Shown {
         lines.push(VIEW_ONCE_ELSEWHERE.to_string());
     }
     for card in &dm.contact {
-        let name = card.name.as_ref().map(|n| [n.given_name.as_deref(), n.family_name.as_deref()].iter().flatten().copied().collect::<Vec<_>>().join(" ")).unwrap_or_default();
-        lines.push(if name.is_empty() { "[Contact]".to_string() } else { format!("[Contact: {name}]") });
+        lines.push(contact_words(card));
     }
     if let Some(poll) = &dm.poll_create {
         lines.push(format!("[Poll: {}]", poll.question.clone().unwrap_or_default()));
@@ -1056,6 +1075,19 @@ mod tests {
         let rows = backlog(&state, &only_buffer(&state));
         assert_eq!(rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["[View-once media: open it in Signal on your phone]"]);
         assert!(rows[0].attachments.is_empty(), "nothing of it is kept or shown");
+    }
+
+    #[test]
+    fn a_contact_card_says_who_and_how_to_reach_them() {
+        use presage::proto::data_message::{contact, Contact};
+        let card = Contact {
+            name: Some(contact::Name { given_name: Some("Ada".into()), family_name: Some("Lovelace".into()), ..Default::default() }),
+            number: vec![contact::Phone { value: Some("+1 555 0100".into()), ..Default::default() }],
+            organization: Some("Engines".into()),
+            ..Default::default()
+        };
+        assert_eq!(contact_words(&card), "[Contact: Ada Lovelace · +1 555 0100 · Engines]");
+        assert_eq!(contact_words(&Contact::default()), "[Contact]");
     }
 
     #[tokio::test]

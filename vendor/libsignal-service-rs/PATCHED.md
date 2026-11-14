@@ -20,5 +20,8 @@ What is changed, and nothing else:
 - Group pictures: `GroupOperations::encrypt_avatar` (the blob members decrypt with `decrypt_avatar`), and
   `PushService::upload_group_avatar` (`GET /v1/groups/avatar/form` from the group server, then CDN 0 through
   `upload_to_cdn0`, whose upload attributes are now crate-visible so the form can be made into them).
+- Stories: a `StoryMessage` is sent with `?story=true` (`OutgoingPushMessages::story`), and its sent copy is synced to
+  the account's other devices with `story_message` and a `StoryMessageRecipient` per member (upstream syncs only data
+  and edit messages).
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

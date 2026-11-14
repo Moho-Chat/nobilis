@@ -793,6 +793,64 @@ pub async fn start_poll(state: &AppState, buffer: &Buffer, question: &str, answe
     Ok(())
 }
 
+/// The colours of a text story moho posts: white words on Signal's blue.
+const STORY_WORDS: u32 = 0xFFFF_FFFF;
+const STORY_BACKGROUND: u32 = 0xFF2C_6BED;
+
+/// A story with words only, as Signal's clients make one.
+pub fn text_story(text: &str, replies: bool) -> Result<presage::proto::StoryMessage, String> {
+    use presage::proto::{story_message::Attachment, text_attachment::Background, TextAttachment};
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("A story needs words or a picture".to_string());
+    }
+    // Signal's clients stop a text story at 700 characters.
+    if text.chars().count() > 700 {
+        return Err("A text story is at most 700 characters".to_string());
+    }
+    let words = TextAttachment { text: Some(text.to_string()), text_foreground_color: Some(STORY_WORDS), background: Some(Background::Color(STORY_BACKGROUND)), ..Default::default() };
+    Ok(presage::proto::StoryMessage { attachment: Some(Attachment::TextAttachment(words)), allows_replies: Some(replies), ..Default::default() })
+}
+
+/// Posts a story to a group (the buffer is the group's conversation): words, or a picture or video with words under it.
+pub async fn post_story(state: &AppState, buffer: &Buffer, text: &str, path: Option<&str>, replies: bool) -> Result<(), String> {
+    use presage::proto::story_message::Attachment;
+    let (handle, thread) = target(state, buffer)?;
+    let Thread::Group(key) = thread else { return Err("Stories are posted to a group here: My Story needs lists moho does not keep".to_string()) };
+    if let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, key).await {
+        may_send(&group, &handle.own)?;
+    }
+    let story = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        None => text_story(text, replies)?,
+        Some(path) => {
+            let content_type = content_type_of(path);
+            if !(content_type.starts_with("image/") || content_type.starts_with("video/")) {
+                return Err("A story is a picture or a video".to_string());
+            }
+            let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+            if size > BIGGEST {
+                return Err(format!("{path} is {} MB and Signal takes at most {} MB", size / 1_000_000, BIGGEST / 1_000_000));
+            }
+            let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {path}: {e}"))?;
+            let (width, height) = dimensions_of(path, content_type);
+            let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("story").to_string();
+            let (done, answer) = oneshot::channel();
+            handle.commands.send(Command::Upload { files: vec![super::Upload { name, content_type: content_type.to_string(), bytes, width, height }], done }).map_err(|_| "that Signal account is not connected".to_string())?;
+            let mut pointer = wait(answer, Duration::from_secs(600)).await?.pop().ok_or("Signal did not take the file")?;
+            pointer.caption = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+            presage::proto::StoryMessage { attachment: Some(Attachment::FileAttachment(pointer)), allows_replies: Some(replies), ..Default::default() }
+        }
+    };
+    let sent = story.clone();
+    let at = ask(&handle, |done| Command::PostStory { key, story: Box::new(sent), done }).await?;
+    // Shown with everybody else's, in Stories, for its day.
+    let mut shown = story;
+    shown.group = Some(presage::proto::GroupContextV2 { master_key: Some(key.to_vec()), revision: None, group_change: None });
+    let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+    super::stories::arrived(&ctx, handle.own, at, &shown).await;
+    Ok(())
+}
+
 /// Ends a poll the account asked: nobody can vote in it after, here or on the other devices.
 pub async fn end_poll(state: &AppState, buffer: &Buffer, poll_id: &str) -> Result<(), String> {
     let (handle, thread) = target(state, buffer)?;
@@ -975,6 +1033,17 @@ mod tests {
     fn a_change_of_timer_is_said_as_signal_says_it() {
         assert_eq!(timer_line("You", 300), "You set disappearing messages to 5 minutes");
         assert_eq!(timer_line("Alice", 0), "Alice turned off disappearing messages");
+    }
+
+    #[test]
+    fn a_text_story_has_words_and_a_colour() {
+        use presage::proto::story_message::Attachment;
+        let story = text_story(" Beach day ", false).unwrap();
+        let Some(Attachment::TextAttachment(t)) = story.attachment else { panic!() };
+        assert_eq!((t.text.as_deref(), story.allows_replies), (Some("Beach day"), Some(false)));
+        assert!(t.background.is_some());
+        assert!(text_story("  ", true).is_err());
+        assert!(text_story(&"a".repeat(701), true).is_err());
     }
 
     #[test]

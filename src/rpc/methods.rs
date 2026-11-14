@@ -6019,6 +6019,16 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "postSignalStory" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("postSignalStory requires a Signal \"bufferId\"".to_string()));
+            };
+            let replies = params.get("allowReplies").and_then(|v| v.as_bool()).unwrap_or(true);
+            match backend::signal::send::post_story(state, &buffer, p_str(params, "text", ""), p_str_opt(params, "path"), replies).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),

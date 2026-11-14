@@ -52,6 +52,9 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// Sent as a story (`?story=true`): the server drops it for a recipient who does not take stories.
+    #[serde(skip)]
+    pub story: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -633,6 +636,7 @@ where
                 timestamp,
                 messages,
                 online,
+                story: matches!(content_body, ContentBody::StoryMessage(_)),
             };
 
             let send = if let Some(unidentified) = &unidentified_access {
@@ -1120,18 +1124,41 @@ where
         send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
     ) -> Option<ContentBody> {
         use sync_message::sent::UnidentifiedDeliveryStatus;
-        let (message, edit_message) = match content_body {
-            ContentBody::DataMessage(m) => (Some(m), None),
-            ContentBody::EditMessage(m) => (None, Some(m)),
+        let (message, edit_message, story_message) = match content_body {
+            ContentBody::DataMessage(m) => (Some(m), None, None),
+            ContentBody::EditMessage(m) => (None, Some(m), None),
+            ContentBody::StoryMessage(m) => (None, None, Some(m)),
             content_body => {
                 tracing::trace!(?content_body, "not syncing to self");
                 return None;
             },
         };
+        let sent: Vec<&SentMessage> = send_message_results
+            .into_iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        let story_message_recipients = if story_message.is_some() {
+            let replies = story_message
+                .as_ref()
+                .and_then(|m| m.allows_replies)
+                .unwrap_or(true);
+            sent.iter()
+                .map(|s| sync_message::sent::StoryMessageRecipient {
+                    destination_service_id: Some(
+                        s.recipient.service_id_string(),
+                    ),
+                    destination_service_id_binary: Some(
+                        s.recipient.service_id_binary(),
+                    ),
+                    distribution_list_ids: Vec::new(),
+                    is_allowed_to_reply: Some(replies),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
-            send_message_results
-                .into_iter()
-                .filter_map(|result| result.as_ref().ok())
+            sent.into_iter()
                 .map(|sent| {
                     let SentMessage {
                         recipient,
@@ -1166,6 +1193,8 @@ where
                     .map(|_| timestamp),
                 message,
                 edit_message,
+                story_message,
+                story_message_recipients,
                 timestamp: Some(timestamp),
                 unidentified_status,
                 ..Default::default()

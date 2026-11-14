@@ -474,6 +474,18 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
+            Command::PostStory { key, mut story, done } => {
+                use presage::store::ContentsStore;
+                let at = now_ms();
+                let revision = manager.store().group(key).await.ok().flatten().map(|g| g.revision).unwrap_or(0);
+                story.group = Some(presage::proto::GroupContextV2 { master_key: Some(key.to_vec()), revision: Some(revision), group_change: None });
+                story.profile_key = Some(manager.registration_data().profile_key().get_bytes().to_vec());
+                let result = manager.send_message_to_group(&key, ContentBody::StoryMessage(*story), at).await.map_err(|e| {
+                    tracing::info!("signal[{account_id}]: a story was not posted: {e}");
+                    explain(&e)
+                });
+                finish(done, result, at);
+            }
             Command::ViewOnceOpened { sender, sent_ms, receipt } => {
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
                 let open = sync_message::ViewOnceOpen { sender_aci: Some(sender.to_string()), timestamp: Some(sent_ms), sender_aci_binary: Some(sender.as_bytes().to_vec()) };

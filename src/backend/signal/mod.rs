@@ -139,6 +139,8 @@ pub enum Command {
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.
     AnswerRequest { thread: presage::store::Thread, answer: requests::Answer, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Post a story to a group: its members see it for a day.
+    PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// A view-once message was opened here: the other devices are told, and the sender if `receipt`.
     ViewOnceOpened { sender: uuid::Uuid, sent_ms: u64, receipt: bool },
     /// Change one of the account's own messages.
