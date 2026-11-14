@@ -232,6 +232,28 @@ pub async fn send(state: &AppState, account_id: &str, to: &str, message: &serde_
     }
 }
 
+/// A call RingRTC took or placed here ended: said in the conversation as the phone's call log says it, under the same
+/// id, and told to the account's other devices so their call logs have it too.
+pub fn ended(state: &AppState, account_id: &str, remote: &str, call_id: u64, video: bool, incoming: bool, accepted: bool) -> Result<(), String> {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let remote = Uuid::parse_str(remote).map_err(|_| "a call is with a Signal person's id".to_string())?;
+    let at_ms = super::commands::now_ms();
+    let kind = if video { Type::VideoCall } else { Type::AudioCall };
+    let direction = if incoming { Direction::Incoming } else { Direction::Outgoing };
+    let event = if accepted { Event::Accepted } else { Event::NotAccepted };
+    if let Some(words) = super::inbox::call_words(kind as i32, direction as i32, event as i32) {
+        let remote_id = format!("p:{remote}");
+        if let Some(buffer) = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote_id.as_str())) {
+            let id = format!("call-{call_id}-{}", event as i32);
+            state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, "Signal", &words, false, "system", None, Some(id), false, None, Vec::new(), Vec::new(), None, Some((at_ms / 1000) as i64), None, None);
+        }
+    }
+    // Not ringing here any more either.
+    stop(state, call_id, false);
+    handle.commands.send(super::Command::CallEventSync { remote, call_id, at_ms, video, incoming, accepted }).map_err(|_| "that Signal account is not connected".to_string())
+}
+
 /// A call message from `sender`, as the server stamped it at `server_ms`.
 pub async fn arrived(ctx: &Ctx<'_>, sender: Uuid, server_ms: u64, call: &CallMessage) {
     if let Some(offer) = &call.offer {

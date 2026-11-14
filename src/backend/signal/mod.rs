@@ -151,6 +151,10 @@ pub enum Command {
     PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// Stories looked at here: the other devices are told, and each author when `receipt`.
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
+    /// A call taken or placed here ended: the account's other devices are told, for their call logs.
+    CallEventSync { remote: uuid::Uuid, call_id: u64, at_ms: u64, video: bool, incoming: bool, accepted: bool },
+    /// Start a fresh session with a person: the old ones are forgotten and a new one is made by sending them nothing.
+    ResetSession { who: uuid::Uuid, done: Done },
     /// Send a call message (what RingRTC asked to send) to a person.
     CallMessage { to: uuid::Uuid, call: Box<presage::proto::CallMessage>, done: Done },
     /// Signal's relays for a call, with their short-lived credentials, as RingRTC takes ICE servers.

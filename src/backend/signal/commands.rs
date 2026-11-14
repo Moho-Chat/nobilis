@@ -570,6 +570,36 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     }
                 }
             }
+            Command::CallEventSync { remote, call_id, at_ms, video, incoming, accepted } => {
+                use presage::proto::sync_message::call_event::{Direction, Event, Type};
+                let event = sync_message::CallEvent {
+                    conversation_id: Some(remote.as_bytes().to_vec()),
+                    call_id: Some(call_id),
+                    timestamp: Some(at_ms),
+                    r#type: Some(if video { Type::VideoCall } else { Type::AudioCall } as i32),
+                    direction: Some(if incoming { Direction::Incoming } else { Direction::Outgoing } as i32),
+                    event: Some(if accepted { Event::Accepted } else { Event::NotAccepted } as i32),
+                };
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let sync = SyncMessage { content: Some(sync_message::Content::CallEvent(event)), ..Default::default() };
+                if let Err(e) = manager.send_message(own, sync, now_ms()).await {
+                    tracing::debug!("signal[{account_id}]: the call log was not shared with the other devices: {e}");
+                }
+            }
+            Command::ResetSession { who, done } => {
+                use presage::libsignal_service::session_store::SessionStoreExt;
+                use presage::store::Store;
+                let at = now_ms();
+                let id = ServiceId::Aci(who.into());
+                let result = async {
+                    manager.store().aci_protocol_store().delete_all_sessions(&id).await.map_err(|e| format!("the old session could not be forgotten: {e}"))?;
+                    // An empty message: the library fetches their keys and starts a new session to send it.
+                    let padding: Vec<u8> = (0..rand::random::<u8>() % 64 + 1).map(|_| rand::random()).collect();
+                    manager.send_message(id, ContentBody::NullMessage(presage::proto::NullMessage { padding: Some(padding) }), at).await.map_err(|e| explain(&e))
+                }
+                .await;
+                finish(done, result, at);
+            }
             Command::CallMessage { to, call, done } => {
                 let at = now_ms();
                 let result = manager.send_message(ServiceId::Aci(to.into()), ContentBody::CallMessage(*call), at).await.map_err(|e| {

@@ -236,6 +236,22 @@ async fn held_for_safety_number(state: &AppState, buffer: &Buffer, handle: &Hand
     Ok(())
 }
 
+/// Starts a fresh session with a person (from their card): for a conversation whose messages stopped decrypting.
+pub async fn reset_session(state: &AppState, account_id: &str, user_id: &str) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let who = uuid::Uuid::parse_str(user_id.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?;
+    if who == handle.own {
+        return Err("Your own devices keep their sessions themselves".to_string());
+    }
+    let at = ask(&handle, |done| Command::ResetSession { who, done }).await?;
+    let remote = format!("p:{who}");
+    if let Some(buffer) = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())) {
+        let ctx = super::people::Ctx::new(state, account_id, handle.store.clone(), handle.own);
+        super::inbox::system(&ctx, &buffer, "You started a fresh secure session", at);
+    }
+    Ok(())
+}
+
 /// Says to send to somebody whose verified safety number changed, without verifying it again.
 pub fn send_anyway(state: &AppState, account_id: &str, user_id: &str) -> Result<(), String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

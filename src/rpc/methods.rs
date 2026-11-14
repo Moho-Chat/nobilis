@@ -6044,6 +6044,22 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalResetSession" => match backend::signal::send::reset_session(state, p_str(params, "accountId", ""), p_str(params, "userId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallEnded" => match backend::signal::calls::ended(
+            state,
+            p_str(params, "accountId", ""),
+            p_str(params, "remote", ""),
+            p_str(params, "callId", "0").parse().unwrap_or(0),
+            p_bool(params, "video", false),
+            p_bool(params, "incoming", false),
+            p_bool(params, "accepted", false),
+        ) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
         "signalSendAnyway" => match backend::signal::send::send_anyway(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
