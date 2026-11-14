@@ -301,7 +301,10 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         ContentBody::TypingMessage(typing) => typing_seen(&ctx, handle, &content, typing).await,
         ContentBody::ReceiptMessage(receipt) => receipt_seen(&ctx, handle, &content, receipt).await,
         ContentBody::NullMessage(_) => {}
-        ContentBody::CallMessage(_) => tracing::debug!("signal[{}]: a call message (calls are not handled yet)", ctx.account_id),
+        ContentBody::CallMessage(call) => {
+            let server_ms = content.metadata.server_timestamp.timestamp_millis().max(0) as u64;
+            super::calls::arrived(&ctx, sender, server_ms, call).await;
+        }
         ContentBody::StoryMessage(story) => {
             // Nothing from somebody blocked; a story is otherwise shown whoever posted it, as Signal's clients do for
             // the people the account has accepted (a stranger's do not reach it).
@@ -982,7 +985,7 @@ pub(super) async fn edited(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, edit: &
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backend::kick::testkit::simulated_daemon;
     use presage::{
@@ -1028,6 +1031,13 @@ mod tests {
         }
         (state, store)
     }
+
+    /// The same made-up account, for the calls tests.
+    pub(in crate::backend::signal) async fn world_for_calls(name: &str) -> (AppState, SignalStore) {
+        world(name).await
+    }
+    pub(in crate::backend::signal) const ACCOUNT_FOR_CALLS: &str = ACCOUNT;
+    pub(in crate::backend::signal) const ME_FOR_CALLS: &str = ME;
 
     fn ctx<'a>(state: &'a AppState, store: &SignalStore) -> Ctx<'a> {
         Ctx::new(state, ACCOUNT, store.clone(), uuid(ME))

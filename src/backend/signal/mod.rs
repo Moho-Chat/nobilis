@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod backup;
+pub mod calls;
 pub mod commands;
 pub mod compose;
 pub mod connect;

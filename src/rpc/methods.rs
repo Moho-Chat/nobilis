@@ -6057,6 +6057,8 @@ pub async fn dispatch(
             Ok(account_id) => (Some(serde_json::json!({ "accountId": account_id })), None),
             Err(e) => (None, Some(e)),
         },
+        // A Signal call ringing here is silenced (nothing is sent; it is answered or turned down on the phone).
+        "silenceSignalCall" => (Some(serde_json::json!({ "silenced": backend::signal::calls::silence(state, p_str(params, "bufferId", "")) })), None),
         "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
