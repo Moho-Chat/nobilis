@@ -6023,7 +6023,11 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
-        "signalStoryLists" => match backend::signal::send::story_lists(state, p_str(params, "accountId", "")) {
+        "signalConnections" => match backend::signal::send::connections(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalStoryLists" => match backend::signal::send::story_lists(state, p_str(params, "accountId", "")).await {
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),
         },
@@ -6062,6 +6066,10 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalSharedChange" => match backend::signal::send::shared_change(state, p_str(params, "accountId", ""), params).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
         "signalSafetyQr" => match backend::signal::profile::safety_qr(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),

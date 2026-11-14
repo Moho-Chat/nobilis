@@ -42,7 +42,7 @@ use crate::configuration::Endpoint;
 use crate::master_key::StorageServiceKey;
 use crate::proto::{
     ManifestRecord, ReadOperation, StorageItem, StorageItems, StorageManifest,
-    StorageRecord,
+    StorageRecord, WriteOperation,
 };
 use crate::push_service::protobuf::ProtobufResponseExt;
 use crate::push_service::SignalServiceResponse;
@@ -61,6 +61,9 @@ pub enum StorageServiceError {
     /// because there's nothing the caller can do differently.
     #[error("invalid storage service blob")]
     Invalid,
+    /// moho: another device wrote first; the manifest is now this one.
+    #[error("the storage service has a newer manifest (version {})", .0.version)]
+    Conflict(Box<StorageManifest>),
     #[error("network / service error: {0}")]
     Service(#[from] ServiceError),
 }
@@ -211,6 +214,95 @@ impl StorageService {
             .iter()
             .map(|item| Self::decrypt_item(&self.storage_key, item, record_ikm))
             .collect()
+    }
+
+    /// moho: `read_items`, answering each item's identifier and its decrypted bytes as they are, so a record can be
+    /// changed without losing fields this copy of the protobufs does not know.
+    pub async fn read_raw_items(
+        &self,
+        keys: Vec<Vec<u8>>,
+        record_ikm: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageServiceError> {
+        let body = ReadOperation { read_key: keys };
+        let items: StorageItems = self
+            .service
+            .request(
+                Method::PUT,
+                Endpoint::storage("/v1/storage/read"),
+                HttpAuthOverride::Identified(self.credentials.clone()),
+            )?
+            .header("Content-Type", "application/x-protobuf")
+            .body(body.encode_to_vec())
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .protobuf()
+            .await?;
+        items
+            .items
+            .iter()
+            .map(|item| {
+                let key = Self::item_key(&self.storage_key, &item.key, record_ikm);
+                Ok((item.key.clone(), decrypt(&key, &item.value)?))
+            })
+            .collect()
+    }
+
+    /// moho: an item from a record's bytes as they are (see `read_raw_items`).
+    pub fn encrypt_raw_item(
+        &self,
+        raw_id: Vec<u8>,
+        plaintext: &[u8],
+        record_ikm: Option<&[u8]>,
+    ) -> StorageItem {
+        let key = Self::item_key(&self.storage_key, &raw_id, record_ikm);
+        StorageItem {
+            key: raw_id,
+            value: encrypt(&key, plaintext),
+        }
+    }
+
+    /// moho: writes a new manifest with the items it adds and the ones it drops (`PUT /v1/storage`). The manifest's
+    /// version must be one more than the server's: a device that wrote first makes this a `Conflict` answering the
+    /// server's manifest, to read again and retry.
+    pub async fn write(
+        &self,
+        manifest: &ManifestRecord,
+        insert: Vec<StorageItem>,
+        delete: Vec<Vec<u8>>,
+    ) -> Result<(), StorageServiceError> {
+        let body = WriteOperation {
+            manifest: Some(Self::encrypt_manifest(&self.storage_key, manifest)),
+            insert_item: insert,
+            delete_key: delete,
+            clear_all: false,
+        };
+        let response = self
+            .service
+            .request(
+                Method::PUT,
+                Endpoint::storage("/v1/storage"),
+                HttpAuthOverride::Identified(self.credentials.clone()),
+            )?
+            .header("Content-Type", "application/x-protobuf")
+            .body(body.encode_to_vec())
+            .send()
+            .await?;
+        if response.status().as_u16() == 409 {
+            let current: StorageManifest = response.protobuf().await?;
+            return Err(StorageServiceError::Conflict(Box::new(current)));
+        }
+        response.service_error_for_status().await?;
+        Ok(())
+    }
+
+    /// moho: the server's manifest a `Conflict` answered, decrypted.
+    pub fn open_manifest(
+        &self,
+        manifest: &StorageManifest,
+    ) -> Result<ManifestRecord, StorageServiceError> {
+        Self::decrypt_manifest(&self.storage_key, manifest)
     }
 
     // -- crypto ------------------------------------------------------------

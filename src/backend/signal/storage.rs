@@ -93,6 +93,9 @@ pub struct Kept {
     pub own_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountSettings>,
+    /// Note to Self's archive and unread marks, which the account's own record keeps.
+    #[serde(default)]
+    pub note_to_self: Standing,
     /// The account's story audiences: My Story and the lists made on the phone (not deleted ones).
     #[serde(default)]
     pub story_lists: Vec<StoryList>,
@@ -246,6 +249,7 @@ impl Kept {
                     kept.pinned = a.pinned_conversations.iter().filter_map(pinned_remote).collect();
                     kept.own_username = text(&a.username);
                     kept.account = Some(account_settings(a));
+                    kept.note_to_self = Standing { archived: a.note_to_self_archived, marked_unread: a.note_to_self_marked_unread, ..Default::default() };
                 }
                 _ => {}
             }

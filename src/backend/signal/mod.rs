@@ -32,6 +32,7 @@ pub mod requests;
 pub mod revisions;
 pub mod send;
 pub mod storage;
+pub mod storage_write;
 pub mod store;
 pub mod stories;
 pub mod unlink;
@@ -151,6 +152,8 @@ pub enum Command {
     PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// Stories looked at here: the other devices are told, and each author when `receipt`.
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
+    /// Change something the account's devices share (see `storage_write`); the other devices are told to read it.
+    SharedChange { target: storage_write::Target, change: storage_write::Change, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Share a contact card.
     SendContact { thread: presage::store::Thread, card: Box<presage::proto::data_message::Contact>, done: Done },
     /// A call taken or placed here ended: the account's other devices are told, for their call logs.

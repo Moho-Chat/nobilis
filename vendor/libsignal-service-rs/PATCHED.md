@@ -30,5 +30,8 @@ What is changed, and nothing else:
 - Number lookup (CDSI, `websocket/directory.rs`): the enclave connection goes through this thread's proxy
   (`push_service::network`) as libsignal-net's own SOCKS/HTTP proxy, and a proxy it cannot use is refused rather than
   bypassed. Upstream always connects directly.
+- Storage service writes: `StorageService::read_raw_items` (an item's decrypted bytes as they are),
+  `encrypt_raw_item`, `write` (`PUT /v1/storage`, a 409 answered as `StorageServiceError::Conflict` with the server's
+  manifest) and `open_manifest`.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

@@ -570,6 +570,26 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     }
                 }
             }
+            Command::SharedChange { target, change, done } => {
+                let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                let device = manager.registration_data().device_id.unwrap_or(0);
+                let mut result = super::storage_write::write(&manager, own, device, &target, &change).await;
+                if result.is_ok() {
+                    // The other devices fetch the new manifest, as Signal's apps ask them to after writing it.
+                    let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::StorageManifest as i32) };
+                    let sync = SyncMessage { content: Some(sync_message::Content::FetchLatest(fetch)), ..Default::default() };
+                    let me = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                    if let Err(e) = manager.send_message(me, sync, now_ms()).await {
+                        tracing::info!("signal[{account_id}]: the other devices were not told the shared settings changed: {e}");
+                    }
+                    // And this one reads it back, so what it shows is what was written.
+                    super::storage::refresh(&state, &handle, &manager).await;
+                } else if let Err(e) = &result {
+                    tracing::info!("signal[{account_id}]: a shared change was not made: {e}");
+                    result = Err(e.clone());
+                }
+                let _ = done.send(result);
+            }
             Command::SendContact { thread, card, done } => {
                 let at = now_ms();
                 let dm = DataMessage { contact: vec![*card], timestamp: Some(at), ..Default::default() };

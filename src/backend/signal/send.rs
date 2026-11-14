@@ -302,6 +302,63 @@ pub async fn contact(state: &AppState, buffer: &Buffer, card: presage::proto::da
     Ok(())
 }
 
+/// How a conversation stands in the account's shared settings: muted until, archived, pinned, marked unread. Note to
+/// Self's archive and unread marks are the account's own.
+fn shared_standing(handle: &Handle, account_id: &str, remote: &str) -> serde_json::Value {
+    let kept = super::storage::current(account_id, &handle.store);
+    let note_to_self = remote == format!("p:{}", handle.own);
+    let standing = if note_to_self { kept.note_to_self.clone() } else { kept.standing(remote).cloned().unwrap_or_default() };
+    serde_json::json!({
+        "known": kept.version > 0,
+        "mutedUntil": if standing.muted_until == u64::MAX { -1 } else { standing.muted_until as i64 },
+        "archived": standing.archived,
+        "unread": standing.marked_unread,
+        "pinned": kept.pinned.iter().any(|p| p == remote),
+        "noteToSelf": note_to_self,
+    })
+}
+
+/// Changes something the account's devices share. `params`: what it is to (`bufferId` for a conversation, `listId` for a
+/// story list, else the account), and the change: `mute` (ms, 0 off, -1 always), `archived`, `unread`, `pinned`,
+/// `setting` + `on`, `replies`, or `person` + `add` for a story list.
+pub async fn shared_change(state: &AppState, account_id: &str, params: &serde_json::Value) -> Result<(), String> {
+    use super::storage_write::{AccountSetting, Change, Target};
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let flag = |name: &str| params.get(name).and_then(|v| v.as_bool());
+    let target = if let Some(list) = params.get("listId").and_then(|v| v.as_str()) {
+        Target::StoryList(uuid::Uuid::parse_str(list).map_err(|_| "that is not a story list".to_string())?)
+    } else if let Some(buffer_id) = params.get("bufferId").and_then(|v| v.as_str()) {
+        let buffer = state.runtime.get_buffer(buffer_id).ok_or("no such conversation")?;
+        match buffer.remote_id.as_deref().and_then(ids::parse_remote_id) {
+            Some(Thread::Contact(id)) => Target::Person(ids::uuid_of(&id)),
+            Some(Thread::Group(key)) => Target::Group(key),
+            None => return Err("that conversation is not a Signal one".to_string()),
+        }
+    } else {
+        Target::Account
+    };
+    let change = if let Some(ms) = params.get("mute").and_then(|v| v.as_i64()) {
+        Change::Mute(if ms < 0 { u64::MAX } else { ms as u64 })
+    } else if let Some(on) = flag("archived") {
+        Change::Archive(on)
+    } else if let Some(on) = flag("unread") {
+        Change::MarkUnread(on)
+    } else if let Some(on) = flag("pinned") {
+        Change::Pin(on)
+    } else if let Some(name) = params.get("setting").and_then(|v| v.as_str()) {
+        Change::Setting(AccountSetting::parse(name).ok_or("no such setting")?, flag("on").unwrap_or(false))
+    } else if let Some(on) = flag("replies") {
+        Change::ListReplies(on)
+    } else if let Some(who) = params.get("person").and_then(|v| v.as_str()) {
+        Change::ListPerson(uuid::Uuid::parse_str(who.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?, flag("add").unwrap_or(false))
+    } else {
+        return Err("nothing to change".to_string());
+    };
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::SharedChange { target, change, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(60)).await
+}
+
 /// Starts a fresh session with a person (from their card): for a conversation whose messages stopped decrypting.
 pub async fn reset_session(state: &AppState, account_id: &str, user_id: &str) -> Result<(), String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
@@ -698,7 +755,9 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         // A conversation with one person has only its timer to show.
         Thread::Contact(_) => {
             let timer = handle.store.expire_timer(&thread).await.ok().flatten().map(|(seconds, _)| seconds).unwrap_or(0);
-            return Ok(serde_json::json!({ "dm": true, "timer": timer }));
+            let mut info = serde_json::json!({ "dm": true, "timer": timer });
+            info["shared"] = shared_standing(&handle, &buffer.account_id, &ids::remote_id(&thread));
+            return Ok(info);
         }
     };
     let group = handle.store.group(key).await.ok().flatten().ok_or("that group is not known to this account")?;
@@ -750,6 +809,7 @@ pub async fn group_info(state: &AppState, buffer: &Buffer) -> Result<serde_json:
         "pending": pending,
         "banned": banned,
         "announcementsOnly": group.announcements_only,
+        "shared": shared_standing(&handle, &buffer.account_id, &ids::remote_id(&thread)),
     }))
 }
 
@@ -969,17 +1029,42 @@ pub fn text_story(text: &str, replies: bool) -> Result<presage::proto::StoryMess
 }
 
 /// The account's story audiences as the window offers them: My Story and the custom lists, each with how many it reaches.
-pub fn story_lists(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+pub async fn story_lists(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
     let kept = super::storage::current(account_id, &handle.store);
-    let mut lists: Vec<serde_json::Value> = kept
-        .story_lists
-        .iter()
-        .map(|l| serde_json::json!({ "id": l.id.to_string(), "name": l.name, "myStory": l.is_my_story(), "count": l.audience(&kept, &handle.own).len(), "replies": l.replies }))
-        .collect();
+    let ctx = super::people::Ctx::new(state, account_id, handle.store.clone(), handle.own);
+    let mut lists: Vec<serde_json::Value> = Vec::new();
+    for l in &kept.story_lists {
+        let mut people = Vec::new();
+        for who in &l.people {
+            people.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, who).await }));
+        }
+        lists.push(serde_json::json!({
+            "id": l.id.to_string(),
+            "name": l.name,
+            "myStory": l.is_my_story(),
+            "count": l.audience(&kept, &handle.own).len(),
+            "replies": l.replies,
+            // For My Story set to "all connections except": the people left out; otherwise the people it goes to.
+            "excluding": l.excluding,
+            "people": people,
+        }));
+    }
     // My Story first, as on the phone.
     lists.sort_by_key(|l| !l["myStory"].as_bool().unwrap_or(false));
     Ok(serde_json::Value::Array(lists))
+}
+
+/// The account's Signal connections (the people a story list is chosen from), by name.
+pub async fn connections(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let kept = super::storage::current(account_id, &handle.store);
+    let ctx = super::people::Ctx::new(state, account_id, handle.store.clone(), handle.own);
+    let mut out = Vec::new();
+    for who in kept.connections().into_iter().filter(|w| *w != handle.own) {
+        out.push(serde_json::json!({ "userId": who.to_string(), "nick": super::people::person(&ctx, &who).await }));
+    }
+    Ok(serde_json::Value::Array(out))
 }
 
 /// Posts a story to one of the account's audiences (My Story or a custom list, by its id).
