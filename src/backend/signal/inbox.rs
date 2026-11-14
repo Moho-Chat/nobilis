@@ -555,7 +555,7 @@ async fn deleted_on_phone(ctx: &Ctx<'_>, deletes: &presage::proto::sync_message:
 
 /// Whether a message is a line in the conversation (text, a file, a sticker...) rather than housekeeping.
 fn shows_something(dm: &DataMessage) -> bool {
-    dm.body.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some() || !dm.contact.is_empty() || dm.poll_create.is_some()
+    dm.body.is_some() || !dm.attachments.is_empty() || dm.sticker.is_some() || !dm.contact.is_empty() || dm.poll_create.is_some() || dm.is_view_once.unwrap_or(false)
 }
 
 /// What the account said on another device.
@@ -652,7 +652,9 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         }
         return;
     }
-    if dm.body.is_none() && dm.attachments.is_empty() && dm.sticker.is_none() && dm.contact.is_empty() && dm.poll_create.is_none() && dm.group_call_update.is_none() && dm.payment.is_none() && dm.gift_badge.is_none() {
+    // A view-once picture can come without the picture (as the phone's copy to the account's other devices does), and
+    // is still something to say: it was dropped as housekeeping (seen on the first real account).
+    if dm.body.is_none() && dm.attachments.is_empty() && dm.sticker.is_none() && dm.contact.is_empty() && dm.poll_create.is_none() && dm.group_call_update.is_none() && dm.payment.is_none() && dm.gift_badge.is_none() && !dm.is_view_once.unwrap_or(false) {
         // A poll vote, a pin, a profile key: not a line in the conversation.
         tracing::debug!("signal[{}]: a message with nothing to show", ctx.account_id);
         return;
@@ -991,6 +993,18 @@ mod tests {
         assert_eq!(found.name, "Note to Self");
         assert!(!state.runtime.awaiting_confirmation(&found.id));
         assert!(ids.iter().any(|id| *id != found.id && state.runtime.awaiting_confirmation(id)));
+    }
+
+    #[tokio::test]
+    async fn a_view_once_picture_without_the_picture_still_says_where_to_see_it() {
+        let (state, store) = world("view-once").await;
+        let ctx = ctx(&state, &store);
+        // As the phone sends it to the account's other devices (seen on the first real account): flagged, no picture.
+        let view_once = DataMessage { is_view_once: Some(true), timestamp: Some(1_700_000_040_000), ..Default::default() };
+        data_message(&ctx, &person(ME), uuid(ME), 1_700_000_040_000, &view_once).await;
+        let rows = backlog(&state, &only_buffer(&state));
+        assert_eq!(rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["[View-once media: open it in Signal on your phone]"]);
+        assert!(rows[0].attachments.is_empty(), "nothing of it is kept or shown");
     }
 
     #[tokio::test]
