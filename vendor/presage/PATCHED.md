@@ -22,6 +22,9 @@ What is changed, and nothing else:
   A change (and a join by link) leaves the actions' `group_id` empty: the server fills it in and refuses a change
   that sets it (HTTP 400).
   `change_group` also answers the change as the server signed it, so the caller can say it in its own conversation.
+- `src/manager/registered.rs`: `upload_group_avatar` (encrypts and uploads a group's picture, answering the CDN key a
+  change names it by) and `group_avatar_at` (a group's picture by that key, without the per-group copy that outlives a
+  change).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

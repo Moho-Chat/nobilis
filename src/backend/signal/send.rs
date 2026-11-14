@@ -411,6 +411,8 @@ pub fn edit_of(params: &serde_json::Value) -> Result<super::manage::Edit, String
     let who = |name: &str| Who::parse(&text(name)).ok_or_else(|| format!("\"{name}\" is all or admins"));
     Ok(match text("action").as_str() {
         "rename" => Edit::Rename(text("name")),
+        // The file is read by edit_group (and uploaded on the account's thread); an empty "path" takes the picture away.
+        "picture" => Edit::Picture(String::new()),
         "describe" => Edit::Describe(text("text")),
         "timer" => Edit::Timer(params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(0) as u32),
         "add" => {
@@ -458,9 +460,38 @@ pub async fn edit_group(state: &AppState, buffer: &Buffer, params: &serde_json::
         params["userIds"] = serde_json::Value::Array(ids);
     }
     let edit = edit_of(&params)?;
+    let picture = match (&edit, params.get("path").and_then(|v| v.as_str()).map(str::trim)) {
+        (super::manage::Edit::Picture(_), Some(path)) if !path.is_empty() => Some(group_picture(path)?),
+        _ => None,
+    };
     let (done, answer) = oneshot::channel();
-    handle.commands.send(Command::EditGroup { key, edit, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    handle.commands.send(Command::EditGroup { key, edit, picture, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     wait(answer, Duration::from_secs(120)).await
+}
+
+/// The most a group's picture may weigh: Signal's clients make theirs a small square, and the CDN's form is for that.
+const BIGGEST_GROUP_PICTURE: u64 = 2 * 1024 * 1024;
+
+/// A picture to put up as a group's: read from `path`, and only a picture (JPEG, PNG, WebP or GIF, by its first bytes)
+/// small enough to be one.
+fn group_picture(path: &str) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("that picture could not be read: {e}"))?.len();
+    if size > BIGGEST_GROUP_PICTURE {
+        return Err("That picture is too big for a group: pick one under 2 MB".to_string());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("that picture could not be read: {e}"))?;
+    if !is_picture(&bytes) {
+        return Err("That is not a picture (JPEG, PNG, WebP or GIF)".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Whether bytes begin as a JPEG, PNG, WebP or GIF does.
+fn is_picture(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"GIF8")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
 }
 
 /// What the group's settings page shows.
@@ -865,6 +896,17 @@ pub async fn answer_request(state: &AppState, account_id: &str, id: &str, answer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_picture_is_only_a_picture() {
+        assert!(is_picture(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]));
+        assert!(is_picture(b"\x89PNG\r\n\x1a\n...."));
+        assert!(is_picture(b"GIF89a"));
+        assert!(is_picture(b"RIFF\0\0\0\0WEBPVP8 "));
+        assert!(!is_picture(b"#!/bin/sh\nrm -rf"));
+        assert!(!is_picture(b"RIFF\0\0\0\0WAVE"));
+        assert!(!is_picture(&[]));
+    }
 
     #[test]
     fn a_poll_asks_a_question_with_two_to_ten_answers() {

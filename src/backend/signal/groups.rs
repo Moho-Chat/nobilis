@@ -168,6 +168,40 @@ pub async fn lines_for(ctx: &Ctx<'_>, changes: &GroupChanges) -> Vec<String> {
 
 /// The window's member list for a group: its members, admins first by their mark, and those invited and not yet in.
 /// Signal has no presence, so nobody is drawn online or away.
+/// Shows a group's picture on its conversation: fetched (through the library, which needs the network) and kept by the
+/// key the group names it by, or taken away when the group has none.
+pub async fn show_avatar(ctx: &Ctx<'_>, manager: &presage::Manager<super::store::SignalStore, presage::manager::Registered>, key: &[u8; 32]) {
+    use presage::store::ContentsStore;
+    let Ok(Some(group)) = ctx.store.group(*key).await else { return };
+    let remote = format!("g:{}", ids::hex(key));
+    let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { return };
+    if group.avatar.is_empty() {
+        ctx.state.runtime.set_buffer_avatar(ctx.state, &buffer.id, "");
+        return;
+    }
+    let path = super::media::group_avatar_path(ctx.account_id, key, &group.avatar);
+    if !path.exists() {
+        let mut manager = manager.clone();
+        match manager.group_avatar_at(*key, &group.avatar).await {
+            Ok(Some(bytes)) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    tracing::debug!("signal[{}]: keeping a group's picture: {e}", ctx.account_id);
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!("signal[{}]: fetching a group's picture: {e}", ctx.account_id);
+                return;
+            }
+        }
+    }
+    ctx.state.runtime.set_buffer_avatar(ctx.state, &buffer.id, &format!("file://{}", path.display()));
+}
+
 pub async fn publish_members(ctx: &Ctx<'_>, key: &[u8; 32]) {
     use presage::store::ContentsStore;
     let Ok(Some(group)) = ctx.store.group(*key).await else { return };

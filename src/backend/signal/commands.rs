@@ -361,7 +361,18 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
-            Command::EditGroup { key, edit, done } => {
+            Command::EditGroup { key, edit, picture, done } => {
+                // A new picture goes up to the CDN first; the change then names it by the key it was given.
+                let edit = match (edit, picture) {
+                    (super::manage::Edit::Picture(_), Some(bytes)) => match manager.upload_group_avatar(key, &bytes).await {
+                        Ok(cdn_key) => super::manage::Edit::Picture(cdn_key),
+                        Err(e) => {
+                            let _ = done.send(Err(format!("the picture could not be put up: {}", explain(&e))));
+                            return;
+                        }
+                    },
+                    (edit, _) => edit,
+                };
                 let result = edit_group(&mut manager, key, edit).await;
                 if let Ok(signed) = &result {
                     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
@@ -371,6 +382,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     // change made from moho, and moho showed none).
                     super::groups::say_own_change(&ctx, key, signed).await;
                     super::groups::publish_members(&ctx, &key).await;
+                    super::groups::show_avatar(&ctx, &manager, &key).await;
                 }
                 let _ = done.send(result.map(|_| ()));
             }
@@ -383,6 +395,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     let buffer = super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
                     super::inbox::system(&ctx, &buffer, "You created the group", now_ms());
                     super::groups::publish_members(&ctx, key).await;
+                    super::groups::show_avatar(&ctx, &manager, key).await;
                 }
                 let _ = done.send(result);
             }
@@ -403,6 +416,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
                     super::people::buffer_for(&ctx, &Thread::Group(*key)).await;
                     super::groups::publish_members(&ctx, key).await;
+                    super::groups::show_avatar(&ctx, &manager, key).await;
                 }
                 let _ = done.send(result);
             }

@@ -113,6 +113,12 @@ pub fn avatar_path(account_id: &str, who: &Uuid) -> PathBuf {
     crate::media_cache::dir(AVATARS).join(format!("{}.jpg", hash(&format!("{account_id}|{who}"))))
 }
 
+/// Where a group's picture is (or will be) in the cache, by the CDN key the group names it by: a new picture is a new
+/// file, so one changed is fetched again rather than an old copy shown.
+pub fn group_avatar_path(account_id: &str, master_key: &[u8; 32], cdn_key: &str) -> PathBuf {
+    crate::media_cache::dir(AVATARS).join(format!("{}.jpg", hash(&format!("{account_id}|g:{}|{cdn_key}", super::ids::hex(master_key)))))
+}
+
 /// The address of a person's picture if it has been fetched.
 pub fn avatar_of(account_id: &str, who: &Uuid) -> Option<String> {
     let path = avatar_path(account_id, who);

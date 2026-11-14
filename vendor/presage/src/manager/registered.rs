@@ -521,6 +521,22 @@ impl<S: Store> Manager<S, Registered> {
         Ok(avatar)
     }
 
+    /// moho: a group's picture by the CDN key the group names it by, decrypted - without `retrieve_group_avatar`'s copy
+    /// kept per group, which outlives the picture being changed. The caller keeps it by key.
+    pub async fn group_avatar_at(
+        &mut self,
+        master_key: [u8; 32],
+        cdn_key: &str,
+    ) -> Result<Option<Vec<u8>>, Error<S::Error>> {
+        if cdn_key.is_empty() {
+            return Ok(None);
+        }
+        let mut gm = Box::pin(self.groups_manager()).await?;
+        Ok(gm
+            .retrieve_avatar(cdn_key, GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)))
+            .await?)
+    }
+
     pub async fn retrieve_profile_avatar_by_uuid(
         &mut self,
         uuid: Uuid,
@@ -644,6 +660,26 @@ impl<S: Store> Manager<S, Registered> {
             .after_group_change(&mut groups_manager, master_key, Some(&before), signed.clone(), timestamp)
             .await?;
         Ok((after, signed))
+    }
+
+    /// moho: puts a picture up as a group's avatar (encrypted with the group's key, uploaded to the CDN), and answers the
+    /// key a change names it by (`ModifyAvatarAction`). The change itself is made with `change_group`.
+    pub async fn upload_group_avatar(
+        &mut self,
+        master_key: [u8; 32],
+        picture: &[u8],
+    ) -> Result<String, Error<S::Error>> {
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = libsignal_service::groups_v2::GroupOperations::new(secret_params);
+        let encrypted = operations.encrypt_avatar(picture, &mut rng());
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        Ok(self
+            .identified_push_service()
+            .upload_group_avatar(authorization, encrypted)
+            .await?)
     }
 
     /// moho: saves a group's state after a change and tells everybody concerned.

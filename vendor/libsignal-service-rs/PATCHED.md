@@ -17,5 +17,8 @@ What is changed, and nothing else:
 - `src/account_manager.rs`, `update_device_name`: the name is encrypted to the account's own identity key (from the
   identity key pair), as Signal's clients do; upstream looked the account up among the identities it had seen, which
   a freshly linked device has not yet, so renaming it failed.
+- Group pictures: `GroupOperations::encrypt_avatar` (the blob members decrypt with `decrypt_avatar`), and
+  `PushService::upload_group_avatar` (`GET /v1/groups/avatar/form` from the group server, then CDN 0 through
+  `upload_to_cdn0`, whose upload attributes are now crate-visible so the form can be made into them).
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

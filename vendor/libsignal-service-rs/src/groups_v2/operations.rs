@@ -364,6 +364,19 @@ impl GroupOperations {
             .encrypt_blob_with_padding(randomness, &buf, 0)
     }
 
+    /// moho: a group's picture, encrypted as the group server and every member's client expect it (the blob that is
+    /// uploaded to the CDN; `decrypt_avatar` is its reverse).
+    pub fn encrypt_avatar<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        picture: &[u8],
+        rng: &mut R,
+    ) -> Vec<u8> {
+        self.encrypt_blob_content(
+            group_attribute_blob::Content::Avatar(picture.to_vec()),
+            rng,
+        )
+    }
+
     pub fn encrypt_title<R: rand::Rng + rand::CryptoRng>(
         &self,
         title: &str,

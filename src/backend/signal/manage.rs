@@ -50,6 +50,8 @@ pub enum Link {
 pub enum Edit {
     Rename(String),
     Describe(String),
+    /// The group's picture: the CDN key it was uploaded under (`upload_group_avatar`), or empty to take it away.
+    Picture(String),
     Timer(u32),
     /// People to put in the group; each is added directly when the server will take it, invited otherwise. The
     /// credentials are fetched before building (see `commands`), `None` meaning "invite".
@@ -90,7 +92,7 @@ pub fn allowed(group: &Group, own: &Aci, edit: &Edit) -> Result<(), String> {
     let attributes_by_admins = group.access_control.as_ref().is_some_and(|a| matches!(a.attributes, presage::libsignal_service::groups_v2::AccessRequired::Administrator));
     let members_by_admins = group.access_control.as_ref().is_some_and(|a| matches!(a.members, presage::libsignal_service::groups_v2::AccessRequired::Administrator));
     match edit {
-        Edit::Rename(_) | Edit::Describe(_) | Edit::Timer(_) if attributes_by_admins && !admin => Err("Only an admin can change this group's details".to_string()),
+        Edit::Rename(_) | Edit::Describe(_) | Edit::Picture(_) | Edit::Timer(_) if attributes_by_admins && !admin => Err("Only an admin can change this group's details".to_string()),
         Edit::Add(_) if members_by_admins && !admin => Err("Only an admin can add people to this group".to_string()),
         Edit::Remove(_) | Edit::Admin(..) | Edit::Approve(..) | Edit::Link(_) | Edit::ResetLink | Edit::DetailsRights(_) | Edit::AddRights(_) | Edit::AnnouncementsOnly(_) if !admin => {
             Err("Only an admin can do that".to_string())
@@ -127,6 +129,7 @@ pub fn actions(operations: &GroupOperations, group: &Group, own: &Aci, edit: &Ed
         Edit::Rename(title) => {
             change.modify_title = Some(actions::ModifyTitleAction { title: operations.encrypt_title(title.trim(), &mut rng) });
         }
+        Edit::Picture(key) => change.modify_avatar = Some(actions::ModifyAvatarAction { avatar: key.clone() }),
         Edit::Describe(text) => {
             change.modify_description = Some(actions::ModifyDescriptionAction { description: operations.encrypt_description(Some(text.trim()).filter(|t| !t.is_empty()), &mut rng) });
         }

@@ -24,13 +24,14 @@ use super::{response::SignalServiceResponse, PushService, ServiceError};
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentV2UploadAttributes {
-    key: String,
-    credential: String,
-    acl: String,
-    algorithm: String,
-    date: String,
-    policy: String,
-    signature: String,
+    // moho: crate-visible, so a group avatar's upload form (protobuf, from the group server) can be made into one.
+    pub(crate) key: String,
+    pub(crate) credential: String,
+    pub(crate) acl: String,
+    pub(crate) algorithm: String,
+    pub(crate) date: String,
+    pub(crate) policy: String,
+    pub(crate) signature: String,
 }
 
 #[derive(Debug, Deserialize)]

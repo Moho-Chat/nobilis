@@ -156,6 +156,7 @@ pub async fn open_groups(state: &AppState, account_id: &str, manager: &Manager<S
         }
         people::buffer_for(&ctx, &Thread::Group(key)).await;
         super::groups::publish_members(&ctx, &key).await;
+        super::groups::show_avatar(&ctx, manager, &key).await;
     }
 }
 
@@ -224,6 +225,21 @@ pub async fn decryption_failed(state: &AppState, handle: &Handle, _manager: &mut
     let _ = state;
 }
 
+/// The group a message changes, if it carries a change: one from a member, or one the account made on another device.
+fn changed_group(content: &Content) -> Option<[u8; 32]> {
+    use presage::proto::sync_message::Content as Sync;
+    let dm = match &content.body {
+        ContentBody::DataMessage(dm) => Some(dm),
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(Sync::Sent(sent)) => sent.message.as_ref(),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    let context = dm.group_v2.as_ref().filter(|g| g.group_change.is_some())?;
+    context.master_key.as_deref().and_then(|k| <[u8; 32]>::try_from(k).ok())
+}
+
 /// One decrypted message, of whatever kind.
 pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<SignalStore, Registered>, content: Content) {
     let ctx = ctx(state, handle, manager);
@@ -232,6 +248,11 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
     if matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
         // Somebody not in the address book is called what they call themselves, which takes their profile.
         want_profile(&ctx, handle, &sender).await;
+    }
+    // A group changed (by somebody else, or on the phone): its picture may be new. The library has brought the group up to
+    // date already; a picture already kept is not fetched again.
+    if let Some(key) = changed_group(&content) {
+        super::groups::show_avatar(&ctx, manager, &key).await;
     }
     announce_changed_identities(&ctx, sent_at).await;
     match &content.body {
@@ -993,6 +1014,19 @@ mod tests {
         assert_eq!(found.name, "Note to Self");
         assert!(!state.runtime.awaiting_confirmation(&found.id));
         assert!(ids.iter().any(|id| *id != found.id && state.runtime.awaiting_confirmation(id)));
+    }
+
+    #[test]
+    fn a_message_that_changes_a_group_is_told_from_one_that_only_speaks_in_it() {
+        use presage::proto::{sync_message, GroupContextV2, SyncMessage};
+        let group = |change: bool| GroupContextV2 { master_key: Some(vec![6; 32]), revision: Some(2), group_change: change.then(|| vec![1, 2, 3]) };
+        let changed = DataMessage { group_v2: Some(group(true)), ..Default::default() };
+        let spoken = DataMessage { group_v2: Some(group(false)), body: Some("hi".into()), ..Default::default() };
+        assert_eq!(changed_group(&content_at(ALICE, ContentBody::DataMessage(changed.clone()), false, 1)), Some([6; 32]));
+        assert_eq!(changed_group(&content_at(ALICE, ContentBody::DataMessage(spoken), false, 1)), None);
+        // Made on the phone: it comes as what the account sent.
+        let sent = SyncMessage { content: Some(sync_message::Content::Sent(sync_message::Sent { message: Some(changed), ..Default::default() })), ..Default::default() };
+        assert_eq!(changed_group(&content_at(ME, ContentBody::SynchronizeMessage(sent), false, 1)), Some([6; 32]));
     }
 
     #[tokio::test]

@@ -107,7 +107,8 @@ pub enum Command {
     /// Find who has a username.
     LookUpUsername { name: String, done: tokio::sync::oneshot::Sender<Result<Option<uuid::Uuid>, String>> },
     /// Change a group.
-    EditGroup { key: [u8; 32], edit: manage::Edit, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// A change to a group; `picture` is uploaded first, for an `Edit::Picture`, which then names it.
+    EditGroup { key: [u8; 32], edit: manage::Edit, picture: Option<Vec<u8>>, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Make a group; the answer is its master key.
     CreateGroup { title: String, members: Vec<uuid::Uuid>, done: tokio::sync::oneshot::Sender<Result<[u8; 32], String>> },
     /// What a group link leads to: (title, members, whether an admin approves).
