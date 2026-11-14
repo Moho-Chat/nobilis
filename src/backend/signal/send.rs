@@ -88,6 +88,7 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
             may_send(&group, &handle.own)?;
         }
     }
+    held_for_safety_number(state, buffer, &handle, &thread).await?;
     // In a group, `@Name` for a member is a mention, which Signal carries as a character and a range over it.
     let (body, mentioned) = match &thread {
         Thread::Group(key) => compose::mentions(body, &members_of(state, buffer, &handle, key).await),
@@ -200,6 +201,34 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
         super::expiry::from_sent(&ctx, &buffer.id, &noted_thread, &ids::message_id(at, &handle.own), at, seconds);
     }
+    Ok(())
+}
+
+/// Refuses a send to somebody (or a group with somebody) whose safety number changed after the account marked them
+/// verified, until the account has looked: Signal's clients stop there too.
+async fn held_for_safety_number(state: &AppState, buffer: &Buffer, handle: &Handle, thread: &Thread) -> Result<(), String> {
+    let people: Vec<uuid::Uuid> = match thread {
+        Thread::Contact(id) => vec![ids::uuid_of(id)],
+        Thread::Group(key) => match presage::store::ContentsStore::group(&handle.store, *key).await {
+            Ok(Some(group)) => group.members.iter().map(|m| uuid::Uuid::from(m.aci)).filter(|u| *u != handle.own).collect(),
+            _ => Vec::new(),
+        },
+    };
+    for who in people {
+        if super::profile::unconfirmed(&handle.store, &who) {
+            let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+            let name = super::people::person(&ctx, &who).await;
+            return Err(format!("{name}'s safety number changed after you verified it. Compare it again, or choose Send anyway, in their profile"));
+        }
+    }
+    Ok(())
+}
+
+/// Says to send to somebody whose verified safety number changed, without verifying it again.
+pub fn send_anyway(state: &AppState, account_id: &str, user_id: &str) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let who = uuid::Uuid::parse_str(user_id.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?;
+    super::profile::confirm(&handle.store, &who);
     Ok(())
 }
 

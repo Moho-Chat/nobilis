@@ -312,6 +312,12 @@ async fn announce_changed_identities(ctx: &Ctx<'_>, at_ms: u64) {
         let thread = Thread::Contact(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(who)));
         let buffer = people::buffer_for(ctx, &thread).await;
         let person = people::person(ctx, &who).await;
+        // Somebody marked verified is not any more, and nothing goes to them until that is looked at, as on the phone.
+        if super::profile::was_verified(&ctx.store, &who) {
+            super::profile::hold_for_confirmation(&ctx.store, &who);
+            system(ctx, &buffer, &format!("Your safety number with {person} has changed, and you had marked them verified. Nothing is sent to them until you compare it again or say to send anyway, in their profile"), at_ms);
+            continue;
+        }
         system(ctx, &buffer, &format!("Your safety number with {person} has changed. Check it in their profile if you want to be sure it is them"), at_ms);
     }
 }
@@ -1551,6 +1557,15 @@ mod tests {
         // And once told, not told again.
         announce_changed_identities(&ctx, 1_700_000_202_000).await;
         assert_eq!(backlog(&state, &only_buffer(&state)).len(), 1);
+        // Marked verified, then changed: no longer verified, and held until looked at.
+        store.set_blob(&format!("verified:{}", uuid(ALICE)), b"1").unwrap();
+        protocol.save_identity(&address, IdentityKeyPair::generate(&mut rng).identity_key()).await.unwrap();
+        announce_changed_identities(&ctx, 1_700_000_203_000).await;
+        assert!(backlog(&state, &only_buffer(&state))[1].body.contains("you had marked them verified"));
+        assert!(!super::super::profile::was_verified(&store, &uuid(ALICE)));
+        assert!(super::super::profile::unconfirmed(&store, &uuid(ALICE)));
+        super::super::profile::confirm(&store, &uuid(ALICE));
+        assert!(!super::super::profile::unconfirmed(&store, &uuid(ALICE)));
     }
 
     #[test]

@@ -43,6 +43,37 @@ fn target_of(state: &AppState, buffer_id: &str, user_id: &str) -> Option<Uuid> {
     Uuid::parse_str(user_id).ok()
 }
 
+/// Whether the account had marked this person verified.
+pub fn was_verified(store: &SignalStore, who: &Uuid) -> bool {
+    store.blob(&format!("verified:{who}")).ok().flatten().is_some_and(|b| b == b"1")
+}
+
+/// A verified person's key changed: no longer verified, and sends to them wait for the account to look.
+pub fn hold_for_confirmation(store: &SignalStore, who: &Uuid) {
+    let _ = store.set_blob(&format!("verified:{who}"), b"0");
+    let _ = store.set_blob(&format!("unconfirmed:{who}"), b"1");
+}
+
+/// Whether sends to this person wait for the account to look at their changed safety number.
+pub fn unconfirmed(store: &SignalStore, who: &Uuid) -> bool {
+    store.blob(&format!("unconfirmed:{who}")).ok().flatten().is_some_and(|b| b == b"1")
+}
+
+/// The account has looked (marked them verified again, cleared it, or said to send anyway).
+pub fn confirm(store: &SignalStore, who: &Uuid) {
+    let _ = store.set_blob(&format!("unconfirmed:{who}"), b"0");
+}
+
+/// The titles of the groups the account and this person are both in.
+pub async fn groups_in_common(store: &SignalStore, who: &Uuid) -> Vec<String> {
+    use presage::store::ContentsStore;
+    let aci = Aci::from(*who);
+    let Ok(groups) = store.groups().await else { return Vec::new() };
+    let mut titles: Vec<String> = groups.filter_map(Result::ok).filter(|(key, g)| g.is_member(&aci) && !store.has_left(key)).map(|(_, g)| g.title).collect();
+    titles.sort_by_key(|t| t.to_lowercase());
+    titles
+}
+
 pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &str, user_id: &str) -> Value {
     let mut card = profile::pending("signal", account_id, who);
     card["pending"] = json!(false);
@@ -79,8 +110,12 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
         if let Some(number) = safety_number(&ctx.store, &handle.own, &target).await {
             profile::note(&mut card, "Safety number (compare with theirs in Signal; not yet checked against another client)", number);
         }
-        let verified = ctx.store.blob(&format!("verified:{target}")).ok().flatten().is_some_and(|b| b == b"1");
-        card["signalVerified"] = json!(verified);
+        let common = groups_in_common(&ctx.store, &target).await;
+        if !common.is_empty() {
+            profile::note(&mut card, "Groups in common", common.join(", "));
+        }
+        card["signalVerified"] = json!(was_verified(&ctx.store, &target));
+        card["signalUnconfirmed"] = json!(unconfirmed(&ctx.store, &target));
         card["signalBlocked"] = json!(kept.blocked(&format!("p:{target}")));
     }
     card

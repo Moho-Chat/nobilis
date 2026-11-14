@@ -376,6 +376,8 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 };
                 if result.is_ok() {
                     let _ = store.set_blob(&format!("verified:{who}"), if verified { b"1" } else { b"0" });
+                    // Looked at: sends to them are no longer held.
+                    super::profile::confirm(&store, &who);
                 }
                 let _ = done.send(result);
             }

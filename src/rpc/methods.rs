@@ -6029,6 +6029,10 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalSendAnyway" => match backend::signal::send::send_anyway(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
         "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
