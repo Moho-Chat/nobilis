@@ -31,6 +31,11 @@ pub fn buffer(ctx: &Ctx<'_>) -> Buffer {
     ctx.state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
 }
 
+/// Which group a story was posted to, kept by the story's id: its answers go there.
+fn group_key(story_id: &str) -> String {
+    format!("story-group:{story_id}")
+}
+
 fn pointer_key(ts: u64, author: &Uuid) -> String {
     format!("story:{}", ids::message_id(ts, author))
 }
@@ -84,12 +89,16 @@ pub async fn arrived(ctx: &Ctx<'_>, author: Uuid, at: u64, story: &StoryMessage)
     if now.saturating_sub(at) > u64::from(LIFE_SECONDS) * 1000 {
         return;
     }
-    let group = match story.group.as_ref().and_then(|g| g.master_key.as_deref()).and_then(|k| <[u8; 32]>::try_from(k).ok()) {
+    let group_master = story.group.as_ref().and_then(|g| g.master_key.as_deref()).and_then(|k| <[u8; 32]>::try_from(k).ok());
+    let group = match group_master {
         Some(key) => Some(people::group_title(ctx, &key).await),
         None => None,
     };
     let buffer = buffer(ctx);
     let id = ids::message_id(at, &author);
+    if let Some(key) = group_master {
+        let _ = ctx.store.set_blob(&group_key(&id), &key);
+    }
     let from = people::person(ctx, &author).await;
     let thread = Thread::Contact(ServiceId::Aci(author.into()));
     let attachments = match &story.attachment {
@@ -126,11 +135,18 @@ pub async fn arrived(ctx: &Ctx<'_>, author: Uuid, at: u64, story: &StoryMessage)
     }
 }
 
-/// The story a message in the Stories conversation is, as a reply names it.
-pub fn context_of(message_id: &str) -> Option<(Thread, presage::proto::data_message::StoryContext)> {
+/// The story a message in the Stories conversation is, as a reply names it, and where its answers go: to the group a
+/// group story was posted to, where its members see them, as Signal's clients send them (seen on the first real account:
+/// a reaction to a group story went to its author instead), else to whoever posted it.
+pub fn context_of(store: &super::store::SignalStore, message_id: &str) -> Option<(Thread, presage::proto::data_message::StoryContext)> {
     let (ts, author) = ids::parse_message_id(message_id)?;
     let context = presage::proto::data_message::StoryContext { author_aci: Some(author.to_string()), sent_timestamp: Some(ts), author_aci_binary: Some(author.as_bytes().to_vec()) };
-    Some((Thread::Contact(ServiceId::Aci(author.into())), context))
+    let group = store.blob(&group_key(message_id)).ok().flatten().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    let thread = match group {
+        Some(key) => Thread::Group(key),
+        None => Thread::Contact(ServiceId::Aci(author.into())),
+    };
+    Some((thread, context))
 }
 
 #[cfg(test)]
@@ -149,8 +165,13 @@ mod tests {
     #[test]
     fn a_reply_names_the_story_by_its_author_and_time() {
         let author = Uuid::from_u128(5);
-        let (thread, context) = context_of(&ids::message_id(1_700_000_000_000, &author)).unwrap();
+        let store = super::super::store::SignalStore::open_in_memory(presage::model::identity::OnNewIdentity::Trust).unwrap();
+        let id = ids::message_id(1_700_000_000_000, &author);
+        let (thread, context) = context_of(&store, &id).unwrap();
         assert!(matches!(thread, Thread::Contact(ServiceId::Aci(a)) if Uuid::from(a) == author));
+        // Posted to a group: answered in the group.
+        store.set_blob(&group_key(&id), &[3u8; 32]).unwrap();
+        assert!(matches!(context_of(&store, &id).unwrap().0, Thread::Group(k) if k == [3u8; 32]));
         assert_eq!((context.sent_timestamp, context.author_aci.as_deref()), (Some(1_700_000_000_000), Some(author.to_string().as_str())));
     }
 

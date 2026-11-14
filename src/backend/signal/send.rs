@@ -206,12 +206,9 @@ async fn story_reply(state: &AppState, buffer: &Buffer, body: &str, paths: &[(St
     if !paths.is_empty() {
         return Err("A story is answered in words or with a reaction, not with a file".to_string());
     }
-    let (thread, context) = super::stories::context_of(story).ok_or("that is not a story")?;
-    if ids::uuid_of(match &thread {
-        Thread::Contact(id) => id,
-        Thread::Group(_) => return Err("that is not a story".to_string()),
-    }) == handle.own
-    {
+    let (thread, context) = super::stories::context_of(&handle.store, story).ok_or("that is not a story")?;
+    // One's own story is answered in its group, where the members talk about it; to oneself there is nobody to tell.
+    if matches!(&thread, Thread::Contact(id) if ids::uuid_of(id) == handle.own) {
         return Err("That is your own story".to_string());
     }
     let (plain, _) = compose::parse(body);
@@ -235,7 +232,7 @@ async fn story_reply(state: &AppState, buffer: &Buffer, body: &str, paths: &[(St
 pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str, add: bool) -> Result<(), String> {
     if buffer.remote_id.as_deref() == Some(super::stories::REMOTE) {
         let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
-        let (thread, context) = super::stories::context_of(msg_id).ok_or("that is not a story")?;
+        let (thread, context) = super::stories::context_of(&handle.store, msg_id).ok_or("that is not a story")?;
         ask(&handle, |done| Command::StoryAnswer { thread, context, body: None, emoji: Some((emoji.to_string(), !add)), done }).await?;
         state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
         return Ok(());
