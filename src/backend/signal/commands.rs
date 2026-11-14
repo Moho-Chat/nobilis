@@ -59,20 +59,40 @@ pub fn in_group(body: ContentBody, key: &[u8; 32], revision: u32) -> ContentBody
     }
 }
 
-/// Sends `body` to `thread`. The error is already in words.
-async fn deliver(manager: &mut Library, thread: &Thread, body: impl Into<ContentBody>, at: u64) -> Result<(), String> {
+/// Sends `body` to `thread`. The error is already in words. A group message that reached some members and not others
+/// counts as sent, and who it missed (and why) is said in the group as a line.
+async fn deliver(state: &AppState, account_id: &str, manager: &mut Library, thread: &Thread, body: impl Into<ContentBody>, at: u64) -> Result<(), String> {
+    let body: ContentBody = body.into();
+    // Passing news (typing) that missed somebody is not worth a line.
+    let worth_saying = !matches!(body, ContentBody::TypingMessage(_));
     let sent = match thread {
         Thread::Contact(id) => manager.send_message(*id, body, at).await,
         Thread::Group(key) => {
             use presage::store::ContentsStore;
             let revision = manager.store().group(*key).await.ok().flatten().map(|g| g.revision).unwrap_or(0);
-            manager.send_message_to_group(key, in_group(body.into(), key, revision), at).await
+            manager.send_message_to_group(key, in_group(body, key, revision), at).await
         }
     };
-    sent.map_err(|e| {
-        tracing::info!("signal: a send failed: {e}");
-        explain(&e)
-    })
+    match sent {
+        Err(PresageError::PartialGroupSend(_)) if !worth_saying => Ok(()),
+        Err(PresageError::PartialGroupSend(failed)) => {
+            tracing::info!("signal[{account_id}]: a group message missed {} member(s)", failed.len());
+            let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+            let ctx = super::people::Ctx::new(state, account_id, manager.store().clone(), own);
+            let buffer = super::people::buffer_for(&ctx, thread).await;
+            let mut missed = Vec::new();
+            for (who, error) in failed {
+                let name = super::people::person(&ctx, &ids::uuid_of(&who)).await;
+                missed.push(format!("{name} ({})", explain(&PresageError::MessageSenderError(Box::new(error))).to_lowercase()));
+            }
+            super::inbox::system(&ctx, &buffer, &format!("Not delivered to {}", missed.join(", ")), at + 1);
+            Ok(())
+        }
+        other => other.map_err(|e| {
+            tracing::info!("signal: a send failed: {e}");
+            explain(&e)
+        }),
+    }
 }
 
 fn finish(done: super::Done, result: Result<(), String>, at: u64) {
@@ -167,7 +187,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 };
                 let typing = TypingMessage { timestamp: Some(at), action: Some(action as i32), group_id };
                 // Typing is passing news: a failure to say it is not worth more than a line in the log.
-                if let Err(e) = deliver(&mut manager, &thread, typing, at).await {
+                if let Err(e) = deliver(&state, &account_id, &mut manager, &thread, typing, at).await {
                     tracing::debug!("signal[{account_id}]: typing was not sent: {e}");
                 }
             }
@@ -211,7 +231,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let at = now_ms();
                 let is_view_once = view_once.then_some(true);
                 let dm = DataMessage { body: Some(body).filter(|b| !b.is_empty()), body_ranges: ranges, quote, attachments, is_view_once, timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::React { thread, target_ms, target_author, emoji, remove, done } => {
@@ -224,13 +244,13 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     target_sent_timestamp: Some(target_ms),
                 };
                 let dm = DataMessage { reaction: Some(reaction), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::Delete { thread, target_ms, done } => {
                 let at = now_ms();
                 let dm = DataMessage { delete: Some(data_message::Delete { target_sent_timestamp: Some(target_ms) }), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::Storage => super::storage::refresh(&state, &handle, &manager).await,
@@ -260,7 +280,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     };
                     let message = data_message::Sticker { pack_id: Some(pack.id.clone()), pack_key: Some(pack.key.clone()), sticker_id: Some(sticker_id), data: Some(pointer), emoji: sticker.emoji.clone() };
                     let dm = DataMessage { sticker: Some(message), timestamp: Some(at), ..Default::default() };
-                    deliver(&mut manager, &thread, dm, at).await
+                    deliver(&state, &account_id, &mut manager, &thread, dm, at).await
                 }
                 .await;
                 finish(done, result.map_err(|e: String| e), at);
@@ -275,26 +295,26 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     target_sent_timestamp: context.sent_timestamp,
                 });
                 let dm = DataMessage { body, reaction, story_context: Some(context), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::Vote { thread, vote, done } => {
                 let at = now_ms();
                 let dm = DataMessage { poll_vote: Some(vote), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::EndPoll { thread, target_ms, done } => {
                 let at = now_ms();
                 let end = data_message::PollTerminate { target_sent_timestamp: Some(target_ms) };
                 let dm = DataMessage { poll_terminate: Some(end), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::Poll { thread, create, done } => {
                 let at = now_ms();
                 let dm = DataMessage { poll_create: Some(create), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
             Command::SetProfile { given, family, about, emoji, picture, done } => {
@@ -445,7 +465,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 use presage::store::ContentsStore;
                 let version = manager.store().expire_timer(&thread).await.ok().flatten().map(|(_, v)| v).unwrap_or(1) + 1;
                 let dm = DataMessage { flags: Some(2), expire_timer: Some(seconds), expire_timer_version: Some(version), timestamp: Some(at), ..Default::default() };
-                let result = deliver(&mut manager, &thread, dm, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
                 if result.is_ok() {
                     let mut store = manager.store().clone();
                     let _ = store.update_expire_timer(&thread, seconds, version).await;
@@ -542,7 +562,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 let at = now_ms();
                 let dm = DataMessage { body: Some(body), body_ranges: ranges, timestamp: Some(at), ..Default::default() };
                 let edit = EditMessage { target_sent_timestamp: Some(target_ms), data_message: Some(dm) };
-                let result = deliver(&mut manager, &thread, edit, at).await;
+                let result = deliver(&state, &account_id, &mut manager, &thread, edit, at).await;
                 finish(done, result, at);
             }
         }

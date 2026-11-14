@@ -64,6 +64,9 @@ pub enum Error<S: std::error::Error> {
     GroupChange(String),
     #[error("unknown group")]
     UnknownGroup,
+    /// moho: a group message reached some members and not these. It was sent and saved.
+    #[error("not delivered to {} member(s)", .0.len())]
+    PartialGroupSend(Vec<(libsignal_service::protocol::ServiceId, libsignal_service::sender::MessageSenderError)>),
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]

@@ -1701,24 +1701,29 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let online_only = false;
+        let recipients_for_errors: Vec<ServiceId> = recipients.iter().map(|(id, _, _)| *id).collect();
         let results = sender
             .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
             .await;
 
-        // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
-        results
-            .into_iter()
-            .find(|res| match res {
-                Ok(_) => false,
+        // moho: a send that reached nobody fails as before; one that reached some members is saved and the others are
+        // answered as `Error::PartialGroupSend`, so a retry does not send it twice to those who have it.
+        let recipient_ids: Vec<ServiceId> = recipients_for_errors;
+        let mut delivered = 0usize;
+        let mut failed = Vec::new();
+        for (who, res) in recipient_ids.into_iter().zip(results) {
+            match res {
+                Ok(_) => delivered += 1,
                 // Ignore any NotFound errors, those mean that e.g. some contact in a group deleted his account.
                 Err(MessageSenderError::NotFound { service_id }) => {
                     debug!(service_id = %service_id.service_id_string(), "recipient not found, skipping sent message result");
-                    false
                 }
-                // return first error if any
-                Err(_) => true,
-            })
-            .transpose()?;
+                Err(error) => failed.push((who, error)),
+            }
+        }
+        if delivered == 0 && !failed.is_empty() {
+            return Err(failed.remove(0).1.into());
+        }
 
         let content = Content {
             metadata: Metadata {
@@ -1746,6 +1751,9 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
+        if !failed.is_empty() {
+            return Err(Error::PartialGroupSend(failed));
+        }
         Ok(())
     }
 
