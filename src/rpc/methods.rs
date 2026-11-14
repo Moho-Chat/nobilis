@@ -1658,6 +1658,10 @@ pub async fn dispatch(
                 .await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("signal:") {
+                // An Ogg Opus file marked as a voice note, as the attachment's flag says on Signal.
+                let path = finished.path.to_string_lossy().to_string();
+                backend::signal::send::voice_message(state, &buffer, &path).await.map_err(|e| anyhow::anyhow!(e))
             } else if buffer.account_id.starts_with("xmpp:") {
                 // An Ogg Opus file over HTTP Upload that says how long it is: what XMPP clients play as a voice message.
                 let path = finished.path.to_string_lossy().to_string();

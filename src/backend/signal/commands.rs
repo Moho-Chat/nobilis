@@ -208,7 +208,7 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                             length: f.bytes.len(),
                             file_name: Some(f.name),
                             preview: None,
-                            voice_note: None,
+                            voice_note: f.voice.then_some(true),
                             borderless: None,
                             width: f.width,
                             height: f.height,

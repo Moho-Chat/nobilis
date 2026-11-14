@@ -79,6 +79,15 @@ fn dimensions_of(path: &str, content_type: &str) -> (Option<u32>, Option<u32>) {
 
 /// Sends text and files: `paths` are put on Signal's servers first, then the message carries them.
 pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+    files_as(state, buffer, body, paths, reply_to, progress, false).await
+}
+
+/// Sends a voice message recorded in the window (an Ogg Opus file), marked as spoken rather than as a file of audio.
+pub async fn voice_message(state: &AppState, buffer: &Buffer, path: &str) -> Result<(), String> {
+    files_as(state, buffer, "", &[(path.to_string(), false)], None, None, true).await
+}
+
+async fn files_as(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>, voice: bool) -> Result<(), String> {
     if buffer.remote_id.as_deref() == Some(super::stories::REMOTE) {
         return story_reply(state, buffer, body, paths, reply_to).await;
     }
@@ -128,10 +137,10 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
         let (width, height) = dimensions_of(path, content_type);
         let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
         local.push(path.clone());
-        uploads.push(super::Upload { name, content_type: content_type.to_string(), bytes, width, height });
+        uploads.push(super::Upload { name, content_type: content_type.to_string(), bytes, width, height, voice });
     }
     if let Some(whole) = long {
-        uploads.push(super::Upload { name: "long-message.txt".to_string(), content_type: super::media::LONG_TEXT.to_string(), bytes: whole.into_bytes(), width: None, height: None });
+        uploads.push(super::Upload { name: "long-message.txt".to_string(), content_type: super::media::LONG_TEXT.to_string(), bytes: whole.into_bytes(), width: None, height: None, voice: false });
     }
     let pointers = if uploads.is_empty() {
         Vec::new()
@@ -897,7 +906,7 @@ pub async fn post_story(state: &AppState, buffer: &Buffer, text: &str, path: Opt
             let (width, height) = dimensions_of(path, content_type);
             let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("story").to_string();
             let (done, answer) = oneshot::channel();
-            handle.commands.send(Command::Upload { files: vec![super::Upload { name, content_type: content_type.to_string(), bytes, width, height }], done }).map_err(|_| "that Signal account is not connected".to_string())?;
+            handle.commands.send(Command::Upload { files: vec![super::Upload { name, content_type: content_type.to_string(), bytes, width, height, voice: false }], done }).map_err(|_| "that Signal account is not connected".to_string())?;
             let mut pointer = wait(answer, Duration::from_secs(600)).await?.pop().ok_or("Signal did not take the file")?;
             pointer.caption = Some(text.trim().to_string()).filter(|t| !t.is_empty());
             presage::proto::StoryMessage { attachment: Some(Attachment::FileAttachment(pointer)), allows_replies: Some(replies), ..Default::default() }
@@ -959,7 +968,7 @@ pub async fn gif(state: &AppState, buffer: &Buffer, url: &str) -> Result<(), Str
     };
     let name = if content_type == "video/mp4" { "gif.mp4" } else { "gif.gif" }.to_string();
     let (done, answer) = oneshot::channel();
-    let upload = super::Upload { name, content_type, bytes: bytes.to_vec(), width: None, height: None };
+    let upload = super::Upload { name, content_type, bytes: bytes.to_vec(), width: None, height: None, voice: false };
     handle.commands.send(Command::Upload { files: vec![upload], done }).map_err(|_| "that Signal account is not connected".to_string())?;
     let mut pointers = wait(answer, Duration::from_secs(300)).await?;
     for pointer in &mut pointers {

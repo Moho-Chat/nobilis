@@ -72,6 +72,8 @@ pub struct Upload {
     pub bytes: Vec<u8>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Spoken into the window (a voice message), not a file of audio.
+    pub voice: bool,
 }
 
 /// How a command says how it went: the time the message was sent, or why it was not.
