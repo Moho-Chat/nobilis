@@ -191,6 +191,10 @@ async fn linking(state: &AppState, login_id: &str, path: &std::path::Path, stop:
                     device_name: data.device_name().unwrap_or(&name).to_string(),
                     history_offered: data.ephemeral_backup_key().is_some(),
                 };
+                // The phone offered its history: the key waits with the account until the archive comes (see `history`).
+                if let Some(key) = data.ephemeral_backup_key() {
+                    store.set_blob(super::history::KEY_BLOB, &key).context("keeping the history key")?;
+                }
                 drop(manager);
                 store.checkpoint().context("writing the account's keys")?;
                 return Ok(Some(found));

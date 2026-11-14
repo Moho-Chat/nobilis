@@ -713,6 +713,19 @@ impl<S: Store> Manager<S, Registered> {
             .await?)
     }
 
+    /// moho: waits (up to `timeout_secs`) for the phone to say where the message history it transfers is.
+    pub async fn transfer_archive(
+        &mut self,
+        timeout_secs: u32,
+    ) -> Result<Option<libsignal_service::websocket::linking::TransferArchive>, Error<S::Error>> {
+        Ok(self.identified_websocket(false).await?.transfer_archive(timeout_secs).await?)
+    }
+
+    /// moho: downloads the transferred history (still encrypted) from its CDN.
+    pub async fn download_transfer_archive(&self, cdn: u32, key: &str) -> Result<Vec<u8>, Error<S::Error>> {
+        Ok(self.identified_push_service().download_cdn_file(cdn, key).await?)
+    }
+
     /// moho: a group call's membership proof: the group server's token for this account in this group, as UTF-8 bytes
     /// (as Signal's apps hand it to RingRTC).
     pub async fn group_call_proof(&mut self, master_key: [u8; 32]) -> Result<Vec<u8>, Error<S::Error>> {

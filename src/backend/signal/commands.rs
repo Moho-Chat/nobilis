@@ -590,6 +590,46 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
+            Command::ImportHistory => {
+                let Some(key) = handle.store.blob(super::history::KEY_BLOB).ok().flatten().and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok()) else { return };
+                // Taken now, whatever comes of it: a history the phone did not send is not waited for on every connect.
+                let _ = handle.store.set_blob(super::history::KEY_BLOB, &[]);
+                let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
+                let note = super::people::buffer_for(&ctx, &Thread::Contact(ServiceId::Aci(own.into()))).await;
+                super::inbox::system(&ctx, &note, "Waiting for your phone to send its message history", now_ms());
+                // The phone uploads it after the link; it can take a while for a long history.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
+                let archive = loop {
+                    if tokio::time::Instant::now() > deadline {
+                        break Err("The phone did not send its message history in time".to_string());
+                    }
+                    match manager.transfer_archive(25).await {
+                        Ok(None) => continue,
+                        Ok(Some(presage::libsignal_service::websocket::linking::TransferArchive::Ready { cdn, key: cdn_key })) => break Ok((cdn, cdn_key)),
+                        Ok(Some(presage::libsignal_service::websocket::linking::TransferArchive::Failed { error })) => {
+                            break Err(if error == "CONTINUE_WITHOUT_UPLOAD" { "The phone chose not to send its message history".to_string() } else { format!("The phone did not send its message history ({error})") })
+                        }
+                        Err(e) => break Err(format!("The message history could not be asked for: {}", explain(&e))),
+                    }
+                };
+                let words = match archive {
+                    Err(e) => e,
+                    Ok((cdn, cdn_key)) => match manager.download_transfer_archive(cdn, &cdn_key).await {
+                        Err(e) => format!("The message history could not be downloaded: {}", explain(&e)),
+                        Ok(bytes) => match super::history::read(&bytes, &key, &own).await {
+                            Err(e) => format!("The message history could not be read: {e}"),
+                            Ok(frames) => {
+                                let old = super::history::messages(&frames);
+                                let brought = super::history::import(&ctx, &old).await;
+                                tracing::info!("signal[{account_id}]: {brought} messages of history brought over");
+                                format!("Your phone's message history was brought over: {brought} messages (pictures and files stay on the phone)")
+                            }
+                        },
+                    },
+                };
+                super::inbox::system(&ctx, &note, &words, now_ms());
+            }
             Command::SendContact { thread, card, done } => {
                 let at = now_ms();
                 let dm = DataMessage { contact: vec![*card], timestamp: Some(at), ..Default::default() };

@@ -94,6 +94,31 @@ impl PushService {
         self.get_from_cdn(ptr.cdn_number(), &path).await
     }
 
+    /// moho: a file on a CDN by its key, as it is stored (the transferred message history, which its reader decrypts).
+    pub async fn download_cdn_file(
+        &mut self,
+        cdn_id: u32,
+        key: &str,
+    ) -> Result<Vec<u8>, ServiceError> {
+        use futures::io::AsyncReadExt;
+        let mut download = self
+            .get_from_cdn(cdn_id, &format!("attachments/{key}"))
+            .await?;
+        let mut out = Vec::new();
+        download
+            .stream
+            .read_to_end(&mut out)
+            .await
+            .map_err(|e| ServiceError::InvalidFrame {
+                reason: if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    "the download stopped early"
+                } else {
+                    "the download failed"
+                },
+            })?;
+        Ok(out)
+    }
+
     #[tracing::instrument(skip(self))]
     pub(crate) async fn get_from_cdn(
         &mut self,

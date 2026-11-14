@@ -109,7 +109,10 @@ impl ProvisioningPipe {
                         &BASE64_RELAXED.encode(
                             self.provisioning_cipher.public_key().serialize(),
                         ),
-                    );
+                    )
+                    // moho: this device takes the message history the phone can transfer when linking (as Signal
+                    // Desktop says it does); the phone then offers to.
+                    .append_pair("capabilities", "backup4,backup5");
 
                 // acknowledge
                 responder

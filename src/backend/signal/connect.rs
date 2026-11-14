@@ -214,6 +214,10 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
                             if !handle.memory.synced().known() {
                                 let _ = handle.commands.send(Command::AskPhone(presage::proto::sync_message::request::Type::Configuration));
                             }
+                            // A fresh link the phone offered its history to: brought over now, once.
+                            if handle.store.blob(super::history::KEY_BLOB).ok().flatten().is_some_and(|k| k.len() == 32) {
+                                let _ = handle.commands.send(Command::ImportHistory);
+                            }
                         }
                     }
                     Received::Contacts => inbox::contacts_arrived(state, &handle, &manager).await,

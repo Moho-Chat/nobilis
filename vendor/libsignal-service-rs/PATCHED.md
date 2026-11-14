@@ -34,5 +34,7 @@ What is changed, and nothing else:
   `encrypt_raw_item`, `write` (`PUT /v1/storage`, a 409 answered as `StorageServiceError::Conflict` with the server's
   manifest) and `open_manifest`.
 - Group calls: `PushService::group_external_credential` (`GET /v1/groups/token`, a group call's membership proof).
+- Message history at link time: the link address says `capabilities=backup4,backup5` (so the phone offers its
+  history), `SignalWebSocket::transfer_archive` (`GET /v1/devices/transfer_archive`) and `PushService::download_cdn_file`.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

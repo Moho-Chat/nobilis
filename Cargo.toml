@@ -70,6 +70,10 @@ grammers-session = { version = "=0.11.0", default-features = false, features = [
 # crate presage-store-sqlite is NOT used - it wants libsqlite3-sys 0.36 + SQLCipher, rusqlite here brings 0.38 - the Store
 # trait is implemented in backend/signal/store.rs instead. No `cdsi` (BoringSSL).
 presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false, features = ["cdsi"] }
+# Reading the message history a phone transfers to a newly linked device (Signal's backup format), at the libsignal
+# version presage uses. `test-util` makes its generated protobuf types public; nothing else of it is used.
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 # The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
 async-trait = "0.1"
 uuid = "1"
@@ -160,6 +164,7 @@ idna = "1"
 thiserror = "2"
 x509-parser = { version = "0.17", default-features = false }
 rqrr = "0.10"
+protobuf = "3.7"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

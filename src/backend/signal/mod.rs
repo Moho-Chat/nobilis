@@ -16,6 +16,7 @@ pub mod compose;
 pub mod connect;
 pub mod expiry;
 pub mod groups;
+pub mod history;
 pub mod ids;
 pub mod inbox;
 pub mod link;
@@ -154,6 +155,8 @@ pub enum Command {
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
     /// Change something the account's devices share (see `storage_write`); the other devices are told to read it.
     SharedChange { target: storage_write::Target, change: storage_write::Change, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Bring over the message history the phone transfers to a fresh link (once; see `history`).
+    ImportHistory,
     /// Share a contact card.
     SendContact { thread: presage::store::Thread, card: Box<presage::proto::data_message::Contact>, done: Done },
     /// A call taken or placed here ended: the account's other devices are told, for their call logs.
