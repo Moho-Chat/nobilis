@@ -33,5 +33,6 @@ What is changed, and nothing else:
 - Storage service writes: `StorageService::read_raw_items` (an item's decrypted bytes as they are),
   `encrypt_raw_item`, `write` (`PUT /v1/storage`, a 409 answered as `StorageServiceError::Conflict` with the server's
   manifest) and `open_manifest`.
+- Group calls: `PushService::group_external_credential` (`GET /v1/groups/token`, a group call's membership proof).
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

@@ -160,6 +160,10 @@ pub enum Command {
     CallEventSync { remote: uuid::Uuid, call_id: u64, at_ms: u64, video: bool, incoming: bool, accepted: bool },
     /// Start a fresh session with a person: the old ones are forgotten and a new one is made by sending them nothing.
     ResetSession { who: uuid::Uuid, done: Done },
+    /// A group call's membership proof (the group server's token for this account).
+    GroupCallProof { key: [u8; 32], done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
+    /// Send a call message (a group call's ring, as RingRTC asked) to these people.
+    CallMessageToPeople { people: Vec<uuid::Uuid>, call: Box<presage::proto::CallMessage>, done: Done },
     /// Send a call message (what RingRTC asked to send) to a person.
     CallMessage { to: uuid::Uuid, call: Box<presage::proto::CallMessage>, done: Done },
     /// Signal's relays for a call, with their short-lived credentials, as RingRTC takes ICE servers.

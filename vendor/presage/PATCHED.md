@@ -32,6 +32,8 @@ What is changed, and nothing else:
   `Error::PartialGroupSend` (who it missed, and why); one that reached nobody fails with the first error as before.
 - `src/manager/registered.rs`: `send_story_to` (a story to My Story's or a custom list's people, not saved to a
   conversation).
+- `src/manager/registered.rs`: `group_call_proof` (the group server's call token), and `send_to_people` (one content
+  to a set of people, as a group send; `send_story_to` is it for a story).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

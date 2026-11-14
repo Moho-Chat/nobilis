@@ -6112,6 +6112,22 @@ pub async fn dispatch(
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),
         },
+        "signalGroupCallInfo" => match backend::signal::calls::group_info(state, p_str(params, "bufferId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalGroupCallBuffer" => match backend::signal::calls::group_buffer(state, p_str(params, "accountId", ""), p_str(params, "groupId", "")).await {
+            Ok(value) => (Some(serde_json::json!({ "bufferId": value })), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalSendGroupCallMessage" => {
+            let message = params.get("message").cloned().unwrap_or_default();
+            let recipients: Vec<String> = params.get("recipients").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            match backend::signal::calls::send_to_group(state, p_str(params, "accountId", ""), p_str(params, "groupId", ""), &message, &recipients).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "signalSendCallMessage" => {
             let message = params.get("message").cloned().unwrap_or_default();
             match backend::signal::calls::send(state, p_str(params, "accountId", ""), p_str(params, "to", ""), &message).await {

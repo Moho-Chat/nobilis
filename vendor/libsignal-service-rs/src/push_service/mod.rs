@@ -300,6 +300,26 @@ impl PushService {
     /// Puts a group's picture on the CDN, already encrypted with the group's operations (`encrypt_avatar`), and
     /// answers the key a `ModifyAvatarAction` names it by: the form comes from the group server
     /// (`GET /v1/groups/avatar/form`), the upload goes to CDN 0 as Signal's clients send it.
+    /// moho: the token a group call's server takes as proof of membership (`GET /v1/groups/token`).
+    pub async fn group_external_credential(
+        &mut self,
+        credentials: HttpAuth,
+    ) -> Result<String, ServiceError> {
+        let credential: crate::proto::ExternalGroupCredential = self
+            .request(
+                Method::GET,
+                Endpoint::storage("/v1/groups/token"),
+                HttpAuthOverride::Identified(credentials),
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .protobuf()
+            .await?;
+        Ok(credential.token)
+    }
+
     pub async fn upload_group_avatar(
         &mut self,
         credentials: HttpAuth,

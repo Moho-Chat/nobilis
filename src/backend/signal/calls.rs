@@ -218,6 +218,89 @@ pub async fn settings(state: &AppState, account_id: &str) -> Result<serde_json::
     Ok(serde_json::json!({ "ownAci": handle.own.to_string(), "deviceId": device, "iceServers": relays }))
 }
 
+/// Where Signal's group calls are held.
+pub const SFU_URL: &str = "https://sfu.voip.signal.org";
+
+/// What the app needs to join a group's call: the group's id as RingRTC knows it (the server's identifier), the
+/// membership proof, every member with their id as the group encrypts it, and the call server.
+pub async fn group_info(state: &AppState, buffer_id: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let buffer = state.runtime.get_buffer(buffer_id).ok_or("no such conversation")?;
+    let handle = state.runtime.signal_handle(&buffer.account_id).ok_or("that Signal account is not connected")?;
+    if crate::net::route::router().routed(&buffer.account_id) {
+        return Err("Calls are not made on an account that goes through Tor: a call's sound and picture would leave Tor".to_string());
+    }
+    let Some(Thread::Group(key)) = buffer.remote_id.as_deref().and_then(super::ids::parse_remote_id) else { return Err("that is not a group".to_string()) };
+    if handle.store.has_left(&key) {
+        return Err("You are no longer in this group".to_string());
+    }
+    let group = presage::store::ContentsStore::group(&handle.store, key).await.ok().flatten().ok_or("that group is not known to this account")?;
+    let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key)));
+    let mut members = Vec::new();
+    for m in &group.members {
+        let cipher = operations.encrypt_aci(m.aci).map_err(|e| format!("a member could not be named: {e:?}"))?;
+        members.push(serde_json::json!({ "userId": b64(Uuid::from(m.aci).as_bytes()), "cipher": b64(&cipher) }));
+    }
+    let (done, answer) = tokio::sync::oneshot::channel();
+    handle.commands.send(super::Command::GroupCallProof { key, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let proof = match tokio::time::timeout(std::time::Duration::from_secs(30), answer).await {
+        Ok(Ok(r)) => r?,
+        Ok(Err(_)) => return Err("the connection ended before Signal answered".to_string()),
+        Err(_) => return Err("Signal did not answer in time".to_string()),
+    };
+    let device = state.accounts.get_signal(&buffer.account_id).map(|c| c.device_id).unwrap_or(0);
+    Ok(serde_json::json!({
+        "accountId": buffer.account_id,
+        "bufferId": buffer.id,
+        "groupId": b64(&super::commands::group_identifier(&key)),
+        "proof": b64(&proof),
+        "members": members,
+        "sfuUrl": SFU_URL,
+        "ownAci": handle.own.to_string(),
+        "deviceId": device,
+    }))
+}
+
+/// The group a RingRTC group id (the server's identifier, base64) is, as its conversation.
+pub async fn group_buffer(state: &AppState, account_id: &str, group_id: &str) -> Result<Option<String>, String> {
+    use base64::Engine;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let id = base64::engine::general_purpose::STANDARD.decode(group_id).map_err(|_| "that is not a group id".to_string())?;
+    let groups = presage::store::ContentsStore::groups(&handle.store).await.map_err(|e| e.to_string())?;
+    let Some(key) = groups.filter_map(Result::ok).map(|(key, _)| key).find(|key| super::commands::group_identifier(key) == id) else { return Ok(None) };
+    let remote = super::ids::remote_id(&Thread::Group(key));
+    Ok(state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())).map(|b| b.id))
+}
+
+/// Sends a group call's message (RingRTC's ring, as `opaque` bytes) to the group's members, or to `recipients` when it
+/// names them.
+pub async fn send_to_group(state: &AppState, account_id: &str, group_id: &str, message: &serde_json::Value, recipients: &[String]) -> Result<(), String> {
+    use base64::Engine;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let id = base64::engine::general_purpose::STANDARD.decode(group_id).map_err(|_| "that is not a group id".to_string())?;
+    let groups = presage::store::ContentsStore::groups(&handle.store).await.map_err(|e| e.to_string())?;
+    let group = groups.filter_map(Result::ok).find(|(key, _)| super::commands::group_identifier(key) == id).map(|(_, g)| g).ok_or("that group is not known to this account")?;
+    let people: Vec<Uuid> = if recipients.is_empty() {
+        group.members.iter().map(|m| Uuid::from(m.aci)).filter(|u| *u != handle.own).collect()
+    } else {
+        recipients.iter().filter_map(|r| Uuid::parse_str(r).ok()).filter(|u| *u != handle.own).collect()
+    };
+    if people.is_empty() {
+        return Ok(());
+    }
+    let call = from_wire(message)?;
+    let (done, answer) = tokio::sync::oneshot::channel();
+    handle.commands.send(super::Command::CallMessageToPeople { people, call: Box::new(call), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), answer).await {
+        Ok(Ok(r)) => r.map(|_| ()),
+        Ok(Err(_)) => Err("the connection ended before Signal answered".to_string()),
+        Err(_) => Err("Signal did not answer in time".to_string()),
+    }
+}
+
 /// Sends what RingRTC asked to send to `to`. Answers once Signal took it, which is what RingRTC waits on.
 pub async fn send(state: &AppState, account_id: &str, to: &str, message: &serde_json::Value) -> Result<(), String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

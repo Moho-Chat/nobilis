@@ -626,6 +626,19 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 .await;
                 finish(done, result, at);
             }
+            Command::GroupCallProof { key, done } => {
+                let result = manager.group_call_proof(key).await.map_err(|e| format!("the group server did not give a call token: {}", explain(&e)));
+                let _ = done.send(result);
+            }
+            Command::CallMessageToPeople { people, call, done } => {
+                let at = now_ms();
+                let acis: Vec<presage::libsignal_service::protocol::Aci> = people.into_iter().map(Into::into).collect();
+                let result = match manager.send_to_people(&acis, ContentBody::CallMessage(*call), at, &[]).await {
+                    Ok(()) | Err(PresageError::PartialGroupSend(_)) => Ok(()),
+                    Err(e) => Err(explain(&e)),
+                };
+                finish(done, result, at);
+            }
             Command::CallMessage { to, call, done } => {
                 let at = now_ms();
                 let result = manager.send_message(ServiceId::Aci(to.into()), ContentBody::CallMessage(*call), at).await.map_err(|e| {

@@ -713,6 +713,21 @@ impl<S: Store> Manager<S, Registered> {
             .await?)
     }
 
+    /// moho: a group call's membership proof: the group server's token for this account in this group, as UTF-8 bytes
+    /// (as Signal's apps hand it to RingRTC).
+    pub async fn group_call_proof(&mut self, master_key: [u8; 32]) -> Result<Vec<u8>, Error<S::Error>> {
+        let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rng(), secret_params)
+            .await?;
+        Ok(self
+            .identified_push_service()
+            .group_external_credential(authorization)
+            .await?
+            .into_bytes())
+    }
+
     /// moho: saves a group's state after a change and tells everybody concerned.
     async fn after_group_change(
         &mut self,
@@ -1767,6 +1782,20 @@ impl<S: Store> Manager<S, Registered> {
         timestamp: u64,
         story_lists: &[String],
     ) -> Result<(), Error<S::Error>> {
+        self.send_to_people(people, ContentBody::StoryMessage(story), timestamp, story_lists)
+            .await
+    }
+
+    /// moho: sends one content to these people, as a group send does (sealed where their profile key allows), synced to
+    /// the account's other devices where it is a kind that is synced, and saved to no conversation. Answers like
+    /// `send_message_to_group` (`Error::PartialGroupSend` naming who it missed).
+    pub async fn send_to_people(
+        &mut self,
+        people: &[Aci],
+        content: ContentBody,
+        timestamp: u64,
+        story_lists: &[String],
+    ) -> Result<(), Error<S::Error>> {
         let mut sender = self.new_message_sender().await?;
         let sender_certificate = self.sender_certificate().await?;
         let own = self.state.data.service_ids.aci();
@@ -1780,7 +1809,7 @@ impl<S: Store> Manager<S, Registered> {
         }
         let ids: Vec<ServiceId> = recipients.iter().map(|(id, _, _)| *id).collect();
         let results = sender
-            .send_message_to_many(recipients, ContentBody::StoryMessage(story), timestamp, false, story_lists)
+            .send_message_to_many(recipients, content, timestamp, false, story_lists)
             .await;
         let mut delivered = 0usize;
         let mut failed = Vec::new();
