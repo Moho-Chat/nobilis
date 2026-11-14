@@ -570,6 +570,12 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     }
                 }
             }
+            Command::SendContact { thread, card, done } => {
+                let at = now_ms();
+                let dm = DataMessage { contact: vec![*card], timestamp: Some(at), ..Default::default() };
+                let result = deliver(&state, &account_id, &mut manager, &thread, dm, at).await;
+                finish(done, result, at);
+            }
             Command::CallEventSync { remote, call_id, at_ms, video, incoming, accepted } => {
                 use presage::proto::sync_message::call_event::{Direction, Event, Type};
                 let event = sync_message::CallEvent {

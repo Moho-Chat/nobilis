@@ -6044,6 +6044,24 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalSendLocation" | "signalSendContact" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let list = |name: &str| -> Vec<String> { params.get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default() };
+            let result = if method == "signalSendLocation" {
+                backend::signal::send::location(state, &buffer, p_str(params, "place", ""), p_str(params, "label", "")).await
+            } else {
+                match backend::signal::send::contact_card(p_str(params, "name", ""), &list("numbers"), &list("emails"), p_str(params, "organization", "")) {
+                    Ok(card) => backend::signal::send::contact(state, &buffer, card).await,
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "signalResetSession" => match backend::signal::send::reset_session(state, p_str(params, "accountId", ""), p_str(params, "userId", "")).await {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),

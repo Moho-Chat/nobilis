@@ -236,6 +236,72 @@ async fn held_for_safety_number(state: &AppState, buffer: &Buffer, handle: &Hand
     Ok(())
 }
 
+/// The words a shared place is sent as, the way Signal's own apps write one: what it is called (if it has a name), then a
+/// maps link to the point. `place` is a `geo:lat,long` address.
+pub fn location_text(place: &str, label: &str) -> Result<String, String> {
+    let point = place.trim().strip_prefix("geo:").and_then(|p| p.split(';').next()).ok_or("A place is a geo: address")?;
+    let (lat, long) = point.split_once(',').ok_or("A place needs a latitude and a longitude")?;
+    let (lat, long): (f64, f64) = (lat.trim().parse().map_err(|_| "not a latitude")?, long.trim().parse().map_err(|_| "not a longitude")?);
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&long) {
+        return Err("That place is not on the Earth".to_string());
+    }
+    let link = format!("https://maps.google.com/maps?q={lat}%2C{long}");
+    Ok(match label.trim() {
+        "" => link,
+        name => format!("{name}\n\n{link}"),
+    })
+}
+
+/// Shares a place in a conversation.
+pub async fn location(state: &AppState, buffer: &Buffer, place: &str, label: &str) -> Result<(), String> {
+    let text = location_text(place, label)?;
+    files(state, buffer, &text, &[], None, None).await
+}
+
+/// A contact card to share: a name and whatever ways to reach them were given.
+pub fn contact_card(name: &str, numbers: &[String], emails: &[String], organization: &str) -> Result<presage::proto::data_message::Contact, String> {
+    use presage::proto::data_message::{contact, Contact};
+    let name = name.trim();
+    let numbers: Vec<&str> = numbers.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).collect();
+    let emails: Vec<&str> = emails.iter().map(|e| e.trim()).filter(|e| !e.is_empty()).collect();
+    if name.is_empty() {
+        return Err("A contact card needs a name".to_string());
+    }
+    if numbers.is_empty() && emails.is_empty() {
+        return Err("A contact card needs a number or an email address".to_string());
+    }
+    let (given, family) = match name.rsplit_once(' ') {
+        Some((given, family)) => (given.to_string(), Some(family.to_string())),
+        None => (name.to_string(), None),
+    };
+    Ok(Contact {
+        name: Some(contact::Name { given_name: Some(given), family_name: family, nickname: None, ..Default::default() }),
+        number: numbers.iter().map(|n| contact::Phone { value: Some(n.to_string()), r#type: Some(contact::phone::Type::Mobile as i32), label: None }).collect(),
+        email: emails.iter().map(|e| contact::Email { value: Some(e.to_string()), r#type: Some(contact::email::Type::Home as i32), label: None }).collect(),
+        organization: Some(organization.trim().to_string()).filter(|o| !o.is_empty()),
+        ..Default::default()
+    })
+}
+
+/// Shares a contact card in a conversation.
+pub async fn contact(state: &AppState, buffer: &Buffer, card: presage::proto::data_message::Contact) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    if let Thread::Group(key) = &thread {
+        if let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, *key).await {
+            may_send(&group, &handle.own)?;
+        }
+    }
+    held_for_safety_number(state, buffer, &handle, &thread).await?;
+    let sent = card.clone();
+    let at = ask(&handle, |done| Command::SendContact { thread, card: Box::new(sent), done }).await?;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    let line = super::inbox::contact_words(&card);
+    let id = ids::message_id(at, &handle.own);
+    state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &line, false, "chat", None, Some(id.clone()), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), None, None);
+    state.runtime.set_message_delivery(state, &buffer.id, &id, "sent");
+    Ok(())
+}
+
 /// Starts a fresh session with a person (from their card): for a conversation whose messages stopped decrypting.
 pub async fn reset_session(state: &AppState, account_id: &str, user_id: &str) -> Result<(), String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
@@ -1160,6 +1226,25 @@ mod tests {
     fn a_change_of_timer_is_said_as_signal_says_it() {
         assert_eq!(timer_line("You", 300), "You set disappearing messages to 5 minutes");
         assert_eq!(timer_line("Alice", 0), "Alice turned off disappearing messages");
+    }
+
+    #[test]
+    fn a_place_is_sent_as_its_name_and_a_maps_link() {
+        assert_eq!(location_text("geo:52.2053,0.1218", "Kings College").unwrap(), "Kings College\n\nhttps://maps.google.com/maps?q=52.2053%2C0.1218");
+        assert_eq!(location_text("geo:1.5,-2;u=35", "").unwrap(), "https://maps.google.com/maps?q=1.5%2C-2");
+        assert!(location_text("geo:95,0", "").is_err());
+        assert!(location_text("52,0", "").is_err());
+    }
+
+    #[test]
+    fn a_contact_card_needs_a_name_and_a_way_to_reach_them() {
+        let card = contact_card("Ada Lovelace", &["+1 555 0100".into(), " ".into()], &[], "Engines").unwrap();
+        let name = card.name.as_ref().unwrap();
+        assert_eq!((name.given_name.as_deref(), name.family_name.as_deref()), (Some("Ada"), Some("Lovelace")));
+        assert_eq!(card.number.len(), 1);
+        assert_eq!(card.organization.as_deref(), Some("Engines"));
+        assert!(contact_card("", &["1".into()], &[], "").is_err());
+        assert!(contact_card("Ada", &[], &[], "").is_err());
     }
 
     #[test]

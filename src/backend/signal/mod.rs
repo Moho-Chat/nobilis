@@ -151,6 +151,8 @@ pub enum Command {
     PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// Stories looked at here: the other devices are told, and each author when `receipt`.
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
+    /// Share a contact card.
+    SendContact { thread: presage::store::Thread, card: Box<presage::proto::data_message::Contact>, done: Done },
     /// A call taken or placed here ended: the account's other devices are told, for their call logs.
     CallEventSync { remote: uuid::Uuid, call_id: u64, at_ms: u64, video: bool, incoming: bool, accepted: bool },
     /// Start a fresh session with a person: the old ones are forgotten and a new one is made by sending them nothing.

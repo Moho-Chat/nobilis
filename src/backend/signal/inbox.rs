@@ -796,7 +796,7 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
 }
 
 /// A shared contact card as a line: the name, then each number, email address and organisation it carries.
-fn contact_words(card: &presage::proto::data_message::Contact) -> String {
+pub(super) fn contact_words(card: &presage::proto::data_message::Contact) -> String {
     let name = card.name.as_ref().map(|n| {
         let parts = [n.prefix.as_deref(), n.given_name.as_deref(), n.middle_name.as_deref(), n.family_name.as_deref(), n.suffix.as_deref()];
         let joined = parts.iter().flatten().map(|p| p.trim()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ");
