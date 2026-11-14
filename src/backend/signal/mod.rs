@@ -33,6 +33,7 @@ pub mod storage;
 pub mod store;
 pub mod stories;
 pub mod unlink;
+pub mod viewonce;
 
 pub use connect::spawn;
 
@@ -80,8 +81,9 @@ pub type Done = tokio::sync::oneshot::Sender<Result<u64, String>>;
 pub enum Command {
     /// Ask the phone to send its contacts again.
     RefreshContacts,
-    /// Say something. `body` is plain text and `ranges` the styles over it.
-    Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, attachments: Vec<presage::proto::AttachmentPointer>, done: Done },
+    /// Say something. `body` is plain text and `ranges` the styles over it; `view_once` makes its one picture or video
+    /// something each person can open once.
+    Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, attachments: Vec<presage::proto::AttachmentPointer>, view_once: bool, done: Done },
     /// Encrypt files and put them on Signal's file servers; the answer is the pointers a message carries.
     Upload { files: Vec<Upload>, done: tokio::sync::oneshot::Sender<Result<Vec<presage::proto::AttachmentPointer>, String>> },
     /// React to a message, or take the reaction back.
@@ -137,6 +139,8 @@ pub enum Command {
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.
     AnswerRequest { thread: presage::store::Thread, answer: requests::Answer, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// A view-once message was opened here: the other devices are told, and the sender if `receipt`.
+    ViewOnceOpened { sender: uuid::Uuid, sent_ms: u64, receipt: bool },
     /// Change one of the account's own messages.
     Edit { thread: presage::store::Thread, target_ms: u64, body: String, ranges: Vec<presage::proto::BodyRange>, done: Done },
 }

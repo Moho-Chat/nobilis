@@ -3860,7 +3860,9 @@ pub async fn dispatch(
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
                         None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
                     };
-                    let files: Vec<(String, bool)> = paths.into_iter().map(|p| (p, false)).collect();
+                    // The window's spoiler mark: Signal has no hidden files, and sends the marked one as view-once.
+                    let marked: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), marked.contains(&p.as_str()))).collect();
                     let sent = backend::signal::send::files(state, &buffer, body, &files, reply_to_id, progress).await;
                     if let Some(p) = progress {
                         if !files.is_empty() {
@@ -6003,6 +6005,24 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+
+        // A view-once picture: opened (the file to show, and from then on it is gone), and the shown file taken away.
+        "openSignalViewOnce" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("openSignalViewOnce requires a Signal \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.signal_handle(&buffer.account_id) else {
+                return (None, Some("that Signal account is not connected".to_string()));
+            };
+            match backend::signal::viewonce::open(state, &handle, p_str(params, "messageId", "")).await {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
 
         "signalCreateGroup" | "signalGroupLinkInfo" | "signalJoinGroupLink" => {
             let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {

@@ -207,9 +207,10 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
-            Command::Send { thread, body, ranges, quote, attachments, done } => {
+            Command::Send { thread, body, ranges, quote, attachments, view_once, done } => {
                 let at = now_ms();
-                let dm = DataMessage { body: Some(body).filter(|b| !b.is_empty()), body_ranges: ranges, quote, attachments, timestamp: Some(at), ..Default::default() };
+                let is_view_once = view_once.then_some(true);
+                let dm = DataMessage { body: Some(body).filter(|b| !b.is_empty()), body_ranges: ranges, quote, attachments, is_view_once, timestamp: Some(at), ..Default::default() };
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }
@@ -472,6 +473,20 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     super::requests::apply(&ctx, &thread, answer).await;
                 }
                 let _ = done.send(result);
+            }
+            Command::ViewOnceOpened { sender, sent_ms, receipt } => {
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let open = sync_message::ViewOnceOpen { sender_aci: Some(sender.to_string()), timestamp: Some(sent_ms), sender_aci_binary: Some(sender.as_bytes().to_vec()) };
+                let sync = SyncMessage { content: Some(sync_message::Content::ViewOnceOpen(open)), ..Default::default() };
+                if let Err(e) = manager.send_message(own, sync, now_ms()).await {
+                    tracing::debug!("signal[{account_id}]: the other devices were not told a view-once picture was opened: {e}");
+                }
+                if receipt {
+                    let viewed = ReceiptMessage { r#type: Some(presage::proto::receipt_message::Type::Viewed as i32), timestamp: vec![sent_ms] };
+                    if let Err(e) = manager.send_message(ServiceId::Aci(sender.into()), viewed, now_ms()).await {
+                        tracing::debug!("signal[{account_id}]: a viewed receipt was not sent: {e}");
+                    }
+                }
             }
             Command::Edit { thread, target_ms, body, ranges, done } => {
                 let at = now_ms();

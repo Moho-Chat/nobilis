@@ -102,6 +102,12 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     if paths.len() > MOST {
         return Err(format!("Signal takes at most {MOST} files in a message, and this has {}", paths.len()));
     }
+    // A file marked (the window's spoiler mark, which Signal does not have) goes as view-once: one picture or video,
+    // alone, that each person can open once.
+    let view_once = paths.iter().any(|(_, marked)| *marked);
+    if view_once {
+        view_once_allowed(paths, &plain)?;
+    }
     let mut uploads = Vec::new();
     let mut local = Vec::new();
     // Over Signal's 2000 bytes, the message carries the first part as its text and the whole as a file, as Signal's
@@ -158,10 +164,17 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     let timer = presage::store::ContentsStore::expire_timer(&handle.store, &thread).await.ok().flatten().map(|(seconds, _)| seconds).filter(|s| *s > 0);
     let noted_thread = thread.clone();
     let sent_pointers = pointers.clone();
-    let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, attachments: sent_pointers, done }).await?;
+    let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, attachments: sent_pointers, view_once, done }).await?;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    if view_once {
+        // Not kept here either: the sender cannot open it again on any device, as on the phone.
+        state.runtime.record_message_at(
+            state, &buffer.account_id, &buffer.name, &buffer.kind, &own, VIEW_ONCE_SENT, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
+        );
+        return Ok(());
+    }
     let names: Vec<(String, String)> = mentioned.iter().map(|id| (id.to_string(), name_here(state, buffer, id, &handle))).collect();
     let drawn = ranges::render(&plain, &styles, |aci| names.iter().find(|(id, _)| id == aci).map(|(_, n)| n.clone()).unwrap_or_else(|| "someone".to_string()));
-    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
     // The files are on hand already: they go into the cache under the names the attachments will be looked for by.
     let mut attachments = super::media::attachments_of(&buffer.account_id, &noted_thread, &handle.own, at, &pointers);
     attachments.retain(|a| a.mimetype.as_deref() != Some(super::media::LONG_TEXT));
@@ -186,6 +199,24 @@ pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Stri
     if let Some(seconds) = timer {
         let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
         super::expiry::from_sent(&ctx, &buffer.id, &noted_thread, &ids::message_id(at, &handle.own), at, seconds);
+    }
+    Ok(())
+}
+
+/// What a view-once picture or video the account sent shows as here.
+pub const VIEW_ONCE_SENT: &str = "[View-once media]";
+
+/// Whether these files can go as view-once: Signal's clients send one picture or video, with no words.
+fn view_once_allowed(paths: &[(String, bool)], text: &str) -> Result<(), String> {
+    if paths.len() != 1 {
+        return Err("View once is for one picture or video at a time".to_string());
+    }
+    let kind = content_type_of(&paths[0].0);
+    if !(kind.starts_with("image/") || kind.starts_with("video/")) {
+        return Err("Only a picture or a video can be sent to view once".to_string());
+    }
+    if !text.trim().is_empty() {
+        return Err("A view-once picture goes without words: send them on their own".to_string());
     }
     Ok(())
 }
@@ -814,7 +845,7 @@ pub async fn gif(state: &AppState, buffer: &Buffer, url: &str) -> Result<(), Str
     for pointer in &mut pointers {
         pointer.flags = Some(pointer.flags.unwrap_or(0) | 8);
     }
-    let at = ask(&handle, |done| Command::Send { thread: thread.clone(), body: String::new(), ranges: Vec::new(), quote: None, attachments: pointers.clone(), done }).await?;
+    let at = ask(&handle, |done| Command::Send { thread: thread.clone(), body: String::new(), ranges: Vec::new(), quote: None, attachments: pointers.clone(), view_once: false, done }).await?;
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
     let attachments = super::media::attachments_of(&buffer.account_id, &thread, &handle.own, at, &pointers);
     // The file is on hand: it goes into the cache where the attachment will be looked for, so it is not fetched back.
@@ -944,6 +975,16 @@ mod tests {
     fn a_change_of_timer_is_said_as_signal_says_it() {
         assert_eq!(timer_line("You", 300), "You set disappearing messages to 5 minutes");
         assert_eq!(timer_line("Alice", 0), "Alice turned off disappearing messages");
+    }
+
+    #[test]
+    fn view_once_is_one_picture_or_video_alone() {
+        let one = |p: &str| vec![(p.to_string(), true)];
+        assert!(view_once_allowed(&one("/a/cat.jpg"), "").is_ok());
+        assert!(view_once_allowed(&one("/a/clip.mp4"), " ").is_ok());
+        assert!(view_once_allowed(&one("/a/notes.txt"), "").is_err());
+        assert!(view_once_allowed(&one("/a/cat.jpg"), "look").is_err());
+        assert!(view_once_allowed(&[("/a/1.jpg".into(), true), ("/a/2.jpg".into(), false)], "").is_err());
     }
 
     #[test]

@@ -342,6 +342,11 @@ async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &
         }
         Some(Sync::Blocked(blocked)) => blocked_on_phone(ctx, blocked).await,
         Some(Sync::DeleteForMe(deletes)) => deleted_on_phone(ctx, deletes).await,
+        Some(Sync::ViewOnceOpen(open)) => {
+            if let (Some(sender), Some(sent_ms)) = (ids::aci_of(open.sender_aci.as_deref(), open.sender_aci_binary.as_deref()), open.timestamp) {
+                super::viewonce::opened_elsewhere(ctx, sender, sent_ms);
+            }
+        }
         Some(Sync::Verified(verified)) => {
             // Marked verified (or not) on the phone: kept with the person, for their card.
             if let Some(who) = ids::aci_of(verified.destination_aci.as_deref(), verified.destination_aci_binary.as_deref()) {
@@ -697,23 +702,29 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
     let highlight = !own && shown.mentioned_me;
     // The pictures, files and stickers: named in the cache now, fetched when looked at (see `media`).
     let view_once = dm.is_view_once.unwrap_or(false);
+    // A view-once picture is kept aside until it is opened, and the message says only what it is (see `viewonce`).
+    let held = if view_once && !own { dm.attachments.first().cloned() } else { None };
     let pointers = if view_once { Vec::new() } else { super::media::pointers_of(dm) };
     let mut attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers[..super::media::shown_count(dm).min(pointers.len())]);
     // A message longer than Signal's 2000 bytes carries the whole of its text as a file; that is not a file to show.
     let long_text = pointers.iter().find(|p| p.content_type.as_deref() == Some(super::media::LONG_TEXT)).cloned();
     attachments.retain(|a| a.mimetype.as_deref() != Some(super::media::LONG_TEXT));
     let cards = if view_once { Vec::new() } else { super::media::previews_of(ctx.account_id, thread, &author, at, dm) };
+    let body = match &held {
+        Some(pointer) => shown.body.replace(VIEW_ONCE_ELSEWHERE, super::viewonce::waiting_words(pointer)),
+        None => shown.body.clone(),
+    };
     let recorded = ctx.state.runtime.record_message_at(
         ctx.state,
         ctx.account_id,
         &buffer.name,
         &buffer.kind,
         &from,
-        &shown.body,
+        &body,
         false,
         "chat",
         reply,
-        Some(id),
+        Some(id.clone()),
         highlight,
         super::media::avatar_of(ctx.account_id, &author),
         cards,
@@ -723,6 +734,9 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         shown.html,
         None,
     );
+    if let (true, Some(pointer)) = (recorded, &held) {
+        super::viewonce::hold(ctx, &buffer.id, &id, pointer);
+    }
     if recorded {
         if let (Some(pointer), Some(handle)) = (long_text, ctx.state.runtime.signal_handle(ctx.account_id)) {
             // The whole text, fetched now rather than on look: it is the message, not an attachment to it.
@@ -751,6 +765,9 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
         }
     }
 }
+
+/// A view-once message moho has no picture for.
+const VIEW_ONCE_ELSEWHERE: &str = "[View-once media: open it in Signal on your phone]";
 
 /// The words of a message and what to say about the rest of it.
 struct Shown {
@@ -781,8 +798,8 @@ async fn describe(ctx: &Ctx<'_>, dm: &DataMessage) -> Shown {
         lines.push("[Reply to a story]".to_string());
     }
     if dm.is_view_once.unwrap_or(false) {
-        // Seen once and gone: moho does not keep or show it, so it says where it can be seen.
-        lines.push("[View-once media: open it in Signal on your phone]".to_string());
+        // Without the picture (the copy of the phone's own send): there is nothing here to open.
+        lines.push(VIEW_ONCE_ELSEWHERE.to_string());
     }
     for card in &dm.contact {
         let name = card.name.as_ref().map(|n| [n.given_name.as_deref(), n.family_name.as_deref()].iter().flatten().copied().collect::<Vec<_>>().join(" ")).unwrap_or_default();
@@ -1039,6 +1056,28 @@ mod tests {
         let rows = backlog(&state, &only_buffer(&state));
         assert_eq!(rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["[View-once media: open it in Signal on your phone]"]);
         assert!(rows[0].attachments.is_empty(), "nothing of it is kept or shown");
+    }
+
+    #[tokio::test]
+    async fn a_view_once_picture_from_somebody_waits_behind_a_button_and_is_forgotten_once_opened_elsewhere() {
+        let (state, store) = world("view-once-held").await;
+        let ctx = ctx(&state, &store);
+        let at = 1_700_000_041_000;
+        let pointer = presage::proto::AttachmentPointer { content_type: Some("image/jpeg".into()), size: Some(10), ..Default::default() };
+        let view_once = DataMessage { is_view_once: Some(true), attachments: vec![pointer], timestamp: Some(at), ..Default::default() };
+        data_message(&ctx, &person(ALICE), uuid(ALICE), at, &view_once).await;
+        let buffer = only_buffer(&state);
+        let rows = backlog(&state, &buffer);
+        assert_eq!(rows[0].body, "[View-once photo]");
+        assert!(rows[0].attachments.is_empty(), "not drawn until opened");
+        let id = ids::message_id(at, &uuid(ALICE));
+        let kept = state.store.get_message(&buffer.id, &id).unwrap().unwrap();
+        assert_eq!(kept.components.iter().filter_map(|c| c.custom_id.as_deref()).collect::<Vec<_>>(), vec![super::super::viewonce::BUTTON]);
+        // Opened on the phone: gone here too.
+        super::super::viewonce::opened_elsewhere(&ctx, uuid(ALICE), at);
+        let kept = state.store.get_message(&buffer.id, &id).unwrap().unwrap();
+        assert!(kept.components.is_empty());
+        assert_eq!(kept.body, super::super::viewonce::OPENED);
     }
 
     #[tokio::test]

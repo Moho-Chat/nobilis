@@ -83,6 +83,8 @@ pub fn spawn(state: AppState, config: SignalAccountConfig) {
     let account_id = config.account_id();
     crate::net::route::router().mark(&account_id, config.use_tor);
     state.runtime.reset_connection(&account_id);
+    // A view-once picture left on disk by a window that closed while showing it.
+    super::viewonce::sweep();
     // The thread stops when this sender is dropped, which is what aborting the task below does.
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let done = local::run("signal", {
