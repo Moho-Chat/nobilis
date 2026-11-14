@@ -481,6 +481,17 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 };
                 let _ = done.send(result);
             }
+            Command::LookUpNumber { number, done } => {
+                let result = match manager.discover_contacts_by_phone_number([number.as_str()]).await {
+                    Ok(found) => number_found(found.into_iter().map(|(_, id)| id).collect()),
+                    Err(PresageError::ServiceError(ServiceError::RateLimitExceeded { .. })) => Err("Signal asked for a pause: too many numbers looked up".to_string()),
+                    Err(e) => {
+                        tracing::info!("signal[{account_id}]: a number lookup failed: {e}");
+                        Err(format!("Signal's number lookup did not answer: {}", explain(&e)))
+                    }
+                };
+                let _ = done.send(result);
+            }
             Command::AnswerRequest { thread, answer, done } => {
                 let at = now_ms();
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
@@ -569,6 +580,21 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
     });
 }
 
+/// What a number lookup found: an ACI is somebody to talk to. Only a PNI is an account that is on Signal but has chosen
+/// not to be found by its number, which is said as such; nothing is nobody.
+fn number_found(found: Vec<Option<ServiceId>>) -> Result<Option<uuid::Uuid>, String> {
+    if let Some(aci) = found.iter().flatten().find_map(|id| match id {
+        ServiceId::Aci(aci) => Some(uuid::Uuid::from(*aci)),
+        _ => None,
+    }) {
+        return Ok(Some(aci));
+    }
+    if found.iter().flatten().any(|id| matches!(id, ServiceId::Pni(_))) {
+        return Err("That number is on Signal, but its owner chose not to be found by it: ask them for their username".to_string());
+    }
+    Ok(None)
+}
+
 /// Makes one change to a group, after checking it is one the account may make.
 async fn edit_group(manager: &mut Library, key: [u8; 32], edit: super::manage::Edit) -> Result<presage::proto::GroupChange, String> {
     use presage::store::ContentsStore;
@@ -642,6 +668,15 @@ pub fn quote_of(state: &AppState, signal: &super::store::SignalStore, buffer_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_number_lookup_tells_somebody_from_somebody_hidden_from_nobody() {
+        use presage::libsignal_service::protocol::{Aci, Pni};
+        let who = uuid::Uuid::from_u128(7);
+        assert_eq!(number_found(vec![Some(ServiceId::Aci(Aci::from(who)))]), Ok(Some(who)));
+        assert!(number_found(vec![Some(ServiceId::Pni(Pni::from(who)))]).unwrap_err().contains("chose not to be found"));
+        assert_eq!(number_found(vec![None]), Ok(None));
+    }
 
     #[test]
     fn a_message_for_a_group_carries_the_group_and_an_edit_does_too() {

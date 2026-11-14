@@ -111,7 +111,8 @@ pub enum Command {
     Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
     /// Find who has a username.
     LookUpUsername { name: String, done: tokio::sync::oneshot::Sender<Result<Option<uuid::Uuid>, String>> },
-    /// Change a group.
+    /// Find who has a number (E.164), through Signal's contact discovery.
+    LookUpNumber { number: String, done: tokio::sync::oneshot::Sender<Result<Option<uuid::Uuid>, String>> },
     /// A change to a group; `picture` is uploaded first, for an `Edit::Picture`, which then names it.
     EditGroup { key: [u8; 32], edit: manage::Edit, picture: Option<Vec<u8>>, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Make a group; the answer is its master key.

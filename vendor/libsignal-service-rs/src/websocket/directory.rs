@@ -21,6 +21,42 @@ use crate::websocket::{Identified, SignalWebSocket};
 
 pub use libsignal_net::cdsi::LookupRequest;
 
+/// moho: this thread's proxy (see `push_service::network`) in libsignal-net's terms. `None` is direct.
+fn thread_proxy() -> Result<
+    Option<libsignal_net_infra::route::ConnectionProxyConfig>,
+    ServiceError,
+> {
+    let refuse = |why: String| {
+        warn!(%why, "number lookup cannot use this thread's proxy");
+        ServiceError::InvalidFrame {
+            reason: "number lookup cannot use this account's route",
+        }
+    };
+    let Some(proxy) = crate::push_service::network::for_this_thread().proxy
+    else {
+        return Ok(None);
+    };
+    if proxy == crate::push_service::network::NOWHERE {
+        return Err(refuse("the route is not ready".into()));
+    }
+    let url = url::Url::parse(&proxy).map_err(|e| refuse(e.to_string()))?;
+    let port = url.port().and_then(std::num::NonZeroU16::new);
+    let auth = (!url.username().is_empty()).then(|| {
+        (
+            url.username().to_string(),
+            url.password().unwrap_or_default().to_string(),
+        )
+    });
+    libsignal_net_infra::route::ConnectionProxyConfig::from_parts(
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        port,
+        auth,
+    )
+    .map(Some)
+    .map_err(|e| refuse(e.to_string()))
+}
+
 /// CDSI authentication credentials
 #[derive(Debug, Deserialize)]
 struct CdsiAuth {
@@ -93,16 +129,21 @@ impl SignalWebSocket<Identified> {
             confirmation_header_name: None,
         };
 
-        // 3. Connect to CDSI using DirectOrProxyProvider::direct() wrapper
+        // 3. Connect to CDSI, through this thread's proxy when it has one (moho: a routed account never goes out
+        // directly; a proxy libsignal-net cannot use is a refusal, not a direct connection).
         let cdsi_endpoint = &env.cdsi;
+        let mode = libsignal_net_infra::route::DirectOrProxyMode::maybe_proxy(
+            thread_proxy()?,
+        );
         let cdsi_connection = CdsiConnection::connect_with(
             connection_resources,
             env.cdsi.domain_config.connect.service,
-            libsignal_net_infra::route::DirectOrProxyProvider::direct(
-                cdsi_endpoint.enclave_websocket_provider(
+            libsignal_net_infra::route::DirectOrProxyProvider {
+                inner: cdsi_endpoint.enclave_websocket_provider(
                     libsignal_net_infra::EnableDomainFronting::No,
                 ),
-            ),
+                mode,
+            },
             cdsi_endpoint.ws_config,
             &cdsi_endpoint.params,
             &auth,

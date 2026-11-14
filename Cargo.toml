@@ -69,7 +69,7 @@ grammers-session = { version = "=0.11.0", default-features = false, features = [
 # own libsignal. All AGPL-3.0, pinned to a commit (its libsignal-service-rs and libsignal pins ride with it). The store
 # crate presage-store-sqlite is NOT used - it wants libsqlite3-sys 0.36 + SQLCipher, rusqlite here brings 0.38 - the Store
 # trait is implemented in backend/signal/store.rs instead. No `cdsi` (BoringSSL).
-presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false, features = ["cdsi"] }
 # The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
 async-trait = "0.1"
 uuid = "1"

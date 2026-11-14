@@ -26,5 +26,8 @@ What is changed, and nothing else:
 - Profile pictures: `ProfileCipher::encrypt_avatar`, `SignalWebSocket::write_profile_with_new_avatar` (the profile write
   that answers the CDN form; upstream's `write_profile` panics on a new avatar) and
   `AccountManager::upload_versioned_profile_with_new_avatar`; the `cdn` module is crate-visible.
+- Number lookup (CDSI, `websocket/directory.rs`): the enclave connection goes through this thread's proxy
+  (`push_service::network`) as libsignal-net's own SOCKS/HTTP proxy, and a proxy it cannot use is refused rather than
+  bypassed. Upstream always connects directly.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

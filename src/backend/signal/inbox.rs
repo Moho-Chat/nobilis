@@ -86,8 +86,8 @@ pub async fn want_profile(ctx: &Ctx<'_>, handle: &Handle, who: &Uuid) {
 }
 
 /// Opens (or finds) the conversation with a person, named by their ACI, their username (`name.42`, with or without an
-/// `@`), or a number the phone already knows. A number nobody has given the account is not looked up: that needs
-/// Signal's contact discovery, which moho does not do (see the plan's Round 12).
+/// `@`), or a number: one the phone already knows, else looked up through Signal's contact discovery (through the
+/// account's route; see the vendored service crate's `directory.rs`).
 pub async fn open_dm(state: &AppState, handle: &Handle, user_id: &str) -> anyhow::Result<String> {
     let wanted = user_id.trim();
     let wanted = wanted.strip_prefix("p:").unwrap_or(wanted);
@@ -100,7 +100,7 @@ pub async fn open_dm(state: &AppState, handle: &Handle, user_id: &str) -> anyhow
     Ok(people::buffer_for(&ctx, &thread).await.id)
 }
 
-/// Who a username or number names.
+/// Who a username or number names. A number the account does not know is looked up with Signal (with its country code).
 pub(super) async fn find_person(state: &AppState, handle: &Handle, wanted: &str) -> anyhow::Result<Uuid> {
     let kept = super::storage::current(&handle.account_id, &handle.store);
     let looks_like_number = wanted.starts_with('+') || wanted.chars().all(|c| c.is_ascii_digit() || " -().".contains(c));
@@ -117,7 +117,20 @@ pub(super) async fn find_person(state: &AppState, handle: &Handle, wanted: &str)
                 }
             }
         }
-        anyhow::bail!("Nobody with that number is in this account's contacts. Signal finds a number only through its contact discovery, which moho does not use: ask them for their username, or add them on your phone first");
+        // Not known here: asked of Signal's contact discovery, whose enclave sees the number and nobody else does.
+        let e164 = format!("+{digits}");
+        if !wanted.trim_start().starts_with('+') {
+            anyhow::bail!("Write the number with its country code, like +44 7700 900123, so Signal can look it up");
+        }
+        let (done, answer) = tokio::sync::oneshot::channel();
+        handle.commands.send(super::Command::LookUpNumber { number: e164, done }).map_err(|_| anyhow::anyhow!("that Signal account is not connected"))?;
+        return match tokio::time::timeout(std::time::Duration::from_secs(60), answer).await {
+            Ok(Ok(Ok(Some(who)))) => Ok(who),
+            Ok(Ok(Ok(None))) => anyhow::bail!("Nobody on Signal can be found by that number. They may not be on Signal, or may have turned off being found by number"),
+            Ok(Ok(Err(e))) => anyhow::bail!("{e}"),
+            Ok(Err(_)) => anyhow::bail!("the connection ended before Signal answered"),
+            Err(_) => anyhow::bail!("Signal did not answer in time"),
+        };
     }
     let name = wanted.trim_start_matches('@');
     if let Some(who) = kept.person_with_username(name) {
