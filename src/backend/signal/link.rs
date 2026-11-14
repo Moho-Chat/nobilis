@@ -173,6 +173,14 @@ async fn linking(state: &AppState, login_id: &str, path: &std::path::Path, stop:
             (linked, ()) = work => {
                 let manager = match linked {
                     Ok(manager) => manager,
+                    // Signal closes the code's socket after a minute or two unscanned, which the library answers as
+                    // "no provisioning message": the code ran out, and a new one is shown, as when ours runs out first
+                    // (seen: a code scanned just after Signal closed it failed the whole link).
+                    Err(e) if got_code.get() && e.to_string().contains("no provisioning message") => {
+                        tracing::info!("signal: the code ran out at Signal's end; making a new one");
+                        status(state, login_id, "The code ran out. Making a new one");
+                        continue;
+                    }
                     Err(e) if !got_code.get() && unreached < 2 => {
                         unreached += 1;
                         tracing::info!("signal: no code from Signal ({e}); trying again");
