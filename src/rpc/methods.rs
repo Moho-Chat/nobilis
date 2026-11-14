@@ -6033,6 +6033,15 @@ pub async fn dispatch(
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
         },
+        // A linked account sealed into a file with a passphrase, and brought back from one (see signal::backup).
+        "exportSignalAccount" => match backend::signal::backup::export(state, p_str(params, "accountId", ""), p_str(params, "path", ""), p_str(params, "passphrase", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "importSignalAccount" => match backend::signal::backup::import(state, p_str(params, "path", ""), p_str(params, "passphrase", "")).await {
+            Ok(account_id) => (Some(serde_json::json!({ "accountId": account_id })), None),
+            Err(e) => (None, Some(e)),
+        },
         "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),

@@ -9,6 +9,7 @@
 // The store is built before the connection that uses it (issue 35, Round 0/2); each piece is used as it lands.
 #![allow(dead_code)]
 
+pub mod backup;
 pub mod commands;
 pub mod compose;
 pub mod connect;
