@@ -151,6 +151,10 @@ pub enum Command {
     PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// Stories looked at here: the other devices are told, and each author when `receipt`.
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
+    /// Send a call message (what RingRTC asked to send) to a person.
+    CallMessage { to: uuid::Uuid, call: Box<presage::proto::CallMessage>, done: Done },
+    /// Signal's relays for a call, with their short-lived credentials, as RingRTC takes ICE servers.
+    CallRelays { done: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>> },
     /// A view-once message was opened here: the other devices are told, and the sender if `receipt`.
     ViewOnceOpened { sender: uuid::Uuid, sent_ms: u64, receipt: bool },
     /// Change one of the account's own messages.

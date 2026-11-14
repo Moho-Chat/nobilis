@@ -6057,6 +6057,18 @@ pub async fn dispatch(
             Ok(account_id) => (Some(serde_json::json!({ "accountId": account_id })), None),
             Err(e) => (None, Some(e)),
         },
+        // RingRTC (in the app) places and takes Signal calls; the daemon carries their messages and fetches the relays.
+        "signalCallSettings" => match backend::signal::calls::settings(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalSendCallMessage" => {
+            let message = params.get("message").cloned().unwrap_or_default();
+            match backend::signal::calls::send(state, p_str(params, "accountId", ""), p_str(params, "to", ""), &message).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         // A Signal call ringing here is silenced (nothing is sent; it is answered or turned down on the phone).
         "silenceSignalCall" => (Some(serde_json::json!({ "silenced": backend::signal::calls::silence(state, p_str(params, "bufferId", "")) })), None),
         "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {

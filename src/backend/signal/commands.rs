@@ -570,6 +570,31 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     }
                 }
             }
+            Command::CallMessage { to, call, done } => {
+                let at = now_ms();
+                let result = manager.send_message(ServiceId::Aci(to.into()), ContentBody::CallMessage(*call), at).await.map_err(|e| {
+                    tracing::info!("signal[{account_id}]: a call message was not sent: {e}");
+                    explain(&e)
+                });
+                finish(done, result, at);
+            }
+            Command::CallRelays { done } => {
+                let result = manager.calling_relays().await.map_err(|e| explain(&e)).map(|relays| {
+                    // RingRTC's ICE servers: the plain addresses, and those with IPs beside the name they are checked by.
+                    let servers: Vec<serde_json::Value> = relays
+                        .into_iter()
+                        .flat_map(|r| {
+                            let mut out = vec![serde_json::json!({ "username": r.username, "password": r.password, "urls": r.urls })];
+                            if !r.urls_with_ips.is_empty() {
+                                out.push(serde_json::json!({ "username": r.username, "password": r.password, "urls": r.urls_with_ips, "hostname": r.hostname }));
+                            }
+                            out
+                        })
+                        .collect();
+                    serde_json::Value::Array(servers)
+                });
+                let _ = done.send(result);
+            }
             Command::ViewOnceOpened { sender, sent_ms, receipt } => {
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
                 let open = sync_message::ViewOnceOpen { sender_aci: Some(sender.to_string()), timestamp: Some(sent_ms), sender_aci_binary: Some(sender.as_bytes().to_vec()) };

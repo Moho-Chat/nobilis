@@ -304,6 +304,7 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         ContentBody::CallMessage(call) => {
             let server_ms = content.metadata.server_timestamp.timestamp_millis().max(0) as u64;
             super::calls::arrived(&ctx, sender, server_ms, call).await;
+            super::calls::hand_to_app(&ctx, sender, u32::from(u8::from(content.metadata.sender_device)), server_ms, call);
         }
         ContentBody::StoryMessage(story) => {
             // Nothing from somebody blocked; a story is otherwise shown whoever posted it, as Signal's clients do for
