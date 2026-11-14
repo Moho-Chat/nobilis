@@ -65,7 +65,8 @@ impl Poll {
     pub fn card(&self, buffer_id: &str, poll_id: &str, own: &Uuid) -> serde_json::Value {
         let tally = self.tally();
         let options: Vec<serde_json::Value> = self.options.iter().enumerate().map(|(i, label)| serde_json::json!({ "id": i.to_string(), "label": label, "votes": tally[i] })).collect();
-        let mine = self.votes.get(&own.to_string()).and_then(|(c, _)| c.first()).map(|i| i.to_string());
+        let chosen: Vec<String> = self.votes.get(&own.to_string()).map(|(c, _)| c.iter().map(|i| i.to_string()).collect()).unwrap_or_default();
+        let mine = chosen.first().cloned();
         serde_json::json!({
             "bufferId": buffer_id,
             "kind": "poll",
@@ -78,6 +79,10 @@ impl Poll {
             "resultDisplayDuration": 0,
             "hasVoted": mine.is_some(),
             "votedOptionId": mine,
+            // Signal's own: several answers where the poll allows it, all of them marked; and a vote can be changed.
+            "multiple": self.multiple,
+            "votedOptionIds": chosen,
+            "changeable": true,
             // Only whoever asked a Signal poll can end it, so nobody else is offered the button.
             "noEnd": ids::parse_message_id(poll_id).is_none_or(|(_, author)| author != *own),
         })
@@ -139,15 +144,21 @@ pub fn ended(ctx: &Ctx<'_>, buffer: &Buffer, author: &Uuid, end: &PollTerminate)
 }
 
 /// The vote the account casts for option `choice` of the poll `poll_id`, and the poll as it will be once sent.
-pub fn own_vote(ctx: &Ctx<'_>, poll_id: &str, choice: u32) -> Result<(PollVote, Poll), String> {
+pub fn own_vote(ctx: &Ctx<'_>, poll_id: &str, choices: &[u32]) -> Result<(PollVote, Poll), String> {
     let mut poll = load(ctx, poll_id).ok_or("that poll is not known here")?;
     if poll.ended {
         return Err("That poll has ended".to_string());
     }
     let (ts, author) = ids::parse_message_id(poll_id).ok_or("that is not a Signal poll")?;
     let count = poll.next_count(&ctx.own);
-    poll.vote(&ctx.own, &[choice], count);
-    let vote = PollVote { target_author_aci_binary: Some(author.as_bytes().to_vec()), target_sent_timestamp: Some(ts), option_indexes: vec![choice], vote_count: Some(count) };
+    if choices.len() > 1 && !poll.multiple {
+        return Err("That poll takes one answer".to_string());
+    }
+    if choices.iter().any(|c| *c as usize >= poll.options.len()) {
+        return Err("That poll has no such answer".to_string());
+    }
+    poll.vote(&ctx.own, choices, count);
+    let vote = PollVote { target_author_aci_binary: Some(author.as_bytes().to_vec()), target_sent_timestamp: Some(ts), option_indexes: choices.to_vec(), vote_count: Some(count) };
     Ok((vote, poll))
 }
 
@@ -197,6 +208,21 @@ mod tests {
         let card = p.card("buf", "1-x", &me);
         assert_eq!((card["title"].as_str(), card["hasVoted"].as_bool(), card["votedOptionId"].as_str(), card["open"].as_bool()), (Some("Lunch?"), Some(true), Some("1"), Some(true)));
         assert_eq!(card["options"][1]["votes"], 1);
+    }
+
+    #[test]
+    fn a_poll_that_allows_several_answers_marks_each_and_a_vote_can_be_taken_back() {
+        let mut p = poll(true);
+        let me = Uuid::from_u128(7);
+        p.vote(&me, &[0, 2], 1);
+        let card = p.card("buf", "1-x", &me);
+        assert_eq!((card["multiple"].as_bool(), card["changeable"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(card["votedOptionIds"], serde_json::json!(["0", "2"]));
+        assert_eq!(p.tally(), vec![1, 0, 1]);
+        // Every answer unticked: the vote is taken back.
+        p.vote(&me, &[], 2);
+        assert_eq!(p.tally(), vec![0, 0, 0]);
+        assert_eq!(p.card("buf", "1-x", &me)["votedOptionIds"], serde_json::json!([]));
     }
 
     #[test]

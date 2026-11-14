@@ -6689,12 +6689,18 @@ pub async fn dispatch(
 
                 // A Signal poll is a message too; the vote is a message naming it.
                 if buffer.account_id.starts_with("signal:") {
-                    return match u32::try_from(option_id) {
-                        Ok(choice) => match backend::signal::send::vote(state, &buffer, choice).await {
-                            Ok(()) => (Some(ok_node()), None),
-                            Err(e) => (None, Some(e)),
+                    // Several answers ("optionIds", for a poll that allows them - an empty list takes the vote back),
+                    // else the one.
+                    let choices: Vec<u32> = match params.get("optionIds").and_then(Value::as_array) {
+                        Some(ids) => ids.iter().filter_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).filter_map(|n| u32::try_from(n).ok()).collect(),
+                        None => match u32::try_from(option_id) {
+                            Ok(choice) => vec![choice],
+                            Err(_) => return (None, Some("votePoll requires \"optionId\"".to_string())),
                         },
-                        Err(_) => (None, Some("votePoll requires \"optionId\"".to_string())),
+                    };
+                    return match backend::signal::send::vote(state, &buffer, &choices).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
                     };
                 }
 
