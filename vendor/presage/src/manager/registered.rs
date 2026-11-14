@@ -1757,6 +1757,49 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// moho: sends a story to these people (My Story or a custom list, named by `story_lists`, the distribution list
+    /// ids the account's other devices see it went to). Not saved to any conversation. Answers like a group send: an
+    /// error when it reached nobody, `Error::PartialGroupSend` naming who it missed otherwise.
+    pub async fn send_story_to(
+        &mut self,
+        people: &[Aci],
+        story: libsignal_service::proto::StoryMessage,
+        timestamp: u64,
+        story_lists: &[String],
+    ) -> Result<(), Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        let sender_certificate = self.sender_certificate().await?;
+        let own = self.state.data.service_ids.aci();
+        let mut recipients = Vec::new();
+        for aci in people.iter().filter(|a| **a != own) {
+            let unidentified_access = self.store.profile_key(&(*aci).into()).await?.map(|profile_key| UnidentifiedAccess {
+                key: profile_key.derive_access_key().to_vec(),
+                certificate: sender_certificate.clone(),
+            });
+            recipients.push(((*aci).into(), unidentified_access, false));
+        }
+        let ids: Vec<ServiceId> = recipients.iter().map(|(id, _, _)| *id).collect();
+        let results = sender
+            .send_message_to_many(recipients, ContentBody::StoryMessage(story), timestamp, false, story_lists)
+            .await;
+        let mut delivered = 0usize;
+        let mut failed = Vec::new();
+        for (who, res) in ids.into_iter().zip(results) {
+            match res {
+                Ok(_) => delivered += 1,
+                Err(MessageSenderError::NotFound { .. }) => {}
+                Err(error) => failed.push((who, error)),
+            }
+        }
+        if delivered == 0 && !failed.is_empty() {
+            return Err(failed.remove(0).1.into());
+        }
+        if !failed.is_empty() {
+            return Err(Error::PartialGroupSend(failed));
+        }
+        Ok(())
+    }
+
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {
         let store_expire_timer = self.store.expire_timer(thread).await.unwrap_or_default();
 

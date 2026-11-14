@@ -883,15 +883,42 @@ pub fn text_story(text: &str, replies: bool) -> Result<presage::proto::StoryMess
     Ok(presage::proto::StoryMessage { attachment: Some(Attachment::TextAttachment(words)), allows_replies: Some(replies), ..Default::default() })
 }
 
-/// Posts a story to a group (the buffer is the group's conversation): words, or a picture or video with words under it.
-pub async fn post_story(state: &AppState, buffer: &Buffer, text: &str, path: Option<&str>, replies: bool) -> Result<(), String> {
-    use presage::proto::story_message::Attachment;
-    let (handle, thread) = target(state, buffer)?;
-    let Thread::Group(key) = thread else { return Err("Stories are posted to a group here: My Story needs lists moho does not keep".to_string()) };
-    if let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, key).await {
-        may_send(&group, &handle.own)?;
+/// The account's story audiences as the window offers them: My Story and the custom lists, each with how many it reaches.
+pub fn story_lists(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let kept = super::storage::current(account_id, &handle.store);
+    let mut lists: Vec<serde_json::Value> = kept
+        .story_lists
+        .iter()
+        .map(|l| serde_json::json!({ "id": l.id.to_string(), "name": l.name, "myStory": l.is_my_story(), "count": l.audience(&kept, &handle.own).len(), "replies": l.replies }))
+        .collect();
+    // My Story first, as on the phone.
+    lists.sort_by_key(|l| !l["myStory"].as_bool().unwrap_or(false));
+    Ok(serde_json::Value::Array(lists))
+}
+
+/// Posts a story to one of the account's audiences (My Story or a custom list, by its id).
+pub async fn post_story_to_list(state: &AppState, account_id: &str, list_id: &str, text: &str, path: Option<&str>) -> Result<(), String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let kept = super::storage::current(account_id, &handle.store);
+    let id = uuid::Uuid::parse_str(list_id).map_err(|_| "that is not a story list".to_string())?;
+    let list = kept.story_lists.iter().find(|l| l.id == id).ok_or("That story list is not known: it may have been deleted on the phone")?;
+    let people = list.audience(&kept, &handle.own);
+    if people.is_empty() {
+        return Err(format!("{} reaches nobody yet: choose who sees it on your phone", list.name));
     }
-    let story = match path.map(str::trim).filter(|p| !p.is_empty()) {
+    let story = story_of(&handle, text, path, list.replies).await?;
+    let sent = story.clone();
+    let at = ask(&handle, |done| Command::PostStoryTo { people, list: id, story: Box::new(sent), done }).await?;
+    let ctx = super::people::Ctx::new(state, account_id, handle.store.clone(), handle.own);
+    super::stories::arrived(&ctx, handle.own, at, &story).await;
+    Ok(())
+}
+
+/// A story's content: words on a colour, or a picture or video (uploaded now) with words under it.
+async fn story_of(handle: &Handle, text: &str, path: Option<&str>, replies: bool) -> Result<presage::proto::StoryMessage, String> {
+    use presage::proto::story_message::Attachment;
+    Ok(match path.map(str::trim).filter(|p| !p.is_empty()) {
         None => text_story(text, replies)?,
         Some(path) => {
             let content_type = content_type_of(path);
@@ -911,7 +938,17 @@ pub async fn post_story(state: &AppState, buffer: &Buffer, text: &str, path: Opt
             pointer.caption = Some(text.trim().to_string()).filter(|t| !t.is_empty());
             presage::proto::StoryMessage { attachment: Some(Attachment::FileAttachment(pointer)), allows_replies: Some(replies), ..Default::default() }
         }
-    };
+    })
+}
+
+/// Posts a story to a group (the buffer is the group's conversation): words, or a picture or video with words under it.
+pub async fn post_story(state: &AppState, buffer: &Buffer, text: &str, path: Option<&str>, replies: bool) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    let Thread::Group(key) = thread else { return Err("Stories are posted to a group here: My Story needs lists moho does not keep".to_string()) };
+    if let Ok(Some(group)) = presage::store::ContentsStore::group(&handle.store, key).await {
+        may_send(&group, &handle.own)?;
+    }
+    let story = story_of(&handle, text, path, replies).await?;
     let sent = story.clone();
     let at = ask(&handle, |done| Command::PostStory { key, story: Box::new(sent), done }).await?;
     // Shown with everybody else's, in Stories, for its day.

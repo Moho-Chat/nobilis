@@ -22,7 +22,8 @@ What is changed, and nothing else:
   `upload_to_cdn0`, whose upload attributes are now crate-visible so the form can be made into them).
 - Stories: a `StoryMessage` is sent with `?story=true` (`OutgoingPushMessages::story`), and its sent copy is synced to
   the account's other devices with `story_message` and a `StoryMessageRecipient` per member (upstream syncs only data
-  and edit messages).
+  and edit messages). `MessageSender::send_message_to_many` sends to a set of people naming the story lists
+  (distribution list ids) in that sync; `send_message_to_group` is it with none.
 - Profile pictures: `ProfileCipher::encrypt_avatar`, `SignalWebSocket::write_profile_with_new_avatar` (the profile write
   that answers the CDN form; upstream's `write_profile` panics on a new avatar) and
   `AccountManager::upload_versioned_profile_with_new_avatar`; the `cdn` module is crate-visible.

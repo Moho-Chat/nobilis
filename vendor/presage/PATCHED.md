@@ -30,6 +30,8 @@ What is changed, and nothing else:
 - `src/manager/registered.rs`: `update_profile_with_picture` (a new profile picture, or none).
 - `src/manager/registered.rs`, `src/errors.rs`: a group send that reached some members is saved and answered as
   `Error::PartialGroupSend` (who it missed, and why); one that reached nobody fails with the first error as before.
+- `src/manager/registered.rs`: `send_story_to` (a story to My Story's or a custom list's people, not saved to a
+  conversation).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

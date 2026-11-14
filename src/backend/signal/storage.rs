@@ -93,6 +93,59 @@ pub struct Kept {
     pub own_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountSettings>,
+    /// The account's story audiences: My Story and the lists made on the phone (not deleted ones).
+    #[serde(default)]
+    pub story_lists: Vec<StoryList>,
+    /// Whether this copy was read by a moho that reads story lists (an older copy is read again in full once).
+    #[serde(default)]
+    pub reads_story_lists: bool,
+}
+
+/// One of the account's story audiences, as the phone keeps it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoryList {
+    pub id: Uuid,
+    pub name: String,
+    /// For My Story with `excluding`, the people left out of all Signal connections; otherwise the people it goes to.
+    pub people: Vec<Uuid>,
+    pub excluding: bool,
+    pub replies: bool,
+}
+
+/// My Story's identifier: the nil UUID, as Signal's clients name it.
+pub const MY_STORY: Uuid = Uuid::nil();
+
+impl StoryList {
+    pub fn is_my_story(&self) -> bool {
+        self.id == MY_STORY
+    }
+
+    /// Who a story to this list goes to: for My Story set to "all connections except", every Signal connection of the
+    /// account (an accepted or saved person, not blocked, hidden or gone from Signal) but those left out.
+    pub fn audience(&self, kept: &Kept, own: &Uuid) -> Vec<Uuid> {
+        let mut who: Vec<Uuid> = if self.excluding {
+            kept.connections().into_iter().filter(|p| !self.people.contains(p)).collect()
+        } else {
+            self.people.iter().copied().filter(|p| kept.standing(&format!("p:{p}")).is_none_or(|s| !s.blocked)).collect()
+        };
+        who.retain(|p| p != own);
+        who.sort();
+        who.dedup();
+        who
+    }
+}
+
+fn story_list(record: &presage::libsignal_service::proto::StoryDistributionListRecord) -> Option<StoryList> {
+    if record.deleted_at_timestamp > 0 {
+        return None;
+    }
+    let id = Uuid::from_slice(&record.identifier).ok()?;
+    let mut people: Vec<Uuid> = record.recipient_service_ids_binary.iter().filter(|b| b.len() == 16).filter_map(|b| Uuid::from_slice(b).ok()).collect();
+    people.extend(record.recipient_service_ids.iter().filter_map(|s| Uuid::parse_str(s).ok()));
+    people.sort();
+    people.dedup();
+    let name = if id == MY_STORY { "My Story".to_string() } else { record.name.clone() };
+    Some(StoryList { id, name, people, excluding: record.is_block_list, replies: record.allows_replies })
 }
 
 const NAME: &str = "storage-service";
@@ -173,7 +226,7 @@ fn account_settings(record: &AccountRecord) -> AccountSettings {
 impl Kept {
     /// What the records say, as of `version`. Records of kinds a client does not act on are passed over.
     pub fn from_records(version: u64, records: &[StorageRecord]) -> Self {
-        let mut kept = Kept { version, ..Default::default() };
+        let mut kept = Kept { version, reads_story_lists: true, ..Default::default() };
         for record in records {
             match &record.record {
                 Some(storage_record::Record::Contact(c)) => {
@@ -183,6 +236,11 @@ impl Kept {
                 }
                 Some(storage_record::Record::GroupV2(g)) if g.master_key.len() == 32 => {
                     kept.conversations.insert(format!("g:{}", ids::hex(&g.master_key)), group_standing(g));
+                }
+                Some(storage_record::Record::StoryDistributionList(list)) => {
+                    if let Some(list) = story_list(list) {
+                        kept.story_lists.push(list);
+                    }
                 }
                 Some(storage_record::Record::Account(a)) => {
                     kept.pinned = a.pinned_conversations.iter().filter_map(pinned_remote).collect();
@@ -209,6 +267,16 @@ impl Kept {
     /// request on a guess).
     pub fn known(&self) -> bool {
         self.version > 0
+    }
+
+    /// The account's Signal connections, as Signal's clients count them for My Story: people it has accepted (shares
+    /// its profile with) or saved, not blocked, hidden or gone from Signal.
+    pub fn connections(&self) -> Vec<Uuid> {
+        self.conversations
+            .iter()
+            .filter(|(remote, s)| remote.starts_with("p:") && (s.accepted || s.number.is_some()) && !s.blocked && !s.hidden && !s.unregistered)
+            .filter_map(|(remote, _)| Uuid::parse_str(&remote[2..]).ok())
+            .collect()
     }
 
     pub fn standing(&self, remote: &str) -> Option<&Standing> {
@@ -322,7 +390,7 @@ pub async fn fetch(manager: &presage::Manager<SignalStore, presage::manager::Reg
     let wanted: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
-        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account))
+        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account | Type::StoryDistributionList))
         .map(|id| id.raw.clone())
         .collect();
     let mut records = Vec::with_capacity(wanted.len());
@@ -338,7 +406,8 @@ pub async fn refresh(state: &crate::state::AppState, handle: &super::Handle, man
     let account_id = handle.account_id.as_str();
     let store = manager.store().clone();
     let before = current(account_id, &store);
-    let known = before.version;
+    // A copy read before story lists were read is read again in full.
+    let known = if before.reads_story_lists { before.version } else { 0 };
     let fetched = tokio::time::timeout(std::time::Duration::from_secs(30), fetch(manager, known)).await;
     let kept = match fetched {
         Ok(Ok(Some(kept))) => keep(account_id, &store, kept),
@@ -452,6 +521,42 @@ mod tests {
         let mut c = ContactRecord { aci: aci.into(), ..Default::default() };
         change(&mut c);
         StorageRecord { record: Some(storage_record::Record::Contact(c)) }
+    }
+
+    #[test]
+    fn my_story_goes_to_connections_but_those_left_out_and_a_list_to_its_people() {
+        use presage::libsignal_service::proto::StoryDistributionListRecord;
+        let my_story = StorageRecord {
+            record: Some(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
+                identifier: MY_STORY.as_bytes().to_vec(),
+                is_block_list: true,
+                allows_replies: true,
+                recipient_service_ids: vec![B.to_string()],
+                ..Default::default()
+            })),
+        };
+        let gone = StorageRecord {
+            record: Some(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
+                identifier: Uuid::from_u128(5).as_bytes().to_vec(),
+                name: "Old".into(),
+                deleted_at_timestamp: 1,
+                ..Default::default()
+            })),
+        };
+        let close = StorageRecord {
+            record: Some(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
+                identifier: Uuid::from_u128(6).as_bytes().to_vec(),
+                name: "Close friends".into(),
+                recipient_service_ids_binary: vec![Uuid::parse_str(A).unwrap().as_bytes().to_vec()],
+                ..Default::default()
+            })),
+        };
+        let kept = Kept::from_records(4, &[contact(A, |c| c.whitelisted = true), contact(B, |c| c.whitelisted = true), my_story, gone, close]);
+        assert!(kept.reads_story_lists);
+        assert_eq!(kept.story_lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), vec!["My Story", "Close friends"]);
+        let own = Uuid::from_u128(1);
+        assert_eq!(kept.story_lists[0].audience(&kept, &own), vec![Uuid::parse_str(A).unwrap()], "everybody but B");
+        assert_eq!(kept.story_lists[1].audience(&kept, &own), vec![Uuid::parse_str(A).unwrap()]);
     }
 
     #[test]

@@ -536,6 +536,21 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 });
                 finish(done, result, at);
             }
+            Command::PostStoryTo { people, list, mut story, done } => {
+                let at = now_ms();
+                story.profile_key = Some(manager.registration_data().profile_key().get_bytes().to_vec());
+                let acis: Vec<presage::libsignal_service::protocol::Aci> = people.into_iter().map(Into::into).collect();
+                let result = match manager.send_story_to(&acis, *story, at, &[list.to_string()]).await {
+                    Ok(()) => Ok(()),
+                    // Some missed it: still posted; who it missed is in the log (there is no conversation to say it in).
+                    Err(PresageError::PartialGroupSend(failed)) => {
+                        tracing::info!("signal[{account_id}]: a story missed {} of its audience", failed.len());
+                        Ok(())
+                    }
+                    Err(e) => Err(explain(&e)),
+                };
+                finish(done, result, at);
+            }
             Command::StoriesViewed { views, receipt } => {
                 let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
                 let viewed = views.iter().map(|(sender, ts)| sync_message::Viewed { sender_aci: Some(sender.to_string()), timestamp: Some(*ts), sender_aci_binary: Some(sender.as_bytes().to_vec()) }).collect();

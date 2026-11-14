@@ -6023,6 +6023,17 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalStoryLists" => match backend::signal::send::story_lists(state, p_str(params, "accountId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        // To a group (by its conversation) or to My Story / a custom list (by account and list id).
+        "postSignalStory" if p_str_opt(params, "listId").is_some() => {
+            match backend::signal::send::post_story_to_list(state, p_str(params, "accountId", ""), p_str(params, "listId", ""), p_str(params, "text", ""), p_str_opt(params, "path")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "postSignalStory" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
                 return (None, Some("postSignalStory requires a Signal \"bufferId\"".to_string()));

@@ -378,6 +378,7 @@ where
                     content_body,
                     timestamp,
                     None,
+                    &[],
                 )
             {
                 return self
@@ -431,6 +432,7 @@ where
                     content_body,
                     timestamp,
                     Some(&result),
+                    &[],
                 )
             };
             if let Some(body) = sync_body {
@@ -466,6 +468,19 @@ where
         message: impl Into<ContentBody>,
         timestamp: u64,
         online: bool,
+    ) -> Vec<SendMessageResult> {
+        self.send_message_to_many(recipients, message, timestamp, online, &[])
+            .await
+    }
+
+    /// moho: `send_message_to_group`, naming the story lists (distribution list ids) a story went to in its sync.
+    pub async fn send_message_to_many(
+        &mut self,
+        recipients: impl AsRef<[(ServiceId, Option<UnidentifiedAccess>, bool)]>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        online: bool,
+        story_lists: &[String],
     ) -> Vec<SendMessageResult> {
         let content_body: ContentBody = message.into();
         let mut results = vec![];
@@ -504,6 +519,7 @@ where
                     content_body.clone(),
                     timestamp,
                     &results,
+                    story_lists,
                 )
             {
                 // Note: the result of sending a sync message is not included in results
@@ -1122,6 +1138,7 @@ where
         content_body: ContentBody,
         timestamp: u64,
         send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
+        story_lists: &[String],
     ) -> Option<ContentBody> {
         use sync_message::sent::UnidentifiedDeliveryStatus;
         let (message, edit_message, story_message) = match content_body {
@@ -1150,7 +1167,7 @@ where
                     destination_service_id_binary: Some(
                         s.recipient.service_id_binary(),
                     ),
-                    distribution_list_ids: Vec::new(),
+                    distribution_list_ids: story_lists.to_vec(),
                     is_allowed_to_reply: Some(replies),
                 })
                 .collect()

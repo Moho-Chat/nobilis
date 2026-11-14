@@ -144,6 +144,8 @@ pub enum Command {
     Storage,
     /// Answer a message request: tell the account's other devices, and the person when it is accepted.
     AnswerRequest { thread: presage::store::Thread, answer: requests::Answer, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Post a story to people (My Story or a custom list, named by its id for the account's other devices).
+    PostStoryTo { people: Vec<uuid::Uuid>, list: uuid::Uuid, story: Box<presage::proto::StoryMessage>, done: Done },
     /// Post a story to a group: its members see it for a day.
     PostStory { key: [u8; 32], story: Box<presage::proto::StoryMessage>, done: Done },
     /// Stories looked at here: the other devices are told, and each author when `receipt`.
