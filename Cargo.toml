@@ -56,7 +56,7 @@ davey = "0.1"
 # `image` for reading Discord's login code, `svg` (a default) for drawing
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Telegram backend (MTProto, pure Rust). `grammers-session` without its default `sqlite-storage` (libsql would sit
@@ -159,6 +159,7 @@ hickory-resolver = "0.26"
 idna = "1"
 thiserror = "2"
 x509-parser = { version = "0.17", default-features = false }
+rqrr = "0.10"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

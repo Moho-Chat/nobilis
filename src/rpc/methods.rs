@@ -6062,6 +6062,14 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalSafetyQr" => match backend::signal::profile::safety_qr(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCompareSafetyQr" => match backend::signal::profile::compare_safety_qr(state, p_str(params, "accountId", ""), p_str(params, "userId", ""), p_str(params, "picture", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
         "signalResetSession" => match backend::signal::send::reset_session(state, p_str(params, "accountId", ""), p_str(params, "userId", "")).await {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),

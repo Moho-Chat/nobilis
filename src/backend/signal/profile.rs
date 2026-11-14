@@ -21,14 +21,115 @@ pub fn grouped(digits: &str) -> String {
 /// The safety number between this account and `who`, if both identity keys are known. Version 2 of Signal's fingerprint,
 /// which names each side by its ACI (version 1 used the phone number).
 ///
-/// **Not yet compared with another Signal client's number for the same pair** (no account to do it with); the
-/// construction is libsignal's own, and what is assumed is the stable identifier (the ACI's sixteen bytes).
+/// The construction is libsignal's own (`Fingerprint`, version 2, 5200 iterations, each side's ACI bytes), as Signal's
+/// apps make it; the same pair's scannable form is `scannable`.
 pub async fn safety_number(store: &SignalStore, own: &Uuid, who: &Uuid) -> Option<String> {
     use presage::libsignal_service::protocol::Fingerprint;
     let local = store.own_identity().ok().flatten()?;
     let remote = store.identity_of(&ServiceId::Aci(Aci::from(*who)).service_id_string()).ok().flatten()?;
     let fingerprint = Fingerprint::new(2, 5200, own.as_bytes(), &local, who.as_bytes(), &remote).ok()?;
     fingerprint.display_string().ok().map(|digits| grouped(&digits))
+}
+
+/// The same pair's fingerprint as Signal's apps put it in a QR code (the scannable form), for comparing by camera.
+pub fn scannable(store: &SignalStore, own: &Uuid, who: &Uuid) -> Option<Vec<u8>> {
+    use presage::libsignal_service::protocol::Fingerprint;
+    let local = store.own_identity().ok().flatten()?;
+    let remote = store.identity_of(&ServiceId::Aci(Aci::from(*who)).service_id_string()).ok().flatten()?;
+    let fingerprint = Fingerprint::new(2, 5200, own.as_bytes(), &local, who.as_bytes(), &remote).ok()?;
+    fingerprint.scannable.serialize().ok()
+}
+
+/// A QR code of `bytes` (byte mode, as Signal's apps encode a fingerprint), as a PNG.
+pub fn qr_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let code = qrcode::QrCode::new(bytes).map_err(|e| e.to_string())?;
+    let picture = code.render::<image::Luma<u8>>().min_dimensions(320, 320).quiet_zone(true).build();
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
+}
+
+/// The raw contents of every QR code in a picture.
+pub fn read_qr(picture: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(image) = image::load_from_memory(picture) else { return Vec::new() };
+    let grey = image.to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(grey);
+    prepared
+        .detect_grids()
+        .into_iter()
+        .filter_map(|grid| {
+            let mut bytes = Vec::new();
+            grid.decode_to(&mut bytes).ok().map(|_| bytes)
+        })
+        .collect()
+}
+
+/// What comparing a scanned code with the safety number here says.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Compared {
+    Same,
+    Different,
+    /// No code was found in the picture.
+    NoCode,
+    /// A code that is not a Signal safety number (or of another version).
+    NotASafetyNumber,
+}
+
+/// Compares the codes in a picture with this pair's fingerprint.
+pub fn compare_picture(mine: &[u8], picture: &[u8]) -> Compared {
+    let codes = read_qr(picture);
+    if codes.is_empty() {
+        return Compared::NoCode;
+    }
+    let Ok(local) = presage::libsignal_service::protocol::ScannableFingerprint::deserialize(mine) else { return Compared::NotASafetyNumber };
+    let mut any = false;
+    for code in codes {
+        match local.compare(&code) {
+            Ok(true) => return Compared::Same,
+            Ok(false) => any = true,
+            Err(_) => {}
+        }
+    }
+    if any {
+        Compared::Different
+    } else {
+        Compared::NotASafetyNumber
+    }
+}
+
+/// The QR code of the safety number with a person, as a data address the window shows.
+pub fn safety_qr(state: &AppState, account_id: &str, user_id: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let who = Uuid::parse_str(user_id.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?;
+    let bytes = scannable(&handle.store, &handle.own, &who).ok_or("Their key is not known yet: exchange a message with them first")?;
+    let png = qr_png(&bytes)?;
+    Ok(json!({ "qr": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)) }))
+}
+
+/// Compares a picture of the other side's code (a camera frame or a chosen file, as base64) with the safety number here.
+pub fn compare_safety_qr(state: &AppState, account_id: &str, user_id: &str, picture_b64: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let who = Uuid::parse_str(user_id.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?;
+    let mine = scannable(&handle.store, &handle.own, &who).ok_or("Their key is not known yet: exchange a message with them first")?;
+    // A camera frame comes as base64; a chosen picture (a photo of their phone, say) by its path.
+    let picture = if let Some(path) = picture_b64.strip_prefix("path:") {
+        let size = std::fs::metadata(path).map_err(|e| format!("that picture could not be read: {e}"))?.len();
+        if size > 20 * 1024 * 1024 {
+            return Err("That picture is too big to look for a code in".to_string());
+        }
+        std::fs::read(path).map_err(|e| format!("that picture could not be read: {e}"))?
+    } else {
+        base64::engine::general_purpose::STANDARD.decode(picture_b64.split_once(',').map(|(_, b)| b).unwrap_or(picture_b64)).map_err(|_| "that picture could not be read".to_string())?
+    };
+    let result = match compare_picture(&mine, &picture) {
+        Compared::Same => "same",
+        Compared::Different => "different",
+        Compared::NoCode => "none",
+        Compared::NotASafetyNumber => "other",
+    };
+    Ok(json!({ "result": result }))
 }
 
 /// The person a card is for: the other one in a direct message, or the member the window named by id.
@@ -124,6 +225,29 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_safety_number_qr_from_one_side_matches_the_other_and_not_a_stranger() {
+        use presage::libsignal_service::protocol::{Fingerprint, IdentityKeyPair};
+        let mut rng = rand09::rng();
+        let (a, b, c) = (IdentityKeyPair::generate(&mut rng), IdentityKeyPair::generate(&mut rng), IdentityKeyPair::generate(&mut rng));
+        let (a_id, b_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let from_a = Fingerprint::new(2, 5200, a_id.as_bytes(), a.identity_key(), b_id.as_bytes(), b.identity_key()).unwrap();
+        let from_b = Fingerprint::new(2, 5200, b_id.as_bytes(), b.identity_key(), a_id.as_bytes(), a.identity_key()).unwrap();
+        let wrong = Fingerprint::new(2, 5200, b_id.as_bytes(), c.identity_key(), a_id.as_bytes(), a.identity_key()).unwrap();
+        let mine = from_a.scannable.serialize().unwrap();
+        // Their phone shows its code; moho reads it from a picture of it.
+        let theirs = qr_png(&from_b.scannable.serialize().unwrap()).unwrap();
+        assert_eq!(compare_picture(&mine, &theirs), Compared::Same);
+        assert_eq!(compare_picture(&mine, &qr_png(&wrong.scannable.serialize().unwrap()).unwrap()), Compared::Different);
+        assert_eq!(compare_picture(&mine, &qr_png(b"https://example.org").unwrap()), Compared::NotASafetyNumber);
+        let blank = {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::GrayImage::from_pixel(64, 64, image::Luma([255])).write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        assert_eq!(compare_picture(&mine, &blank), Compared::NoCode);
+    }
 
     #[test]
     fn sixty_digits_are_read_in_twelve_groups_of_five() {
