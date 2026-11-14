@@ -181,6 +181,7 @@ async fn files_as(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Strin
         state.runtime.record_message_at(
             state, &buffer.account_id, &buffer.name, &buffer.kind, &own, VIEW_ONCE_SENT, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), None, None,
         );
+        state.runtime.set_message_delivery(state, &buffer.id, &ids::message_id(at, &handle.own), "sent");
         return Ok(());
     }
     let names: Vec<(String, String)> = mentioned.iter().map(|id| (id.to_string(), name_here(state, buffer, id, &handle))).collect();
@@ -205,6 +206,8 @@ async fn files_as(state: &AppState, buffer: &Buffer, body: &str, paths: &[(Strin
     state.runtime.record_message_at(
         state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, embeds, attachments, Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
     );
+    // Signal took it: sent. Delivered and read follow from the receipts (see `inbox::receipt_seen`).
+    state.runtime.set_message_delivery(state, &buffer.id, &ids::message_id(at, &handle.own), "sent");
     // The conversation has a disappearing timer, which the library put on the message: it runs from now.
     if let Some(seconds) = timer {
         let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);

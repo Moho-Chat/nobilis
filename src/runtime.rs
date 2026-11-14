@@ -4963,6 +4963,7 @@ impl Runtime {
             // returns - only Discord has any, and it is the one that knows.
             components: Vec::new(),
             moderated: None,
+            delivery: None,
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),
@@ -5087,6 +5088,16 @@ impl Runtime {
     /// resolution) - doesn't set the `edited` flag either in storage or in
     /// the emitted event, so the frontend's "(edited)" label doesn't show
     /// up for something the user never touched.
+    /// Moves one of the account's own messages on to a delivery state ("sent", "delivered", "read") and tells the
+    /// window, if that is further than it was.
+    pub fn set_message_delivery(&self, state: &AppState, buffer_id: &str, msg_id: &str, delivery: &str) {
+        match state.store.set_delivery(buffer_id, msg_id, delivery) {
+            Ok(true) => state.events.emit("messageDelivery", serde_json::json!({ "bufferId": buffer_id, "messageId": msg_id, "delivery": delivery })),
+            Ok(false) => {}
+            Err(e) => tracing::debug!("keeping how far {msg_id} got: {e:#}"),
+        }
+    }
+
     pub fn update_message_body_only(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str) -> bool {
         match state.store.update_message_body_silent(buffer_id, msg_id, body) {
             Ok(true) => {

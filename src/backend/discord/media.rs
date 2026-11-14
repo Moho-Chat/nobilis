@@ -630,6 +630,7 @@ mod tests {
             html: None,
             components: Vec::new(),
             moderated: None,
+            delivery: None,
             sender_color: None,
             badges: Vec::new(),
             from: "x".into(),

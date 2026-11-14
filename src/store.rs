@@ -170,6 +170,8 @@ impl Store {
             // pressed for months, so a client that lost them on restart would
             // be showing a message whose whole point had gone.
             "ALTER TABLE messages ADD COLUMN components TEXT NOT NULL DEFAULT '[]'",
+            // How far one of the account's own messages has got (sent, delivered, read), where the service says.
+            "ALTER TABLE messages ADD COLUMN delivery TEXT",
             // Which kind of conversation this was said in.
             //
             // Buffers live only as long as the daemon does - they are rebuilt
@@ -886,6 +888,7 @@ impl Store {
             html: row.get("html")?,
             components,
             moderated,
+            delivery: row.get::<_, Option<String>>("delivery").ok().flatten(),
         })
     }
 
@@ -893,7 +896,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -922,6 +925,22 @@ impl Store {
             params![buffer_id, msg_id, json],
         )?;
         Ok(())
+    }
+
+    /// Moves one of the account's own messages on to `state` (sent, delivered, read). Never backwards: a late delivery
+    /// receipt does not undo a read. Answers whether it moved.
+    pub fn set_delivery(&self, buffer_id: &str, msg_id: &str, state: &str) -> Result<bool> {
+        let Some(rank) = crate::model::delivery_rank(state) else { return Ok(false) };
+        let conn = self.conn.lock().unwrap();
+        let now: Option<Option<String>> = conn
+            .query_row("SELECT delivery FROM messages WHERE buffer_id = ?1 AND msg_id = ?2 AND is_own = 1", params![buffer_id, msg_id], |r| r.get(0))
+            .optional()?;
+        let Some(now) = now else { return Ok(false) };
+        if now.as_deref().and_then(crate::model::delivery_rank).is_some_and(|r| r >= rank) {
+            return Ok(false);
+        }
+        conn.execute("UPDATE messages SET delivery = ?3 WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id, state])?;
+        Ok(true)
     }
 
     /// Takes the buttons off a message, for an edit that removed them.
@@ -976,7 +995,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2
              ORDER BY ts ASC LIMIT ?3",
@@ -999,7 +1018,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 500 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
              ORDER BY ts ASC LIMIT ?4",
@@ -1040,7 +1059,7 @@ impl Store {
     pub fn messages_around(&self, buffer_id: &str, ts: i64, span: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let span = if span > 0 { span } else { 50 };
-        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated";
+        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery";
 
         let mut older = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
@@ -1086,7 +1105,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -1347,7 +1366,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -1420,7 +1439,7 @@ impl Store {
     pub fn thread_messages(&self, buffer_id: &str, root_id: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR reply_thread_root = ?2 OR msg_id = ?2)
              ORDER BY ts ASC, rowid ASC",
@@ -1432,7 +1451,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
@@ -1637,6 +1656,20 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    #[test]
+    fn an_own_message_moves_on_through_sent_delivered_and_read_and_never_back() {
+        let (s, dir) = store();
+        s.append_message("b", "mine", "me", "hi", 1, false, false, "chat", None, &[], true, None, &[], &[], None, None, "dm", None, &[]).unwrap();
+        append(&s, "b", "theirs");
+        assert!(s.set_delivery("b", "mine", "sent").unwrap());
+        assert!(s.set_delivery("b", "mine", "read").unwrap());
+        assert!(!s.set_delivery("b", "mine", "delivered").unwrap(), "a late delivery does not undo a read");
+        assert_eq!(s.get_message("b", "mine").unwrap().unwrap().delivery.as_deref(), Some("read"));
+        assert!(!s.set_delivery("b", "theirs", "sent").unwrap(), "only the account's own messages");
+        assert!(!s.set_delivery("b", "mine", "lost").unwrap(), "not a state");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

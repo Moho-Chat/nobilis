@@ -472,8 +472,9 @@ async fn typing_seen(ctx: &Ctx<'_>, handle: &Handle, content: &Content, typing: 
 /// Somebody read (or viewed) messages of the account's.
 async fn receipt_seen(ctx: &Ctx<'_>, handle: &Handle, content: &Content, receipt: &ReceiptMessage) {
     let kind = receipt.r#type.unwrap_or(0);
-    // Delivered is not drawn: there is nowhere in a conversation to put it yet.
-    if kind != receipt_message::Type::Read as i32 && kind != receipt_message::Type::Viewed as i32 {
+    let read = kind == receipt_message::Type::Read as i32 || kind == receipt_message::Type::Viewed as i32;
+    let delivered = kind == receipt_message::Type::Delivery as i32;
+    if !read && !delivered {
         return;
     }
     let reader = ids::uuid_of(&content.metadata.sender);
@@ -482,7 +483,12 @@ async fn receipt_seen(ctx: &Ctx<'_>, handle: &Handle, content: &Content, receipt
         let Ok(Some(thread)) = ctx.store.thread_for_sender_and_timestamp(&mine, ts).await else { continue };
         let remote = ids::remote_id(&thread);
         let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { continue };
-        note_read(ctx, handle, &buffer, reader, ts).await;
+        // The message's tick: delivered once anybody has it, read once anybody has read it (the faces say who).
+        let id = super::revisions::original(&ctx.store, &ids::message_id(ts, &ctx.own));
+        ctx.state.runtime.set_message_delivery(ctx.state, &buffer.id, &id, if read { "read" } else { "delivered" });
+        if read {
+            note_read(ctx, handle, &buffer, reader, ts).await;
+        }
     }
 }
 
@@ -1446,18 +1452,36 @@ mod tests {
         let mut events = state.events.subscribe();
         let read = |ts: u64| content_from(ALICE, ContentBody::ReceiptMessage(ReceiptMessage { r#type: Some(receipt_message::Type::Read as i32), timestamp: vec![ts] }), false);
         let receipt = |ts: u64| ReceiptMessage { r#type: Some(receipt_message::Type::Read as i32), timestamp: vec![ts] };
-        receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &receipt(1_700_000_030_000)).await;
-        let event = events.try_recv().expect("a marker");
-        assert_eq!(event.name, "readReceipts");
-        assert_eq!(event.data["readers"][0]["nick"], "Alice");
-        assert_eq!(event.data["readers"][0]["messageId"], format!("1700000030000-{ME}"));
-        // An older receipt arriving late does not move it back, and says nothing.
-        receipt_seen(&ctx, &handle, &read(1_700_000_020_000), &receipt(1_700_000_020_000)).await;
-        assert!(events.try_recv().is_err());
-        // A delivery receipt is not a reading.
+        // What was said, by event name: the read marker, and each message's tick.
+        let mut drain = || {
+            let mut got = Vec::new();
+            while let Ok(e) = events.try_recv() {
+                got.push(e);
+            }
+            got
+        };
+        let ticks = |got: &[crate::events::Event]| got.iter().filter(|e| e.name == "messageDelivery").map(|e| (e.data["messageId"].as_str().unwrap_or("").to_string(), e.data["delivery"].as_str().unwrap_or("").to_string())).collect::<Vec<_>>();
+        let markers = |got: &[crate::events::Event]| got.iter().filter(|e| e.name == "readReceipts").cloned().collect::<Vec<_>>();
+        // Delivered first: the tick moves, and no reader is marked.
         let delivered = ReceiptMessage { r#type: Some(receipt_message::Type::Delivery as i32), timestamp: vec![1_700_000_030_000] };
         receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &delivered).await;
-        assert!(events.try_recv().is_err());
+        let got = drain();
+        assert_eq!(ticks(&got), vec![(format!("1700000030000-{ME}"), "delivered".to_string())]);
+        assert!(markers(&got).is_empty(), "a delivery receipt is not a reading");
+        receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &receipt(1_700_000_030_000)).await;
+        let got = drain();
+        assert_eq!(ticks(&got), vec![(format!("1700000030000-{ME}"), "read".to_string())]);
+        let event = markers(&got).pop().expect("a marker");
+        assert_eq!(event.data["readers"][0]["nick"], "Alice");
+        assert_eq!(event.data["readers"][0]["messageId"], format!("1700000030000-{ME}"));
+        // An older receipt arriving late does not move the marker back (its own message is read, though).
+        receipt_seen(&ctx, &handle, &read(1_700_000_020_000), &receipt(1_700_000_020_000)).await;
+        let got = drain();
+        assert!(markers(&got).is_empty());
+        assert_eq!(ticks(&got), vec![(format!("1700000020000-{ME}"), "read".to_string())]);
+        // A late delivery receipt does not undo a read.
+        receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &delivered).await;
+        assert!(drain().is_empty());
     }
 
     #[tokio::test]
