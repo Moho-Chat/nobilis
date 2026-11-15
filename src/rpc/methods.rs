@@ -6161,6 +6161,26 @@ pub async fn dispatch(
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),
         },
+        "signalCallLinkJoinInfo" => match backend::signal::call_links::join_info(state, p_str(params, "accountId", ""), p_str(params, "rootKey", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkCreateInfo" => match backend::signal::call_links::create_info(state, p_str(params, "accountId", ""), p_str(params, "rootKey", ""), p_str(params, "roomId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkSave" => match backend::signal::call_links::save(state, p_str(params, "accountId", ""), p_str(params, "rootKey", ""), p_str(params, "adminPasskey", "")).await {
+            Ok(()) => (Some(serde_json::Value::Bool(true)), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkForget" => match backend::signal::call_links::forget(state, p_str(params, "accountId", ""), p_str(params, "rootKey", "")).await {
+            Ok(()) => (Some(serde_json::Value::Bool(true)), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinks" => match backend::signal::call_links::list(state, p_str(params, "accountId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
         "signalGroupCallInfo" => match backend::signal::calls::group_info(state, p_str(params, "bufferId", "")).await {
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),

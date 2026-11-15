@@ -38,5 +38,7 @@ What is changed, and nothing else:
   history), `SignalWebSocket::transfer_archive` (`GET /v1/devices/transfer_archive`) and `PushService::download_cdn_file`.
 - Usernames: `reserve_username_hash`, `confirm_username_hash`, `delete_username_hash`, `reset_username_link` (answering
   the link's entropy and handle); the `usernames` crate is re-exported and `websocket::usernames` is public.
+- Call links (`websocket/call_links.rs`): `call_link_auth_credentials` (the `callLinkAuthCredentials` the group
+  credential request also answers) and `create_call_link_credential` (`POST /v1/call-link/create-auth`).
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.

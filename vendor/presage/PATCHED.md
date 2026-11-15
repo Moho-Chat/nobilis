@@ -39,6 +39,7 @@ What is changed, and nothing else:
   hash where the archive gives no encrypted digest).
 - `src/manager/registered.rs`: `set_username` (Signal's candidates or a chosen number, reserved, proved, confirmed
   with a fresh link), `delete_username`, `reset_username_link`; `Error::UsernameTaken`.
+- `src/manager/registered.rs`: `call_link_auth_credentials` and `create_call_link_credential` (call links).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

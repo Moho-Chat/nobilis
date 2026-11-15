@@ -164,6 +164,8 @@ pub enum Target {
     Account,
     /// A story list (My Story is the nil id).
     StoryList(Uuid),
+    /// A call link, by its root key.
+    CallLink(Vec<u8>),
 }
 
 /// One change.
@@ -191,6 +193,8 @@ pub enum Change {
     Username(Option<(String, [u8; 32], Uuid)>),
     /// A new link for the same username.
     UsernameLink([u8; 32], Uuid),
+    /// A call link given up (marked deleted, as Signal's apps do once its room is gone).
+    CallLinkDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +274,7 @@ fn record_field(target: &Target, own: &Uuid) -> u32 {
         Target::Group(_) => 3,
         Target::Account => 4,
         Target::StoryList(_) => 5,
+        Target::CallLink(_) => 7,
     }
 }
 
@@ -358,8 +363,7 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
             replace(inner, 2, &[Value::Bytes(name.as_bytes().to_vec())])
         }
         Change::ListDelete => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
-            let step = set_varint(inner, 4, now).ok_or_else(broken)?;
+            let step = set_varint(inner, 4, now_ms()).ok_or_else(broken)?;
             let step = replace(&step, 3, &[]).ok_or_else(broken)?;
             replace(&step, 7, &[])
         }
@@ -383,6 +387,7 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
             let link = replace(&link, 2, &[Value::Bytes(handle.as_bytes().to_vec())]).ok_or_else(broken)?;
             replace(inner, 35, &[Value::Bytes(link)])
         }
+        Change::CallLinkDelete => set_varint(inner, 3, now_ms()),
         Change::ListPerson(who, add) => {
             // The list names people by text and by bytes; both are kept in step, everything else left alone.
             let mut binary: Vec<Vec<u8>> = all_bytes(inner, 7).into_iter().map(<[u8]>::to_vec).collect();
@@ -420,6 +425,7 @@ fn is_target(record: &StorageRecord, target: &Target) -> bool {
         (Some(storage_record::Record::GroupV2(g)), Target::Group(key)) => g.master_key == key,
         (Some(storage_record::Record::Account(_)), Target::Account) => true,
         (Some(storage_record::Record::StoryDistributionList(l)), Target::StoryList(id)) => Uuid::from_slice(&l.identifier).ok() == Some(*id),
+        (Some(storage_record::Record::CallLink(l)), Target::CallLink(key)) => &l.root_key == key,
         _ => false,
     }
 }
@@ -430,7 +436,12 @@ fn type_of(target: &Target) -> Type {
         Target::Group(_) => Type::Groupv2,
         Target::Account => Type::Account,
         Target::StoryList(_) => Type::StoryDistributionList,
+        Target::CallLink(_) => Type::CallLink,
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1)
 }
 
 /// The whole record's bytes with its inner record changed.
@@ -490,36 +501,49 @@ pub async fn write(manager: &presage::Manager<super::store::SignalStore, presage
 
 /// Makes a new story list with these people (replies allowed), as a new record in a new manifest version. Answers its id.
 pub async fn create_list(manager: &presage::Manager<super::store::SignalStore, presage::manager::Registered>, device: u32, name: &str, people: &[Uuid]) -> Result<Uuid, String> {
-    use presage::libsignal_service::proto::{manifest_record::Identifier, StoryDistributionListRecord};
+    use presage::libsignal_service::proto::StoryDistributionListRecord;
     let name = name.trim();
     if name.is_empty() {
         return Err("A story list needs a name".to_string());
     }
     let id = Uuid::new_v4();
-    let record = StorageRecord {
-        record: Some(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
-            identifier: id.as_bytes().to_vec(),
-            name: name.to_string(),
-            recipient_service_ids_binary: people.iter().map(|p| p.as_bytes().to_vec()).collect(),
-            allows_replies: true,
-            ..Default::default()
-        })),
-    }
-    .encode_to_vec();
+    let record = storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
+        identifier: id.as_bytes().to_vec(),
+        name: name.to_string(),
+        recipient_service_ids_binary: people.iter().map(|p| p.as_bytes().to_vec()).collect(),
+        allows_replies: true,
+        ..Default::default()
+    });
+    create(manager, device, record, Type::StoryDistributionList).await.map_err(|e| e.replace("{what}", "the list"))?;
+    Ok(id)
+}
+
+/// Adds a call link made here (its root key and admin passkey) to the shared records, so the account's other devices
+/// list it and can manage it.
+pub async fn create_call_link(manager: &presage::Manager<super::store::SignalStore, presage::manager::Registered>, device: u32, root_key: &[u8], admin_passkey: &[u8]) -> Result<(), String> {
+    use presage::libsignal_service::proto::CallLinkRecord;
+    let record = storage_record::Record::CallLink(CallLinkRecord { root_key: root_key.to_vec(), admin_passkey: admin_passkey.to_vec(), deleted_at_timestamp_ms: 0 });
+    create(manager, device, record, Type::CallLink).await.map_err(|e| e.replace("{what}", "the call link"))
+}
+
+/// A new record in the shared records: a fresh raw id in the next manifest. Errors say `{what}` for the caller's noun.
+async fn create(manager: &presage::Manager<super::store::SignalStore, presage::manager::Registered>, device: u32, record: storage_record::Record, kind: Type) -> Result<(), String> {
+    use presage::libsignal_service::proto::manifest_record::Identifier;
+    let record = StorageRecord { record: Some(record) }.encode_to_vec();
     let storage = manager.storage_service().await.map_err(|e| format!("the storage service could not be reached: {e}"))?;
     let mut manifest = storage.manifest().await.map_err(|e| format!("the storage service could not be read: {e}"))?;
     for attempt in 0..2 {
         let ikm = Some(manifest.record_ikm.as_slice()).filter(|k| !k.is_empty());
         let raw: [u8; 16] = rand::random();
         let mut next = ManifestRecord { version: manifest.version + 1, source_device: device, ..manifest.clone() };
-        next.identifiers.push(Identifier { raw: raw.to_vec(), r#type: Type::StoryDistributionList as i32 });
+        next.identifiers.push(Identifier { raw: raw.to_vec(), r#type: kind as i32 });
         let item = storage.encrypt_raw_item(raw.to_vec(), &record, ikm);
         match storage.write(&next, vec![item], vec![]).await {
-            Ok(()) => return Ok(id),
+            Ok(()) => return Ok(()),
             Err(StorageServiceError::Conflict(current)) if attempt == 0 => {
                 manifest = storage.open_manifest(&current).map_err(|e| format!("the storage service could not be read: {e}"))?;
             }
-            Err(e) => return Err(format!("the list could not be made: {e}")),
+            Err(e) => return Err(format!("{{what}} could not be made: {e}")),
         }
     }
     Err("another device kept changing the shared settings; try again".to_string())
@@ -636,6 +660,27 @@ mod tests {
         let Some(storage_record::Record::StoryDistributionList(l)) = StorageRecord::decode(gone.as_slice()).unwrap().record else { panic!() };
         assert_eq!(l.name, "Close friends");
         assert!(l.deleted_at_timestamp > 0);
+    }
+
+    #[test]
+    fn a_call_link_is_found_by_its_key_and_marked_deleted_with_the_rest_kept() {
+        use presage::libsignal_service::proto::CallLinkRecord;
+        let own = Uuid::from_u128(1);
+        let key = vec![7u8; 16];
+        let inner = with_unknown(CallLinkRecord { root_key: key.clone(), admin_passkey: vec![9, 9], deleted_at_timestamp_ms: 0 }.encode_to_vec());
+        let mut plain = Vec::new();
+        tag(7, 2, &mut plain);
+        write_varint(inner.len() as u64, &mut plain);
+        plain.extend_from_slice(&inner);
+        let decoded = StorageRecord::decode(plain.as_slice()).unwrap();
+        assert!(is_target(&decoded, &Target::CallLink(key.clone())));
+        assert!(!is_target(&decoded, &Target::CallLink(vec![8; 16])));
+        let target = Target::CallLink(key.clone());
+        let gone = change_record(&plain, &Change::CallLinkDelete, &target, &own, record_field(&target, &own)).unwrap();
+        let Some(storage_record::Record::CallLink(l)) = StorageRecord::decode(gone.as_slice()).unwrap().record else { panic!() };
+        assert_eq!((l.root_key, l.admin_passkey), (key, vec![9, 9]));
+        assert!(l.deleted_at_timestamp_ms > 0);
+        assert!(gone.windows(3).any(|w| w == b"new"), "the unknown field stays");
     }
 
     #[test]

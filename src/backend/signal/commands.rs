@@ -731,6 +731,26 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 .await;
                 finish(done, result, at);
             }
+            Command::CallLinkCredentials { start, end, done } => {
+                let result = manager.call_link_auth_credentials(start, end).await.map_err(|e| format!("Signal did not give call link credentials: {}", explain(&e)));
+                let _ = done.send(result);
+            }
+            Command::CreateCallLinkCredential { request, done } => {
+                let result = manager.create_call_link_credential(&request).await.map_err(|e| format!("Signal did not let a call link be made: {}", explain(&e)));
+                let _ = done.send(result);
+            }
+            Command::SaveCallLink { root_key, admin_passkey, done } => {
+                let device = manager.registration_data().device_id.unwrap_or(0);
+                let result = super::storage_write::create_call_link(&manager, device, &root_key, &admin_passkey).await;
+                if result.is_ok() {
+                    let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::StorageManifest as i32) };
+                    let sync = SyncMessage { content: Some(sync_message::Content::FetchLatest(fetch)), ..Default::default() };
+                    let me = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                    let _ = manager.send_message(me, sync, now_ms()).await;
+                    super::storage::refresh(&state, &handle, &manager).await;
+                }
+                let _ = done.send(result);
+            }
             Command::GroupCallProof { key, done } => {
                 let result = manager.group_call_proof(key).await.map_err(|e| format!("the group server did not give a call token: {}", explain(&e)));
                 let _ = done.send(result);

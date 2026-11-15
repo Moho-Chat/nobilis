@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod backup;
+pub mod call_links;
 pub mod calls;
 pub mod commands;
 pub mod compose;
@@ -172,6 +173,12 @@ pub enum Command {
     CallEventSync { remote: uuid::Uuid, call_id: u64, at_ms: u64, video: bool, incoming: bool, accepted: bool },
     /// Start a fresh session with a person: the old ones are forgotten and a new one is made by sending them nothing.
     ResetSession { who: uuid::Uuid, done: Done },
+    /// A week's call link auth credentials (serialized responses, by day in seconds).
+    CallLinkCredentials { start: u64, end: u64, done: tokio::sync::oneshot::Sender<Result<call_links::Credentials, String>> },
+    /// The credential to make a call link's room, for a serialized request.
+    CreateCallLinkCredential { request: Vec<u8>, done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
+    /// Keep a call link made here in the shared records.
+    SaveCallLink { root_key: Vec<u8>, admin_passkey: Vec<u8>, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// A group call's membership proof (the group server's token for this account).
     GroupCallProof { key: [u8; 32], done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
     /// Send a call message (a group call's ring, as RingRTC asked) to these people.

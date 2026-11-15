@@ -221,6 +221,10 @@ pub async fn settings(state: &AppState, account_id: &str) -> Result<serde_json::
 /// Where Signal's group calls are held.
 pub const SFU_URL: &str = "https://sfu.voip.signal.org";
 
+/// The certificate authority the calling server's certificate chains to: Signal's own, not a public one, so its
+/// requests trust this alone.
+pub const SFU_CA: &str = include_str!("../../../vendor/libsignal-service-rs/certs/production-root-ca.pem");
+
 /// What the app needs to join a group's call: the group's id as RingRTC knows it (the server's identifier), the
 /// membership proof, every member with their id as the group encrypts it, and the call server.
 pub async fn group_info(state: &AppState, buffer_id: &str) -> Result<serde_json::Value, String> {
@@ -259,6 +263,7 @@ pub async fn group_info(state: &AppState, buffer_id: &str) -> Result<serde_json:
         "proof": b64(&proof),
         "members": members,
         "sfuUrl": SFU_URL,
+        "sfuCa": SFU_CA,
         "ownAci": handle.own.to_string(),
         "deviceId": device,
     }))

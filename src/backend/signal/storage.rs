@@ -130,6 +130,12 @@ pub struct Kept {
     /// Whether this copy was read by a moho that reads folders and profiles (an older copy is read again once).
     #[serde(default)]
     pub reads_folders: bool,
+    /// The account's call links (not deleted ones): root key, and the admin passkey for those it made.
+    #[serde(default)]
+    pub call_links: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether this copy was read by a moho that reads call links (an older copy is read again once).
+    #[serde(default)]
+    pub reads_call_links: bool,
 }
 
 /// A chat folder as the phone keeps it: which chats it holds, by rule and by name.
@@ -355,7 +361,7 @@ fn account_settings(record: &AccountRecord) -> AccountSettings {
 impl Kept {
     /// What the records say, as of `version`. Records of kinds a client does not act on are passed over.
     pub fn from_records(version: u64, records: &[StorageRecord]) -> Self {
-        let mut kept = Kept { version, reads_story_lists: true, reads_folders: true, ..Default::default() };
+        let mut kept = Kept { version, reads_story_lists: true, reads_folders: true, reads_call_links: true, ..Default::default() };
         for record in records {
             match &record.record {
                 Some(storage_record::Record::Contact(c)) => {
@@ -396,6 +402,9 @@ impl Kept {
                             days: p.schedule_days_enabled.clone(),
                         });
                     }
+                }
+                Some(storage_record::Record::CallLink(l)) if l.deleted_at_timestamp_ms == 0 && !l.root_key.is_empty() => {
+                    kept.call_links.push((l.root_key.clone(), l.admin_passkey.clone()));
                 }
                 Some(storage_record::Record::StoryDistributionList(list)) => {
                     if let Some(list) = story_list(list) {
@@ -561,7 +570,7 @@ pub async fn fetch(manager: &presage::Manager<SignalStore, presage::manager::Reg
     let wanted: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
-        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account | Type::StoryDistributionList | Type::ChatFolder | Type::NotificationProfile))
+        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account | Type::StoryDistributionList | Type::ChatFolder | Type::NotificationProfile | Type::CallLink))
         .map(|id| id.raw.clone())
         .collect();
     let mut records = Vec::with_capacity(wanted.len());
@@ -578,7 +587,7 @@ pub async fn refresh(state: &crate::state::AppState, handle: &super::Handle, man
     let store = manager.store().clone();
     let before = current(account_id, &store);
     // A copy read before story lists were read is read again in full.
-    let known = if before.reads_story_lists && before.reads_folders { before.version } else { 0 };
+    let known = if before.reads_story_lists && before.reads_folders && before.reads_call_links { before.version } else { 0 };
     let fetched = tokio::time::timeout(std::time::Duration::from_secs(30), fetch(manager, known)).await;
     let kept = match fetched {
         Ok(Ok(Some(kept))) => keep(account_id, &store, kept),

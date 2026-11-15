@@ -741,6 +741,17 @@ impl<S: Store> Manager<S, Registered> {
             .into_bytes())
     }
 
+    /// moho: the call link auth credentials the chat server gives for these days (serialized
+    /// `CallLinkAuthCredentialResponse`s, by redemption time in seconds).
+    pub async fn call_link_auth_credentials(&mut self, start: u64, end: u64) -> Result<Vec<(u64, Vec<u8>)>, Error<S::Error>> {
+        Ok(self.identified_websocket(false).await?.call_link_auth_credentials(start, end).await?)
+    }
+
+    /// moho: the credential to make a call link's room, for a serialized `CreateCallLinkCredentialRequest`.
+    pub async fn create_call_link_credential(&mut self, request: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
+        Ok(self.identified_websocket(false).await?.create_call_link_credential(request).await?)
+    }
+
     /// moho: saves a group's state after a change and tells everybody concerned.
     async fn after_group_change(
         &mut self,
