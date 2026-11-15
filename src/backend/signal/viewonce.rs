@@ -89,7 +89,7 @@ pub async fn open(state: &AppState, handle: &Handle, msg_id: &str) -> Result<ser
     let bytes = handle.store.blob(&pointer_key(msg_id)).ok().flatten().filter(|b| !b.is_empty()).ok_or("That was opened already")?;
     let pointer = AttachmentPointer::decode(bytes.as_slice()).map_err(|_| "That picture's details were damaged".to_string())?;
     let (done, answer) = tokio::sync::oneshot::channel();
-    handle.commands.send(Command::Fetch { pointer: Box::new(pointer.clone()), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    handle.commands.send(Command::Fetch { pointer: Box::new(pointer.clone()), plaintext_hash: None, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     let picture = match tokio::time::timeout(std::time::Duration::from_secs(300), answer).await {
         Ok(Ok(result)) => result?,
         Ok(Err(_)) => return Err("the connection ended before Signal gave the picture".to_string()),

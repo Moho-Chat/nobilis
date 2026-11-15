@@ -103,8 +103,9 @@ pub enum Command {
     Rename { name: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Fetch a person's profile (name and picture), once their profile key is known.
     Profile { who: uuid::Uuid },
-    /// Download and decrypt an attachment.
-    Fetch { pointer: Box<presage::proto::AttachmentPointer>, done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
+    /// Download and decrypt an attachment. `plaintext_hash`: check the decrypted file against this SHA-256 instead of
+    /// the pointer's digest (a file from transferred history).
+    Fetch { pointer: Box<presage::proto::AttachmentPointer>, plaintext_hash: Option<Vec<u8>>, done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
     /// Tell the account's other devices these messages were read here.
     ReadSync { reads: Vec<(uuid::Uuid, u64)> },
     /// Say the account is typing in a conversation, or has stopped.

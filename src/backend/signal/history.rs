@@ -4,12 +4,15 @@
 //! key with the link, uploads its history as a backup archive, and says where (`/v1/devices/transfer_archive`). The
 //! archive is Signal's backup format: libsignal's own reader checks it and takes off its encryption and compression,
 //! and its frames - who each recipient is, which chat is whose, and each message - are read here and written into the
-//! conversations under the ids a live message has, so nothing is shown twice. Text is brought over; pictures and files
-//! are named, not fetched (their copies are the phone's to keep).
+//! conversations under the ids a live message has, so nothing is shown twice. Pictures and files the phone put where a
+//! linked device can fetch them (its transit copy) come over as attachments, fetched when looked at like any other and
+//! checked against the archive's digest or hash; older ones, no longer there, are named.
 
 use super::people::{self, Ctx};
 use super::ids;
-use libsignal_message_backup::proto::backup::{chat_item, frame, recipient, BackupInfo, Frame};
+use libsignal_message_backup::proto::backup::{chat_item, file_pointer, frame, message_attachment, recipient, BackupInfo, Frame, MessageAttachment};
+use presage::proto::AttachmentPointer;
+use prost::Message as _;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::store::Thread;
 use std::collections::{HashMap, HashSet};
@@ -33,6 +36,61 @@ pub struct Old {
     author: Who,
     sent_ms: u64,
     body: String,
+    /// The files the phone left where they can be fetched, each with the plaintext hash to check it by (when the
+    /// archive gives that rather than the encrypted digest).
+    files: Vec<(AttachmentPointer, Option<Vec<u8>>)>,
+}
+
+/// A file of the archive as a pointer the library fetches, if the phone left it on the transit CDN.
+fn pointer_of(a: &MessageAttachment) -> Option<(AttachmentPointer, Option<Vec<u8>>)> {
+    use presage::proto::attachment_pointer::AttachmentIdentifier;
+    let p = a.pointer.as_ref()?;
+    let at = p.locatorInfo.as_ref()?;
+    let cdn_key = at.transitCdnKey.clone().filter(|k| !k.is_empty())?;
+    if at.key.len() != 64 {
+        return None;
+    }
+    let (digest, hash) = match &at.integrityCheck {
+        Some(file_pointer::locator_info::IntegrityCheck::EncryptedDigest(d)) => (Some(d.clone()), None),
+        Some(file_pointer::locator_info::IntegrityCheck::PlaintextHash(h)) => (None, Some(h.clone())),
+        // Nothing to check it by, or a kind this copy does not know: not fetched.
+        _ => return None,
+    };
+    let flags = match a.flag.enum_value() {
+        Ok(message_attachment::Flag::VOICE_MESSAGE) => 1,
+        Ok(message_attachment::Flag::BORDERLESS) => 2,
+        Ok(message_attachment::Flag::GIF) => 8,
+        _ => 0,
+    };
+    let pointer = AttachmentPointer {
+        attachment_identifier: Some(AttachmentIdentifier::CdnKey(cdn_key)),
+        cdn_number: at.transitCdnNumber,
+        key: Some(at.key.clone()),
+        digest,
+        size: Some(at.size),
+        content_type: p.contentType.clone(),
+        file_name: p.fileName.clone(),
+        width: p.width,
+        height: p.height,
+        caption: p.caption.clone(),
+        blur_hash: p.blurHash.clone(),
+        flags: Some(flags).filter(|f| *f != 0),
+        ..Default::default()
+    };
+    Some((pointer, hash))
+}
+
+fn file_key(thread: &Thread, ts: u64, author: &Uuid, index: usize) -> String {
+    format!("history-file:{}:{ts}:{author}:{index}", ids::remote_id(thread))
+}
+
+/// A file a transferred message carried, kept for fetching when it is looked at: its pointer, and the plaintext hash
+/// to check it by when the archive gave that.
+pub fn file(store: &super::store::SignalStore, thread: &Thread, ts: u64, author: &Uuid, index: usize) -> Option<(AttachmentPointer, Option<Vec<u8>>)> {
+    let key = file_key(thread, ts, author, index);
+    let pointer = AttachmentPointer::decode(store.blob(&key).ok().flatten()?.as_slice()).ok()?;
+    let hash = store.blob(&format!("{key}:hash")).ok().flatten().filter(|h| !h.is_empty());
+    Some((pointer, hash))
 }
 
 /// Takes off the archive's encryption and compression (libsignal's reader, which checks it too) and reads its frames.
@@ -115,8 +173,13 @@ pub fn messages(frames: &[Frame]) -> Vec<Old> {
             }
             Some(frame::Item::ChatItem(item)) => {
                 let (Some(thread), Some(author)) = (chats.get(&item.chatId), recipients.get(&item.authorId)) else { continue };
-                let Some(body) = words(item) else { continue };
-                out.push(Old { thread: *thread, author: *author, sent_ms: item.dateSent, body });
+                let files_present = matches!(&item.item, Some(chat_item::Item::StandardMessage(m)) if m.attachments.iter().any(|a| pointer_of(a).is_some()));
+                let Some(body) = words(item).or_else(|| files_present.then(String::new)) else { continue };
+                let files = match &item.item {
+                    Some(chat_item::Item::StandardMessage(m)) => m.attachments.iter().filter_map(pointer_of).collect(),
+                    _ => Vec::new(),
+                };
+                out.push(Old { thread: *thread, author: *author, sent_ms: item.dateSent, body, files });
             }
             _ => {}
         }
@@ -130,7 +193,8 @@ fn words(item: &libsignal_message_backup::proto::backup::ChatItem) -> Option<Str
     Some(match item.item.as_ref()? {
         Item::StandardMessage(m) => {
             let text = m.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
-            let files = m.attachments.len();
+            // Only the ones that cannot be fetched are named: the rest come over as attachments.
+            let files = m.attachments.iter().filter(|a| pointer_of(a).is_none()).count();
             let named = match files {
                 0 => String::new(),
                 1 => "[An attachment, kept on the phone]".to_string(),
@@ -178,7 +242,17 @@ pub async fn import(ctx: &Ctx<'_>, old: &[Old]) -> usize {
         };
         let id = ids::message_id(m.sent_ms, &author);
         let own = author == ctx.own;
-        let fresh = ctx.state.store.append_message(&buffer.id, &id, &from, &m.body, (m.sent_ms / 1000) as i64, false, false, "chat", None, &[], own, None, &[], &[], Some(&author.to_string()), None, &buffer.kind, None, &[]);
+        // The files are kept where `media` looks for them when the window asks.
+        for (index, (pointer, hash)) in m.files.iter().enumerate() {
+            let key = file_key(&thread, m.sent_ms, &author, index);
+            let _ = ctx.store.set_blob(&key, &pointer.encode_to_vec());
+            if let Some(hash) = hash {
+                let _ = ctx.store.set_blob(&format!("{key}:hash"), hash);
+            }
+        }
+        let pointers: Vec<AttachmentPointer> = m.files.iter().map(|(p, _)| p.clone()).collect();
+        let attachments = super::media::attachments_of(ctx.account_id, &thread, &author, m.sent_ms, &pointers);
+        let fresh = ctx.state.store.append_message(&buffer.id, &id, &from, &m.body, (m.sent_ms / 1000) as i64, false, false, "chat", None, &[], own, None, &[], &attachments, Some(&author.to_string()), None, &buffer.kind, None, &[]);
         if matches!(fresh, Ok(true)) {
             brought += 1;
             touched.insert(buffer.id.clone());
@@ -242,10 +316,30 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                Old { thread: Who::Person(alice), author: Who::Person(alice), sent_ms: 1_700_000_000_000, body: "hello".into() },
-                Old { thread: Who::Person(alice), author: Who::Me, sent_ms: 1_700_000_001_000, body: "hi back".into() },
+                Old { thread: Who::Person(alice), author: Who::Person(alice), sent_ms: 1_700_000_000_000, body: "hello".into(), files: vec![] },
+                Old { thread: Who::Person(alice), author: Who::Me, sent_ms: 1_700_000_001_000, body: "hi back".into(), files: vec![] },
             ]
         );
         assert!(frames(&[0x05, 1, 2]).is_err(), "cut short");
+    }
+
+    #[test]
+    fn a_file_the_phone_left_on_the_transit_cdn_is_fetchable_and_an_older_one_is_not() {
+        use libsignal_message_backup::proto::backup::FilePointer;
+        let locator = |cdn: Option<&str>| file_pointer::LocatorInfo {
+            key: vec![7; 64],
+            size: 10,
+            transitCdnKey: cdn.map(String::from),
+            transitCdnNumber: Some(3),
+            integrityCheck: Some(file_pointer::locator_info::IntegrityCheck::PlaintextHash(vec![1; 32])),
+            ..Default::default()
+        };
+        let attachment = |cdn: Option<&str>| MessageAttachment {
+            pointer: protobuf::MessageField::some(FilePointer { contentType: Some("image/jpeg".into()), locatorInfo: protobuf::MessageField::some(locator(cdn)), ..Default::default() }),
+            ..Default::default()
+        };
+        let (pointer, hash) = pointer_of(&attachment(Some("abc"))).unwrap();
+        assert_eq!((pointer.cdn_number, pointer.size, hash), (Some(3), Some(10), Some(vec![1; 32])));
+        assert!(pointer_of(&attachment(None)).is_none(), "only on the phone now");
     }
 }

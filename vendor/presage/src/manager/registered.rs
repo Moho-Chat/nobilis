@@ -1875,6 +1875,32 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Downloads and decrypts a single attachment.
+    /// moho: an attachment whose pointer has no digest but whose plaintext's SHA-256 is known (a file in the history
+    /// a phone transfers): downloaded, decrypted, and checked against that hash instead.
+    pub async fn get_attachment_by_plaintext_hash(
+        &self,
+        attachment_pointer: &AttachmentPointer,
+        plaintext_sha256: &[u8],
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let mut service = self.identified_push_service();
+        let mut attachment_stream = service.get_attachment(attachment_pointer).await?;
+        let mut data = Vec::new();
+        attachment_stream.stream.read_to_end(&mut data).await?;
+        let key: [u8; 64] = attachment_pointer.key().try_into()?;
+        let mut data = tokio::task::spawn_blocking(move || decrypt_in_place(key, &mut data).map(|_| data))
+            .await
+            .expect("decryption in another thread")?;
+        if let Some(len) = attachment_pointer.size.and_then(|len| usize::try_from(len).ok()) {
+            if len < data.len() {
+                data.truncate(len);
+            }
+        }
+        if sha2::Sha256::digest(&data)[..] != *plaintext_sha256 {
+            return Err(Error::UnexpectedAttachmentChecksum);
+        }
+        Ok(data)
+    }
+
     pub async fn get_attachment(
         &self,
         attachment_pointer: &AttachmentPointer,

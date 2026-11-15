@@ -35,6 +35,8 @@ What is changed, and nothing else:
 - `src/manager/registered.rs`: `group_call_proof` (the group server's call token), and `send_to_people` (one content
   to a set of people, as a group send; `send_story_to` is it for a story).
 - `src/manager/registered.rs`: `transfer_archive` and `download_transfer_archive` (the history a phone sends a new link).
+- `src/manager/registered.rs`: `get_attachment_by_plaintext_hash` (a transferred-history file, checked by its plaintext's
+  hash where the archive gives no encrypted digest).
 - `src/errors.rs`: `Error::GroupChange`, a refusal in words.
 - `src/manager/registered.rs`: the identified websocket asks for stories (`X-Signal-Receive-Stories: true`).
 - `Cargo.toml`: reqwest's `socks` feature; the dev-dependencies are dropped (they named sibling crates of the

@@ -228,14 +228,21 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
 }
 
 async fn fetch(handle: &Handle, thread: Thread, ts: u64, index: usize, author: Option<Uuid>) -> Result<Vec<u8>> {
-    // A story's picture is kept by moho, the library keeping no stories.
+    // A story's picture is kept by moho, the library keeping no stories; a file from transferred history too.
+    let mut plaintext_hash = None;
     let pointer = match pointer_for(&handle.store, &thread, ts, index).await {
         Some(pointer) => Some(pointer),
-        None => author.and_then(|a| super::stories::pointer(&handle.store, ts, &a)),
+        None => match author.and_then(|a| super::stories::pointer(&handle.store, ts, &a)) {
+            Some(pointer) => Some(pointer),
+            None => author.and_then(|a| super::history::file(&handle.store, &thread, ts, &a, index)).map(|(pointer, hash)| {
+                plaintext_hash = hash;
+                pointer
+            }),
+        },
     };
     let pointer = pointer.ok_or_else(|| anyhow!("the message that carried this file is no longer kept"))?;
     let (done, answer) = oneshot::channel();
-    handle.commands.send(Command::Fetch { pointer: Box::new(pointer), done }).map_err(|_| anyhow!("that Signal account is not connected"))?;
+    handle.commands.send(Command::Fetch { pointer: Box::new(pointer), plaintext_hash, done }).map_err(|_| anyhow!("that Signal account is not connected"))?;
     match tokio::time::timeout(PATIENCE, answer).await {
         Ok(Ok(Ok(bytes))) => Ok(bytes),
         Ok(Ok(Err(e))) => bail!("{e}"),

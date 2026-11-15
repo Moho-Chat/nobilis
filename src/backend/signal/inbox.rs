@@ -776,7 +776,7 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
             let (state, buffer_id, id) = (ctx.state.clone(), buffer.id.clone(), ids::message_id(at, &author));
             tokio::task::spawn_local(async move {
                 let (done, answer) = tokio::sync::oneshot::channel();
-                if handle.commands.send(super::Command::Fetch { pointer: Box::new(pointer), done }).is_err() {
+                if handle.commands.send(super::Command::Fetch { pointer: Box::new(pointer), plaintext_hash: None, done }).is_err() {
                     return;
                 }
                 if let Ok(Ok(bytes)) = answer.await {

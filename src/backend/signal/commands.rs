@@ -152,8 +152,12 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     Err(e) => tracing::debug!("signal[{account_id}]: a profile was not fetched: {e}"),
                 }
             }
-            Command::Fetch { pointer, done } => {
-                let result = manager.get_attachment(&pointer).await.map_err(|e| {
+            Command::Fetch { pointer, plaintext_hash, done } => {
+                let fetched = match &plaintext_hash {
+                    Some(hash) => manager.get_attachment_by_plaintext_hash(&pointer, hash).await,
+                    None => manager.get_attachment(&pointer).await,
+                };
+                let result = fetched.map_err(|e| {
                     tracing::info!("signal[{account_id}]: an attachment was not fetched: {e}");
                     format!("Signal did not give the file: {e}")
                 });
