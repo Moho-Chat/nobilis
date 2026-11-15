@@ -70,6 +70,16 @@ pub struct AccountSettings {
     /// Whether authors are told their stories were viewed; unset follows `read_receipts`, as on the phone.
     #[serde(default)]
     pub story_view_receipts: Option<bool>,
+    /// Who sees the account's number: 1 everybody, 2 nobody (0 not said).
+    #[serde(default)]
+    pub phone_number_sharing: i32,
+    /// Whether the account can be found by its number (false: unlisted).
+    #[serde(default)]
+    pub findable_by_number: bool,
+    #[serde(default)]
+    pub stories_disabled: bool,
+    #[serde(default)]
+    pub keep_muted_chats_archived: bool,
 }
 
 impl AccountSettings {
@@ -223,6 +233,10 @@ fn account_settings(record: &AccountRecord) -> AccountSettings {
             2 => Some(false),
             _ => None,
         },
+        phone_number_sharing: record.phone_number_sharing_mode,
+        findable_by_number: !record.unlisted_phone_number,
+        stories_disabled: record.stories_disabled,
+        keep_muted_chats_archived: record.keep_muted_chats_archived,
     }
 }
 

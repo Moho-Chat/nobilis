@@ -346,7 +346,8 @@ pub async fn shared_change(state: &AppState, account_id: &str, params: &serde_js
     } else if let Some(on) = flag("pinned") {
         Change::Pin(on)
     } else if let Some(name) = params.get("setting").and_then(|v| v.as_str()) {
-        Change::Setting(AccountSetting::parse(name).ok_or("no such setting")?, flag("on").unwrap_or(false))
+        let setting = AccountSetting::parse(name).ok_or("no such setting")?;
+        Change::Setting(setting, setting.value(flag("on"), params.get("value").and_then(|v| v.as_u64()))?)
     } else if let Some(on) = flag("replies") {
         Change::ListReplies(on)
     } else if let Some(who) = params.get("person").and_then(|v| v.as_str()) {
@@ -959,6 +960,11 @@ pub async fn settings(state: &AppState, account_id: &str) -> Result<serde_json::
         "linkPreviews": synced.link_previews,
         "sealedSenderIndicators": synced.unidentified_delivery_indicators,
         "defaultTimer": kept.account.map(|a| a.default_timer),
+        "phoneNumberSharing": kept.account.map(|a| a.phone_number_sharing),
+        "findableByNumber": kept.account.map(|a| a.findable_by_number),
+        "storiesDisabled": kept.account.map(|a| a.stories_disabled),
+        "storyViewReceipts": kept.account.map(|a| a.tells_story_views()),
+        "keepMutedChatsArchived": kept.account.map(|a| a.keep_muted_chats_archived),
         "blocked": blocked,
     }))
 }

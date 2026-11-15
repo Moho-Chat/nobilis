@@ -175,8 +175,8 @@ pub enum Change {
     MarkUnread(bool),
     /// Pinned or not (an account-record change, whatever the conversation).
     Pin(bool),
-    /// An account setting (a field of the account record that is a bool).
-    Setting(AccountSetting, bool),
+    /// An account setting (a field of the account record): a yes or no as 1 or 0, a choice, or a number.
+    Setting(AccountSetting, u64),
     /// Whether a story list's audience may reply.
     ListReplies(bool),
     /// A person added to (true) or taken off a story list.
@@ -189,6 +189,16 @@ pub enum AccountSetting {
     SealedSenderIndicators,
     TypingIndicators,
     LinkPreviews,
+    /// Who sees the account's number: 1 everybody, 2 nobody.
+    PhoneNumberSharing,
+    /// Found by number: written as the account record's "unlisted", the other way round.
+    FindableByNumber,
+    /// The timer a new conversation starts with, in seconds (0 off).
+    DefaultTimer,
+    StoriesDisabled,
+    /// 1 on, 2 off (the record's optional bool).
+    StoryViewReceipts,
+    KeepMutedChatsArchived,
 }
 
 impl AccountSetting {
@@ -198,6 +208,27 @@ impl AccountSetting {
             Self::SealedSenderIndicators => 7,
             Self::TypingIndicators => 8,
             Self::LinkPreviews => 11,
+            Self::PhoneNumberSharing => 12,
+            Self::FindableByNumber => 13,
+            Self::DefaultTimer => 17,
+            Self::KeepMutedChatsArchived => 25,
+            Self::StoriesDisabled => 29,
+            Self::StoryViewReceipts => 30,
+        }
+    }
+
+    /// The value written for what the window says: a yes or no, or a number.
+    pub fn value(self, on: Option<bool>, number: Option<u64>) -> Result<u64, String> {
+        match self {
+            Self::PhoneNumberSharing => match number {
+                Some(n @ (1 | 2)) => Ok(n),
+                _ => Err("phone number sharing is 1 (everybody) or 2 (nobody)".to_string()),
+            },
+            Self::DefaultTimer => number.filter(|n| *n <= 4 * 7 * 24 * 3600).ok_or_else(|| "the timer is a number of seconds, at most four weeks".to_string()),
+            Self::StoryViewReceipts => on.map(|on| if on { 1 } else { 2 }).ok_or_else(|| "on or off".to_string()),
+            // Unlisted is the record's word: findable is the other way round.
+            Self::FindableByNumber => on.map(|on| u64::from(!on)).ok_or_else(|| "on or off".to_string()),
+            _ => on.map(u64::from).ok_or_else(|| "on or off".to_string()),
         }
     }
 
@@ -207,6 +238,12 @@ impl AccountSetting {
             "sealedSenderIndicators" => Self::SealedSenderIndicators,
             "typingIndicators" => Self::TypingIndicators,
             "linkPreviews" => Self::LinkPreviews,
+            "phoneNumberSharing" => Self::PhoneNumberSharing,
+            "findableByNumber" => Self::FindableByNumber,
+            "defaultTimer" => Self::DefaultTimer,
+            "storiesDisabled" => Self::StoriesDisabled,
+            "storyViewReceipts" => Self::StoryViewReceipts,
+            "keepMutedChatsArchived" => Self::KeepMutedChatsArchived,
             _ => return None,
         })
     }
@@ -301,7 +338,7 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
             }
             replace(inner, 14, &pins.into_iter().map(Value::Bytes).collect::<Vec<_>>())
         }
-        Change::Setting(setting, on) => set_varint(inner, setting.field(), u64::from(*on)),
+        Change::Setting(setting, value) => set_varint(inner, setting.field(), *value),
         Change::ListReplies(on) => set_varint(inner, 5, u64::from(*on)),
         Change::ListPerson(who, add) => {
             // The list names people by text and by bytes; both are kept in step, everything else left alone.
@@ -489,9 +526,14 @@ mod tests {
     fn a_setting_and_a_story_list_are_changed_in_place() {
         let own = Uuid::from_u128(1);
         let account = wrap(storage_record::Record::Account(AccountRecord { typing_indicators: true, ..Default::default() }));
-        let changed = change_record(&account, &Change::Setting(AccountSetting::ReadReceipts, true), &Target::Account, &own, 4).unwrap();
+        let changed = change_record(&account, &Change::Setting(AccountSetting::ReadReceipts, 1), &Target::Account, &own, 4).unwrap();
         let Some(storage_record::Record::Account(a)) = StorageRecord::decode(changed.as_slice()).unwrap().record else { panic!() };
         assert!(a.read_receipts && a.typing_indicators);
+        let timer = change_record(&changed, &Change::Setting(AccountSetting::DefaultTimer, 3600), &Target::Account, &own, 4).unwrap();
+        let unlisted = change_record(&timer, &Change::Setting(AccountSetting::FindableByNumber, AccountSetting::FindableByNumber.value(Some(false), None).unwrap()), &Target::Account, &own, 4).unwrap();
+        let Some(storage_record::Record::Account(a)) = StorageRecord::decode(unlisted.as_slice()).unwrap().record else { panic!() };
+        assert_eq!((a.universal_expire_timer, a.unlisted_phone_number, a.read_receipts), (3600, true, true));
+        assert!(AccountSetting::PhoneNumberSharing.value(None, Some(3)).is_err());
         let (x, y) = (Uuid::from_u128(4), Uuid::from_u128(5));
         let list = wrap(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
             identifier: Uuid::nil().as_bytes().to_vec(),
