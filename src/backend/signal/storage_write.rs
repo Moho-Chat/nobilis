@@ -181,6 +181,12 @@ pub enum Change {
     ListReplies(bool),
     /// A person added to (true) or taken off a story list.
     ListPerson(Uuid, bool),
+    /// A story list's new name (not My Story's).
+    ListRename(String),
+    /// A story list taken away (marked deleted, as Signal's apps do; not My Story).
+    ListDelete,
+    /// My Story's audience: every connection except those listed (true), or only those listed; the list starts empty.
+    ListMode(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +346,24 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
         }
         Change::Setting(setting, value) => set_varint(inner, setting.field(), *value),
         Change::ListReplies(on) => set_varint(inner, 5, u64::from(*on)),
+        Change::ListRename(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("A story list needs a name".to_string());
+            }
+            replace(inner, 2, &[Value::Bytes(name.as_bytes().to_vec())])
+        }
+        Change::ListDelete => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
+            let step = set_varint(inner, 4, now).ok_or_else(broken)?;
+            let step = replace(&step, 3, &[]).ok_or_else(broken)?;
+            replace(&step, 7, &[])
+        }
+        Change::ListMode(excluding) => {
+            let step = set_varint(inner, 6, u64::from(*excluding)).ok_or_else(broken)?;
+            let step = replace(&step, 3, &[]).ok_or_else(broken)?;
+            replace(&step, 7, &[])
+        }
         Change::ListPerson(who, add) => {
             // The list names people by text and by bytes; both are kept in step, everything else left alone.
             let mut binary: Vec<Vec<u8>> = all_bytes(inner, 7).into_iter().map(<[u8]>::to_vec).collect();
@@ -440,6 +464,43 @@ pub async fn write(manager: &presage::Manager<super::store::SignalStore, presage
                 manifest = storage.open_manifest(&current).map_err(|e| format!("the storage service could not be read: {e}"))?;
             }
             Err(e) => return Err(format!("the change could not be written: {e}")),
+        }
+    }
+    Err("another device kept changing the shared settings; try again".to_string())
+}
+
+/// Makes a new story list with these people (replies allowed), as a new record in a new manifest version. Answers its id.
+pub async fn create_list(manager: &presage::Manager<super::store::SignalStore, presage::manager::Registered>, device: u32, name: &str, people: &[Uuid]) -> Result<Uuid, String> {
+    use presage::libsignal_service::proto::{manifest_record::Identifier, StoryDistributionListRecord};
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("A story list needs a name".to_string());
+    }
+    let id = Uuid::new_v4();
+    let record = StorageRecord {
+        record: Some(storage_record::Record::StoryDistributionList(StoryDistributionListRecord {
+            identifier: id.as_bytes().to_vec(),
+            name: name.to_string(),
+            recipient_service_ids_binary: people.iter().map(|p| p.as_bytes().to_vec()).collect(),
+            allows_replies: true,
+            ..Default::default()
+        })),
+    }
+    .encode_to_vec();
+    let storage = manager.storage_service().await.map_err(|e| format!("the storage service could not be reached: {e}"))?;
+    let mut manifest = storage.manifest().await.map_err(|e| format!("the storage service could not be read: {e}"))?;
+    for attempt in 0..2 {
+        let ikm = Some(manifest.record_ikm.as_slice()).filter(|k| !k.is_empty());
+        let raw: [u8; 16] = rand::random();
+        let mut next = ManifestRecord { version: manifest.version + 1, source_device: device, ..manifest.clone() };
+        next.identifiers.push(Identifier { raw: raw.to_vec(), r#type: Type::StoryDistributionList as i32 });
+        let item = storage.encrypt_raw_item(raw.to_vec(), &record, ikm);
+        match storage.write(&next, vec![item], vec![]).await {
+            Ok(()) => return Ok(id),
+            Err(StorageServiceError::Conflict(current)) if attempt == 0 => {
+                manifest = storage.open_manifest(&current).map_err(|e| format!("the storage service could not be read: {e}"))?;
+            }
+            Err(e) => return Err(format!("the list could not be made: {e}")),
         }
     }
     Err("another device kept changing the shared settings; try again".to_string())
@@ -547,6 +608,15 @@ mod tests {
         assert_eq!(l.recipient_service_ids_binary, vec![y.as_bytes().to_vec()]);
         assert!(l.allows_replies);
         assert_eq!(l.identifier, Uuid::nil().as_bytes());
+        // My Story to "only those listed": the list starts empty; renamed and deleted for a custom one.
+        let only = change_record(&replies, &Change::ListMode(false), &Target::StoryList(Uuid::nil()), &own, 5).unwrap();
+        let Some(storage_record::Record::StoryDistributionList(l)) = StorageRecord::decode(only.as_slice()).unwrap().record else { panic!() };
+        assert!(!l.is_block_list && l.recipient_service_ids_binary.is_empty() && l.allows_replies);
+        let renamed = change_record(&only, &Change::ListRename(" Close friends ".into()), &Target::StoryList(Uuid::nil()), &own, 5).unwrap();
+        let gone = change_record(&renamed, &Change::ListDelete, &Target::StoryList(Uuid::nil()), &own, 5).unwrap();
+        let Some(storage_record::Record::StoryDistributionList(l)) = StorageRecord::decode(gone.as_slice()).unwrap().record else { panic!() };
+        assert_eq!(l.name, "Close friends");
+        assert!(l.deleted_at_timestamp > 0);
     }
 
     #[test]

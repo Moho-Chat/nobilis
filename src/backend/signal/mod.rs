@@ -155,6 +155,8 @@ pub enum Command {
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
     /// Change something the account's devices share (see `storage_write`); the other devices are told to read it.
     SharedChange { target: storage_write::Target, change: storage_write::Change, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Make a new story list; the answer is its id.
+    CreateStoryList { name: String, people: Vec<uuid::Uuid>, done: tokio::sync::oneshot::Sender<Result<uuid::Uuid, String>> },
     /// Bring over the message history the phone transfers to a fresh link (once; see `history`).
     ImportHistory,
     /// Share a contact card.

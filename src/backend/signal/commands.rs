@@ -590,6 +590,18 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
+            Command::CreateStoryList { name, people, done } => {
+                let device = manager.registration_data().device_id.unwrap_or(0);
+                let result = super::storage_write::create_list(&manager, device, &name, &people).await;
+                if result.is_ok() {
+                    let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::StorageManifest as i32) };
+                    let sync = SyncMessage { content: Some(sync_message::Content::FetchLatest(fetch)), ..Default::default() };
+                    let me = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                    let _ = manager.send_message(me, sync, now_ms()).await;
+                    super::storage::refresh(&state, &handle, &manager).await;
+                }
+                let _ = done.send(result);
+            }
             Command::ImportHistory => {
                 let Some(key) = handle.store.blob(super::history::KEY_BLOB).ok().flatten().and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok()) else { return };
                 // Taken now, whatever comes of it: a history the phone did not send is not waited for on every connect.

@@ -350,6 +350,21 @@ pub async fn shared_change(state: &AppState, account_id: &str, params: &serde_js
         Change::Setting(setting, setting.value(flag("on"), params.get("value").and_then(|v| v.as_u64()))?)
     } else if let Some(on) = flag("replies") {
         Change::ListReplies(on)
+    } else if let Some(name) = params.get("rename").and_then(|v| v.as_str()) {
+        if matches!(target, Target::StoryList(id) if id.is_nil()) {
+            return Err("My Story keeps its name".to_string());
+        }
+        Change::ListRename(name.to_string())
+    } else if flag("delete") == Some(true) {
+        if matches!(target, Target::StoryList(id) if id.is_nil()) {
+            return Err("My Story cannot be deleted".to_string());
+        }
+        Change::ListDelete
+    } else if let Some(excluding) = flag("excluding") {
+        if !matches!(target, Target::StoryList(id) if id.is_nil()) {
+            return Err("Only My Story chooses between everybody-except and only-these".to_string());
+        }
+        Change::ListMode(excluding)
     } else if let Some(who) = params.get("person").and_then(|v| v.as_str()) {
         Change::ListPerson(uuid::Uuid::parse_str(who.trim_start_matches("p:")).map_err(|_| "that is not a Signal person".to_string())?, flag("add").unwrap_or(false))
     } else {
@@ -358,6 +373,15 @@ pub async fn shared_change(state: &AppState, account_id: &str, params: &serde_js
     let (done, answer) = oneshot::channel();
     handle.commands.send(Command::SharedChange { target, change, done }).map_err(|_| "that Signal account is not connected".to_string())?;
     wait(answer, Duration::from_secs(60)).await
+}
+
+/// Makes a new story list with these people (ACIs).
+pub async fn create_story_list(state: &AppState, account_id: &str, name: &str, people: &[String]) -> Result<String, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let people: Vec<uuid::Uuid> = people.iter().filter_map(|p| uuid::Uuid::parse_str(p.trim_start_matches("p:")).ok()).collect();
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::CreateStoryList { name: name.to_string(), people, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    wait(answer, Duration::from_secs(60)).await.map(|id| id.to_string())
 }
 
 /// Starts a fresh session with a person (from their card): for a conversation whose messages stopped decrypting.

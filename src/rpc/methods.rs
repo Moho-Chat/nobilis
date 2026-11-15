@@ -6066,6 +6066,13 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        "signalCreateStoryList" => {
+            let people: Vec<String> = params.get("people").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            match backend::signal::send::create_story_list(state, p_str(params, "accountId", ""), p_str(params, "name", ""), &people).await {
+                Ok(id) => (Some(serde_json::json!({ "listId": id })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "signalSharedChange" => match backend::signal::send::shared_change(state, p_str(params, "accountId", ""), params).await {
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
