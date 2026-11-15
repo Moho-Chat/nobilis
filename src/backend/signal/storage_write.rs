@@ -187,6 +187,10 @@ pub enum Change {
     ListDelete,
     /// My Story's audience: every connection except those listed (true), or only those listed; the list starts empty.
     ListMode(bool),
+    /// The account's username and its link (entropy, server handle), or none.
+    Username(Option<(String, [u8; 32], Uuid)>),
+    /// A new link for the same username.
+    UsernameLink([u8; 32], Uuid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +368,21 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
             let step = replace(&step, 3, &[]).ok_or_else(broken)?;
             replace(&step, 7, &[])
         }
+        Change::Username(None) => {
+            let step = replace(inner, 33, &[]).ok_or_else(broken)?;
+            replace(&step, 35, &[])
+        }
+        Change::Username(Some((name, entropy, handle))) => {
+            let step = replace(inner, 33, &[Value::Bytes(name.as_bytes().to_vec())]).ok_or_else(broken)?;
+            change_inner(&step, &Change::UsernameLink(*entropy, *handle), conversation, own).ok()
+        }
+        Change::UsernameLink(entropy, handle) => {
+            // The link's colour (and anything else in it) stays; its entropy and handle are the new ones.
+            let link = all_bytes(inner, 35).into_iter().next().unwrap_or_default().to_vec();
+            let link = replace(&link, 1, &[Value::Bytes(entropy.to_vec())]).ok_or_else(broken)?;
+            let link = replace(&link, 2, &[Value::Bytes(handle.as_bytes().to_vec())]).ok_or_else(broken)?;
+            replace(inner, 35, &[Value::Bytes(link)])
+        }
         Change::ListPerson(who, add) => {
             // The list names people by text and by bytes; both are kept in step, everything else left alone.
             let mut binary: Vec<Vec<u8>> = all_bytes(inner, 7).into_iter().map(<[u8]>::to_vec).collect();
@@ -386,7 +405,7 @@ fn change_inner(inner: &[u8], change: &Change, conversation: &Target, own: &Uuid
 /// Which record a change is made in: a conversation's own, or the account's (Note to Self and pins live there).
 fn record_target(conversation: &Target, change: &Change, own: &Uuid) -> Target {
     match (conversation, change) {
-        (_, Change::Pin(_)) | (_, Change::Setting(..)) => Target::Account,
+        (_, Change::Pin(_)) | (_, Change::Setting(..)) | (_, Change::Username(_)) | (_, Change::UsernameLink(..)) => Target::Account,
         (Target::Person(who), _) if who == own => Target::Account,
         (t, _) => t.clone(),
     }
@@ -617,6 +636,21 @@ mod tests {
         let Some(storage_record::Record::StoryDistributionList(l)) = StorageRecord::decode(gone.as_slice()).unwrap().record else { panic!() };
         assert_eq!(l.name, "Close friends");
         assert!(l.deleted_at_timestamp > 0);
+    }
+
+    #[test]
+    fn a_username_and_its_link_go_in_the_account_record_and_the_colour_stays() {
+        use presage::libsignal_service::proto::account_record::UsernameLink;
+        let own = Uuid::from_u128(1);
+        let account = wrap(storage_record::Record::Account(AccountRecord { username_link: Some(UsernameLink { color: 5, ..Default::default() }), ..Default::default() }));
+        let handle = Uuid::from_u128(9);
+        let set = change_record(&account, &Change::Username(Some(("moho.42".into(), [3; 32], handle))), &Target::Account, &own, 4).unwrap();
+        let Some(storage_record::Record::Account(a)) = StorageRecord::decode(set.as_slice()).unwrap().record else { panic!() };
+        let link = a.username_link.unwrap();
+        assert_eq!((a.username.as_str(), link.entropy, link.server_id, link.color), ("moho.42", vec![3; 32], handle.as_bytes().to_vec(), 5));
+        let gone = change_record(&set, &Change::Username(None), &Target::Account, &own, 4).unwrap();
+        let Some(storage_record::Record::Account(a)) = StorageRecord::decode(gone.as_slice()).unwrap().record else { panic!() };
+        assert!(a.username.is_empty() && a.username_link.is_none());
     }
 
     #[test]

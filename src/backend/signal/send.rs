@@ -375,6 +375,32 @@ pub async fn shared_change(state: &AppState, account_id: &str, params: &serde_js
     wait(answer, Duration::from_secs(60)).await
 }
 
+/// Chooses (or removes, or relinks) the account's username. `params`: `nickname` and optional `number`, or `remove`, or
+/// `resetLink`.
+pub async fn username(state: &AppState, account_id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let text = |n: &str| params.get(n).and_then(|v| v.as_str()).map(str::to_string);
+    let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+    let reset_link = params.get("resetLink").and_then(|v| v.as_bool()).unwrap_or(false);
+    let nickname = if remove || reset_link { None } else { Some(text("nickname").filter(|n| !n.trim().is_empty()).ok_or("Give the name part of the username")?) };
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::Username { nickname, discriminator: text("number"), reset_link, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let name = wait(answer, Duration::from_secs(60)).await?;
+    Ok(serde_json::json!({ "username": name }))
+}
+
+/// The account's username link, and its QR code, as the phone shows them.
+pub fn username_link(state: &AppState, account_id: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let kept = super::storage::current(account_id, &handle.store);
+    let (entropy, server) = kept.own_username_link.clone().ok_or("There is no username link yet")?;
+    let entropy: [u8; 32] = entropy.try_into().map_err(|_| "the link is damaged".to_string())?;
+    let link = presage::libsignal_service::websocket::usernames::generate_username_link(server, &entropy).to_string();
+    let png = super::profile::qr_png(link.as_bytes())?;
+    Ok(serde_json::json!({ "link": link, "qr": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)) }))
+}
+
 /// Makes a new story list with these people (ACIs).
 pub async fn create_story_list(state: &AppState, account_id: &str, name: &str, people: &[String]) -> Result<String, String> {
     let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;

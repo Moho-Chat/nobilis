@@ -87,5 +87,7 @@ pub mod protocol {
 }
 
 pub use libsignal_account_keys;
+/// moho: the whole of libsignal's username crate (candidates, proofs, links), for choosing a username.
+pub use usernames;
 
 pub use zkgroup;

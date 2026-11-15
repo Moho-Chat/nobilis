@@ -6100,6 +6100,14 @@ pub async fn dispatch(
             Ok(rows) => (Some(serde_json::json!(rows.into_iter().map(|(body, ts)| serde_json::json!({ "body": body, "replacedAt": ts })).collect::<Vec<_>>())), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         },
+        "signalUsername" => match backend::signal::send::username(state, p_str(params, "accountId", ""), params).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalUsernameLink" => match backend::signal::send::username_link(state, p_str(params, "accountId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
         "signalCreateStoryList" => {
             let people: Vec<String> = params.get("people").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
             match backend::signal::send::create_story_list(state, p_str(params, "accountId", ""), p_str(params, "name", ""), &people).await {

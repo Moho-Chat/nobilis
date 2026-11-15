@@ -101,6 +101,9 @@ pub struct Kept {
     pub pinned: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_username: Option<String>,
+    /// The account's username link: its entropy and server handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_username_link: Option<(Vec<u8>, Uuid)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountSettings>,
     /// Note to Self's archive and unread marks, which the account's own record keeps.
@@ -402,6 +405,7 @@ impl Kept {
                 Some(storage_record::Record::Account(a)) => {
                     kept.pinned = a.pinned_conversations.iter().filter_map(pinned_remote).collect();
                     kept.own_username = text(&a.username);
+                    kept.own_username_link = a.username_link.as_ref().filter(|l| l.entropy.len() == 32).and_then(|l| Uuid::from_slice(&l.server_id).ok().map(|h| (l.entropy.clone(), h)));
                     kept.account = Some(account_settings(a));
                     {
                         use presage::libsignal_service::proto::account_record::notification_profile_manual_override::Override;

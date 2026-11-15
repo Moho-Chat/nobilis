@@ -594,6 +594,51 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
+            Command::Username { nickname, discriminator, reset_link, done } => {
+                use super::storage_write::{Change, Target};
+                let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                let device = manager.registration_data().device_id.unwrap_or(0);
+                let kept = super::storage::current(&account_id, manager.store());
+                let result: Result<(Option<String>, Change), String> = async {
+                    if reset_link {
+                        let name = kept.own_username.clone().ok_or("There is no username to make a link for")?;
+                        let (entropy, handle) = manager.reset_username_link(&name).await.map_err(|e| explain(&e))?;
+                        return Ok((Some(name), Change::UsernameLink(entropy, handle)));
+                    }
+                    match nickname {
+                        None => {
+                            manager.delete_username().await.map_err(|e| explain(&e))?;
+                            Ok((None, Change::Username(None)))
+                        }
+                        Some(nick) => match manager.set_username(nick.trim(), discriminator.as_deref().map(str::trim).filter(|d| !d.is_empty())).await {
+                            Ok((name, entropy, handle)) => Ok((Some(name.clone()), Change::Username(Some((name, entropy, handle))))),
+                            Err(PresageError::UsernameTaken) => Err("That username is taken: try another number, or let Signal choose one".to_string()),
+                            Err(PresageError::InvalidUsername(e)) => Err(format!("That is not a username Signal takes ({e}): 3 to 32 letters, digits or _, not starting with a digit")),
+                            Err(e) => Err(explain(&e)),
+                        },
+                    }
+                }
+                .await;
+                let result = match result {
+                    Ok((name, change)) => match super::storage_write::write(&manager, own, device, &Target::Account, &change).await {
+                        Ok(()) => {
+                            let fetch = sync_message::FetchLatest { r#type: Some(sync_message::fetch_latest::Type::StorageManifest as i32) };
+                            let sync = SyncMessage { content: Some(sync_message::Content::FetchLatest(fetch)), ..Default::default() };
+                            let me = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                            let _ = manager.send_message(me, sync, now_ms()).await;
+                            super::storage::refresh(&state, &handle, &manager).await;
+                            Ok(name)
+                        }
+                        // Signal has it; only the shared copy lags, which the phone puts right when it next writes it.
+                        Err(e) => {
+                            tracing::info!("signal[{account_id}]: the username was changed but not written to the shared settings: {e}");
+                            Ok(name)
+                        }
+                    },
+                    Err(e) => Err(e),
+                };
+                let _ = done.send(result);
+            }
             Command::CreateStoryList { name, people, done } => {
                 let device = manager.registration_data().device_id.unwrap_or(0);
                 let result = super::storage_write::create_list(&manager, device, &name, &people).await;

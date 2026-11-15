@@ -251,6 +251,136 @@ impl SignalWebSocket<Identified> {
     }
 }
 
+// moho: choosing, confirming and dropping the account's own username, as Signal's clients do.
+impl SignalWebSocket<Identified> {
+    /// Reserves one of these username hashes for the account (`PUT /v1/accounts/username_hash/reserve`). Answers the
+    /// one reserved, or `None` when every one is taken.
+    pub async fn reserve_username_hash(
+        &mut self,
+        hashes: &[[u8; 32]],
+    ) -> Result<Option<[u8; 32]>, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Request {
+            username_hashes: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: Vec<u8>,
+        }
+        let response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/reserve")?
+            .send_json(Request {
+                username_hashes: hashes
+                    .iter()
+                    .map(|h| BASE64_URL_SAFE_NO_PAD.encode(h))
+                    .collect(),
+            })
+            .await?;
+        if response.status() == 409 {
+            return Ok(None);
+        }
+        let reserved: Response =
+            response.service_error_for_status().await?.json().await?;
+        Ok(reserved.username_hash.try_into().ok())
+    }
+
+    /// Confirms a reserved username hash with its proof and, for the account's link, the username encrypted with the
+    /// link's entropy (`PUT /v1/accounts/username_hash/confirm`). Answers the link's handle.
+    pub async fn confirm_username_hash(
+        &mut self,
+        hash: &[u8; 32],
+        proof: &[u8],
+        encrypted_username: &[u8],
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Request {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_hash: Vec<u8>,
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            zk_proof: Vec<u8>,
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            encrypted_username: Vec<u8>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            username_link_handle: Option<uuid::Uuid>,
+        }
+        let confirmed: Response = self
+            .http_request(Method::PUT, "/v1/accounts/username_hash/confirm")?
+            .send_json(Request {
+                username_hash: hash.to_vec(),
+                zk_proof: proof.to_vec(),
+                encrypted_username: encrypted_username.to_vec(),
+            })
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await?;
+        Ok(confirmed.username_link_handle)
+    }
+
+    /// Takes the account's username (and its link) away (`DELETE /v1/accounts/username_hash`).
+    pub async fn delete_username_hash(&mut self) -> Result<(), ServiceError> {
+        self.http_request(Method::DELETE, "/v1/accounts/username_hash")?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
+    }
+
+    /// `set_username_link`, answering the link's entropy and handle too (they go in the account's storage record).
+    pub async fn reset_username_link(
+        &mut self,
+        username: &usernames::Username,
+    ) -> Result<
+        (
+            [u8; usernames::constants::USERNAME_LINK_ENTROPY_SIZE],
+            uuid::Uuid,
+        ),
+        ServiceError,
+    > {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Request {
+            #[serde(with = "serde_base64_url_safe_no_pad")]
+            username_link_encrypted_value: Vec<u8>,
+            keep_link_handle: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            username_link_handle: uuid::Uuid,
+        }
+        let (entropy, ciphertext) = usernames::create_for_username(
+            &mut rand::rng(),
+            username.to_string(),
+            None,
+        )
+        .map_err(|_e| ServiceError::InvalidFrame {
+            reason: "username too long to encrypt",
+        })?;
+        let response: Response = self
+            .http_request(Method::PUT, "/v1/accounts/username_link")?
+            .send_json(Request {
+                username_link_encrypted_value: ciphertext,
+                keep_link_handle: false,
+            })
+            .await?
+            .service_error_for_status_with(put_username_link_errors)
+            .await?
+            .json()
+            .await?;
+        Ok((entropy, response.username_link_handle))
+    }
+}
+
 /// Builds the `https://signal.me/#eu/<base64url>` link from its parts.
 ///
 /// `entropy` is the 32-byte link entropy; `handle` is the server-assigned

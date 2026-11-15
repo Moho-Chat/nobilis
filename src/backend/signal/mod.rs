@@ -157,6 +157,9 @@ pub enum Command {
     StoriesViewed { views: Vec<(uuid::Uuid, u64)>, receipt: bool },
     /// Change something the account's devices share (see `storage_write`); the other devices are told to read it.
     SharedChange { target: storage_write::Target, change: storage_write::Change, done: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Choose the account's username (a nickname, and a number or one of Signal's choosing), remove it (`None`), or
+    /// give it a new link (`reset_link`); the shared settings are written after. The answer is the username.
+    Username { nickname: Option<String>, discriminator: Option<String>, reset_link: bool, done: tokio::sync::oneshot::Sender<Result<Option<String>, String>> },
     /// Make a new story list; the answer is its id.
     CreateStoryList { name: String, people: Vec<uuid::Uuid>, done: tokio::sync::oneshot::Sender<Result<uuid::Uuid, String>> },
     /// Install (or remove) a sticker pack, on every device of the account.

@@ -1476,6 +1476,52 @@ impl<S: Store> Manager<S, Registered> {
             .collect())
     }
 
+    /// moho: makes `nickname` (with `discriminator`, or a number of the server's choosing from Signal's candidates) the
+    /// account's username, with a fresh link. Answers the username, the link's entropy and its handle.
+    pub async fn set_username(
+        &mut self,
+        nickname: &str,
+        discriminator: Option<&str>,
+    ) -> Result<(String, [u8; 32], Uuid), Error<S::Error>> {
+        use libsignal_service::usernames::{NicknameLimits, Username};
+        let candidates: Vec<String> = match discriminator {
+            Some(d) => vec![format!("{nickname}.{d}")],
+            None => Username::candidates_from(&mut rng(), nickname, NicknameLimits::default())?,
+        };
+        let parsed: Vec<Username> = candidates.iter().map(|c| Username::new(c)).collect::<Result<_, _>>()?;
+        let hashes: Vec<[u8; 32]> = parsed.iter().map(Username::hash).collect();
+        let mut ws = self.identified_websocket(false).await?;
+        let reserved = ws
+            .reserve_username_hash(&hashes)
+            .await?
+            .ok_or(Error::UsernameTaken)?;
+        let username = parsed
+            .into_iter()
+            .find(|u| u.hash() == reserved)
+            .ok_or(Error::UsernameTaken)?;
+        let randomness: [u8; 32] = rand::random();
+        let proof = username.proof(&randomness)?;
+        let (entropy, encrypted) =
+            libsignal_service::usernames::create_for_username(&mut rng(), username.to_string(), None)
+                .map_err(|_| Error::UsernameTaken)?;
+        let handle = ws
+            .confirm_username_hash(&reserved, &proof, &encrypted)
+            .await?
+            .ok_or(Error::UsernameTaken)?;
+        Ok((username.to_string(), entropy, handle))
+    }
+
+    /// moho: takes the account's username away.
+    pub async fn delete_username(&mut self) -> Result<(), Error<S::Error>> {
+        Ok(self.identified_websocket(false).await?.delete_username_hash().await?)
+    }
+
+    /// moho: a fresh link for the account's username (the old one stops working). Answers its entropy and handle.
+    pub async fn reset_username_link(&mut self, username: &str) -> Result<([u8; 32], Uuid), Error<S::Error>> {
+        let username = libsignal_service::usernames::Username::new(username)?;
+        Ok(self.identified_websocket(false).await?.reset_username_link(&username).await?)
+    }
+
     /// Resolves a username (which has a text part and an additional random number) to its account identity
     /// for sending messages.
     pub async fn lookup_username(

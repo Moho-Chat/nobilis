@@ -36,5 +36,7 @@ What is changed, and nothing else:
 - Group calls: `PushService::group_external_credential` (`GET /v1/groups/token`, a group call's membership proof).
 - Message history at link time: the link address says `capabilities=backup4,backup5` (so the phone offers its
   history), `SignalWebSocket::transfer_archive` (`GET /v1/devices/transfer_archive`) and `PushService::download_cdn_file`.
+- Usernames: `reserve_username_hash`, `confirm_username_hash`, `delete_username_hash`, `reset_username_link` (answering
+  the link's entropy and handle); the `usernames` crate is re-exported and `websocket::usernames` is public.
 
 Drop this copy when upstream takes a way to set the client's proxy and user agent.
