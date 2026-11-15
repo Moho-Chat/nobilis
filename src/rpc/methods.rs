@@ -6066,6 +6066,11 @@ pub async fn dispatch(
                 Err(e) => (None, Some(e)),
             }
         }
+        // What an edited message said before, oldest first, with when each was replaced. Any service.
+        "getEditHistory" => match state.store.edit_history(p_str(params, "bufferId", ""), p_str(params, "messageId", "")) {
+            Ok(rows) => (Some(serde_json::json!(rows.into_iter().map(|(body, ts)| serde_json::json!({ "body": body, "replacedAt": ts })).collect::<Vec<_>>())), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
         "signalCreateStoryList" => {
             let people: Vec<String> = params.get("people").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
             match backend::signal::send::create_story_list(state, p_str(params, "accountId", ""), p_str(params, "name", ""), &people).await {

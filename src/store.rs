@@ -129,6 +129,14 @@ impl Store {
                One row per card, replaced as the votes come in: card_id is
                whatever the service uses to mean the same poll, or the moment
                it started where the service names nothing. */
+            /* What a message said before each edit, oldest first: its earlier versions, for showing an edit's history. */
+            CREATE TABLE IF NOT EXISTS message_edits (
+                buffer_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                replaced_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(buffer_id, msg_id);
             CREATE TABLE IF NOT EXISTS live_cards (
                 buffer_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -497,6 +505,17 @@ impl Store {
     /// our loaded history isn't something there's a visible row to update.
     pub fn update_message_body(&self, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // The words it is replacing are kept, so the edit's history can be shown. The same words again (a service that
+        // repeats an edit) are no new version.
+        let before: Option<String> = conn
+            .query_row("SELECT body FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id], |r| r.get(0))
+            .optional()?;
+        if let Some(before) = before.filter(|b| b != body) {
+            conn.execute(
+                "INSERT INTO message_edits (buffer_id, msg_id, body, replaced_at) VALUES (?1, ?2, ?3, ?4)",
+                params![buffer_id, msg_id, before, chrono::Utc::now().timestamp()],
+            )?;
+        }
         let embeds_json = serde_json::to_string(embeds)?;
         let attachments_json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
@@ -504,6 +523,14 @@ impl Store {
             params![body, buffer_id, msg_id, embeds_json, attachments_json, chrono::Utc::now().timestamp().max(2)],
         )?;
         Ok(rows > 0)
+    }
+
+    /// A message's earlier versions, oldest first: what it said, and when that was replaced (unix seconds).
+    pub fn edit_history(&self, buffer_id: &str, msg_id: &str) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT body, replaced_at FROM message_edits WHERE buffer_id = ?1 AND msg_id = ?2 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![buffer_id, msg_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Like update_message_body, but doesn't set `edited` - for backend-
@@ -1669,6 +1696,19 @@ mod tests {
         assert_eq!(s.get_message("b", "mine").unwrap().unwrap().delivery.as_deref(), Some("read"));
         assert!(!s.set_delivery("b", "theirs", "sent").unwrap(), "only the account's own messages");
         assert!(!s.set_delivery("b", "mine", "lost").unwrap(), "not a state");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_edit_keeps_what_the_message_said_before() {
+        let (s, dir) = store();
+        append(&s, "b", "m1");
+        assert!(s.update_message_body("b", "m1", "second", &[], &[]).unwrap());
+        assert!(s.update_message_body("b", "m1", "second", &[], &[]).unwrap(), "the same again");
+        assert!(s.update_message_body("b", "m1", "third", &[], &[]).unwrap());
+        let history = s.edit_history("b", "m1").unwrap();
+        assert_eq!(history.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(), vec!["hi", "second"]);
+        assert!(s.edit_history("b", "nope").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
