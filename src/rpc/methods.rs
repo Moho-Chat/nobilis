@@ -6071,6 +6071,19 @@ pub async fn dispatch(
             Ok(()) => (Some(ok_node()), None),
             Err(e) => (None, Some(e)),
         },
+        "signalFolders" | "signalProfiles" => {
+            let account_id = p_str(params, "accountId", "");
+            let Some(handle) = state.runtime.signal_handle(account_id) else {
+                return (None, Some("that Signal account is not connected".to_string()));
+            };
+            let kept = backend::signal::storage::current(account_id, &handle.store);
+            if method == "signalFolders" {
+                (Some(backend::signal::storage::folders_for_window(state, account_id, &kept)), None)
+            } else {
+                let list: Vec<serde_json::Value> = kept.notification_profiles.iter().map(|p| serde_json::json!({ "id": p.id.to_string(), "name": p.name, "emoji": p.emoji, "scheduled": p.scheduled, "start": p.start, "end": p.end, "days": p.days, "allowMentions": p.allow_mentions, "allowed": p.allowed.len() })).collect();
+                (Some(serde_json::json!({ "profiles": list })), None)
+            }
+        }
         "signalStickerPacks" => match backend::signal::sticker_packs::list(state, p_str(params, "accountId", "")).await {
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),

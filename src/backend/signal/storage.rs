@@ -112,6 +112,115 @@ pub struct Kept {
     /// Whether this copy was read by a moho that reads story lists (an older copy is read again in full once).
     #[serde(default)]
     pub reads_story_lists: bool,
+    /// The account's chat folders, in the phone's order (not deleted ones, nor the "all chats" one).
+    #[serde(default)]
+    pub chat_folders: Vec<ChatFolder>,
+    /// The account's notification profiles (not deleted ones).
+    #[serde(default)]
+    pub notification_profiles: Vec<NotificationProfile>,
+    /// A profile turned on by hand: its id and until when (ms; 0 is until turned off). `None` with `profiles_off_at`
+    /// set is "turned off by hand" at that time.
+    #[serde(default)]
+    pub profile_on: Option<(Uuid, u64)>,
+    #[serde(default)]
+    pub profiles_off_at: u64,
+    /// Whether this copy was read by a moho that reads folders and profiles (an older copy is read again once).
+    #[serde(default)]
+    pub reads_folders: bool,
+}
+
+/// A chat folder as the phone keeps it: which chats it holds, by rule and by name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChatFolder {
+    pub id: Uuid,
+    pub name: String,
+    pub position: u32,
+    pub all_people: bool,
+    pub all_groups: bool,
+    pub muted_too: bool,
+    pub only_unread: bool,
+    /// Conversations (`p:<aci>`, `g:<hex>`) named in, and named out.
+    pub included: Vec<String>,
+    pub excluded: Vec<String>,
+}
+
+impl ChatFolder {
+    /// Whether the folder holds a conversation (the phone's rules; "only unread" is left to the window's own unread
+    /// marks, so the folder holds what it would hold read or not).
+    pub fn holds(&self, remote: &str, standing: Option<&Standing>, now_ms: u64) -> bool {
+        if self.excluded.iter().any(|r| r == remote) {
+            return false;
+        }
+        if self.included.iter().any(|r| r == remote) {
+            return true;
+        }
+        let by_kind = (self.all_people && remote.starts_with("p:")) || (self.all_groups && remote.starts_with("g:"));
+        by_kind && (self.muted_too || !standing.is_some_and(|s| s.muted(now_ms)))
+    }
+}
+
+/// A notification profile: while it is on, only these people (and, if it says so, mentions) are announced.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotificationProfile {
+    pub id: Uuid,
+    pub name: String,
+    pub emoji: Option<String>,
+    pub allow_mentions: bool,
+    pub allow_calls: bool,
+    /// Conversations (`p:<aci>`, `g:<hex>`) whose messages still notify.
+    pub allowed: Vec<String>,
+    pub scheduled: bool,
+    /// The schedule, as the phone writes it: 24-hour clock numbers (930 is 9:30), and days 1 (Monday) to 7.
+    pub start: u32,
+    pub end: u32,
+    pub days: Vec<i32>,
+}
+
+impl NotificationProfile {
+    /// Whether the schedule has it on at this local time: `day` 1 (Monday) to 7, `clock` as 24-hour hhmm. A schedule
+    /// that runs past midnight is on from its start to midnight on its day and from midnight to its end the day after.
+    pub fn scheduled_on(&self, day: i32, clock: u32) -> bool {
+        if !self.scheduled {
+            return false;
+        }
+        let day_on = |d: i32| self.days.iter().any(|x| *x == d || (*x == 0 && d == 1));
+        if self.start <= self.end {
+            day_on(day) && clock >= self.start && clock < self.end
+        } else {
+            let yesterday = if day == 1 { 7 } else { day - 1 };
+            (day_on(day) && clock >= self.start) || (day_on(yesterday) && clock < self.end)
+        }
+    }
+}
+
+impl Kept {
+    /// The profile on now, if one is: one turned on by hand (until its end), else one whose schedule has it on, unless
+    /// profiles were turned off by hand since the schedule began. `day` and `clock` are local (see `scheduled_on`).
+    pub fn active_profile(&self, now_ms: u64, day: i32, clock: u32) -> Option<&NotificationProfile> {
+        if let Some((id, until)) = self.profile_on {
+            if until == 0 || until > now_ms {
+                return self.notification_profiles.iter().find(|p| p.id == id);
+            }
+        }
+        // Turned off by hand within the last day: the schedule that was on then stays off for now.
+        if self.profiles_off_at > 0 && now_ms.saturating_sub(self.profiles_off_at) < 24 * 3600 * 1000 {
+            return None;
+        }
+        self.notification_profiles.iter().find(|p| p.scheduled_on(day, clock))
+    }
+}
+
+/// A recipient as the storage service names one, as moho names its conversation.
+fn recipient_remote(r: &presage::libsignal_service::proto::Recipient) -> Option<String> {
+    use presage::libsignal_service::proto::recipient::Identifier;
+    match r.identifier.as_ref()? {
+        Identifier::Contact(c) => {
+            let aci = if c.service_id_binary.len() == 16 { Uuid::from_slice(&c.service_id_binary).ok() } else { Uuid::parse_str(&c.service_id).ok() }?;
+            Some(format!("p:{aci}"))
+        }
+        Identifier::GroupMasterKey(key) => Some(format!("g:{}", ids::hex(key))),
+        _ => None,
+    }
 }
 
 /// One of the account's story audiences, as the phone keeps it.
@@ -243,7 +352,7 @@ fn account_settings(record: &AccountRecord) -> AccountSettings {
 impl Kept {
     /// What the records say, as of `version`. Records of kinds a client does not act on are passed over.
     pub fn from_records(version: u64, records: &[StorageRecord]) -> Self {
-        let mut kept = Kept { version, reads_story_lists: true, ..Default::default() };
+        let mut kept = Kept { version, reads_story_lists: true, reads_folders: true, ..Default::default() };
         for record in records {
             match &record.record {
                 Some(storage_record::Record::Contact(c)) => {
@@ -254,6 +363,37 @@ impl Kept {
                 Some(storage_record::Record::GroupV2(g)) if g.master_key.len() == 32 => {
                     kept.conversations.insert(format!("g:{}", ids::hex(&g.master_key)), group_standing(g));
                 }
+                Some(storage_record::Record::ChatFolder(f)) if f.deleted_at_timestamp_ms == 0 && f.folder_type == 2 => {
+                    if let Ok(id) = Uuid::from_slice(&f.identifier) {
+                        kept.chat_folders.push(ChatFolder {
+                            id,
+                            name: f.name.clone(),
+                            position: f.position,
+                            all_people: f.include_all_individual_chats,
+                            all_groups: f.include_all_group_chats,
+                            muted_too: f.show_muted_chats,
+                            only_unread: f.show_only_unread,
+                            included: f.included_recipients.iter().filter_map(recipient_remote).collect(),
+                            excluded: f.excluded_recipients.iter().filter_map(recipient_remote).collect(),
+                        });
+                    }
+                }
+                Some(storage_record::Record::NotificationProfile(p)) if p.deleted_at_timestamp_ms == 0 => {
+                    if let Ok(id) = Uuid::from_slice(&p.id) {
+                        kept.notification_profiles.push(NotificationProfile {
+                            id,
+                            name: p.name.clone(),
+                            emoji: p.emoji.clone().filter(|e| !e.is_empty()),
+                            allow_mentions: p.allow_all_mentions,
+                            allow_calls: p.allow_all_calls,
+                            allowed: p.allowed_members.iter().filter_map(recipient_remote).collect(),
+                            scheduled: p.schedule_enabled,
+                            start: p.schedule_start_time,
+                            end: p.schedule_end_time,
+                            days: p.schedule_days_enabled.clone(),
+                        });
+                    }
+                }
                 Some(storage_record::Record::StoryDistributionList(list)) => {
                     if let Some(list) = story_list(list) {
                         kept.story_lists.push(list);
@@ -263,11 +403,20 @@ impl Kept {
                     kept.pinned = a.pinned_conversations.iter().filter_map(pinned_remote).collect();
                     kept.own_username = text(&a.username);
                     kept.account = Some(account_settings(a));
+                    {
+                        use presage::libsignal_service::proto::account_record::notification_profile_manual_override::Override;
+                        match a.notification_profile_manual_override.as_ref().and_then(|o| o.r#override.as_ref()) {
+                            Some(Override::Enabled(on)) => kept.profile_on = Uuid::from_slice(&on.id).ok().map(|id| (id, on.end_at_timestamp_ms)),
+                            Some(Override::DisabledAtTimestampMs(at)) => kept.profiles_off_at = *at,
+                            None => {}
+                        }
+                    }
                     kept.note_to_self = Standing { archived: a.note_to_self_archived, marked_unread: a.note_to_self_marked_unread, ..Default::default() };
                 }
                 _ => {}
             }
         }
+        kept.chat_folders.sort_by_key(|f| f.position);
         kept
     }
 
@@ -408,7 +557,7 @@ pub async fn fetch(manager: &presage::Manager<SignalStore, presage::manager::Reg
     let wanted: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
-        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account | Type::StoryDistributionList))
+        .filter(|id| matches!(id.r#type(), Type::Contact | Type::Groupv2 | Type::Account | Type::StoryDistributionList | Type::ChatFolder | Type::NotificationProfile))
         .map(|id| id.raw.clone())
         .collect();
     let mut records = Vec::with_capacity(wanted.len());
@@ -425,7 +574,7 @@ pub async fn refresh(state: &crate::state::AppState, handle: &super::Handle, man
     let store = manager.store().clone();
     let before = current(account_id, &store);
     // A copy read before story lists were read is read again in full.
-    let known = if before.reads_story_lists { before.version } else { 0 };
+    let known = if before.reads_story_lists && before.reads_folders { before.version } else { 0 };
     let fetched = tokio::time::timeout(std::time::Duration::from_secs(30), fetch(manager, known)).await;
     let kept = match fetched {
         Ok(Ok(Some(kept))) => keep(account_id, &store, kept),
@@ -460,7 +609,58 @@ fn marked_unread_now(before: &Kept, now: &Kept, remote: &str) -> Option<bool> {
 }
 
 /// Acts on what was read.
+/// The local day (1 Monday to 7) and the 24-hour clock as hhmm, as a notification profile's schedule reads them.
+fn local_now() -> (i32, u32) {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    (now.weekday().number_from_monday() as i32, now.hour() * 100 + now.minute())
+}
+
+/// Puts the account's notification profile into effect: while one is on, only the people it allows (and mentions, if
+/// it says so) are announced here, as on the phone. Said to the window when what is on changes.
+pub fn apply_profile(state: &crate::state::AppState, account_id: &str, kept: &Kept) {
+    let (day, clock) = local_now();
+    let now = super::commands::now_ms();
+    let active = kept.active_profile(now, day, clock);
+    state.runtime.set_quiet(account_id, active.map(|p| crate::runtime::Quiet { allowed: p.allowed.clone(), mentions: p.allow_mentions }));
+    let said = active.map(|p| p.id);
+    let mut last = profile_said().lock().unwrap_or_else(|e| e.into_inner());
+    if last.get(account_id) != Some(&said) {
+        last.insert(account_id.to_string(), said);
+        state.events.emit("signalProfile", serde_json::json!({ "accountId": account_id, "profile": active.map(|p| serde_json::json!({ "id": p.id.to_string(), "name": p.name, "emoji": p.emoji })) }));
+    }
+}
+
+fn profile_said() -> &'static Mutex<HashMap<String, Option<Uuid>>> {
+    static SAID: OnceLock<Mutex<HashMap<String, Option<Uuid>>>> = OnceLock::new();
+    SAID.get_or_init(Default::default)
+}
+
+/// The account's chat folders as the window draws them (the shape Telegram's folders have): each with the
+/// conversations it holds, by remote id. Numbered from 2 in the phone's order.
+pub fn folders_for_window(state: &crate::state::AppState, account_id: &str, kept: &Kept) -> serde_json::Value {
+    let now = super::commands::now_ms();
+    let remotes: Vec<String> = state.runtime.list_buffers().into_iter().filter(|b| b.account_id == account_id).filter_map(|b| b.remote_id).filter(|r| r.starts_with("p:") || r.starts_with("g:")).collect();
+    serde_json::Value::Array(
+        kept.chat_folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let members: Vec<&String> = remotes.iter().filter(|r| f.holds(r, kept.standing(r), now)).collect();
+                serde_json::json!({ "id": i as i64 + 2, "name": f.name, "emoticon": null, "members": members, "shared": false, "signal": true })
+            })
+            .collect(),
+    )
+}
+
+/// Tells the window the account's folders (after the storage service was read, or conversations came and went).
+pub fn say_folders(state: &crate::state::AppState, account_id: &str, kept: &Kept) {
+    state.events.emit("signalFolders", serde_json::json!({ "accountId": account_id, "folders": folders_for_window(state, account_id, kept) }));
+}
+
 async fn arrived(ctx: &super::people::Ctx<'_>, handle: &super::Handle, kept: &Kept, before: &Kept) {
+    apply_profile(ctx.state, ctx.account_id, kept);
+    say_folders(ctx.state, ctx.account_id, kept);
     // The account's settings, where the phone keeps them for every device: more current than a configuration sync.
     if let Some(account) = kept.account {
         let synced = super::memory::Synced {
@@ -575,6 +775,25 @@ mod tests {
         let own = Uuid::from_u128(1);
         assert_eq!(kept.story_lists[0].audience(&kept, &own), vec![Uuid::parse_str(A).unwrap()], "everybody but B");
         assert_eq!(kept.story_lists[1].audience(&kept, &own), vec![Uuid::parse_str(A).unwrap()]);
+    }
+
+    #[test]
+    fn a_folder_holds_by_rule_and_by_name_and_a_profile_runs_on_its_schedule() {
+        let folder = ChatFolder { all_groups: true, included: vec!["p:1".into()], excluded: vec!["g:aa".into()], ..Default::default() };
+        let muted = Standing { muted_until: u64::MAX, ..Default::default() };
+        assert!(folder.holds("p:1", None, 0));
+        assert!(!folder.holds("p:2", None, 0), "people are not in it by rule");
+        assert!(folder.holds("g:bb", None, 0));
+        assert!(!folder.holds("g:aa", None, 0), "named out");
+        assert!(!folder.holds("g:bb", Some(&muted), 0), "muted chats only when it says so");
+        let work = NotificationProfile { scheduled: true, start: 900, end: 1700, days: vec![1, 2, 3, 4, 5], ..Default::default() };
+        assert!(work.scheduled_on(1, 930) && !work.scheduled_on(6, 930) && !work.scheduled_on(1, 1700));
+        let night = NotificationProfile { scheduled: true, start: 2200, end: 700, days: vec![5], ..Default::default() };
+        assert!(night.scheduled_on(5, 2300) && night.scheduled_on(6, 600) && !night.scheduled_on(6, 2300));
+        let mut kept = Kept { notification_profiles: vec![work.clone()], ..Default::default() };
+        assert!(kept.active_profile(10, 1, 1000).is_some());
+        kept.profiles_off_at = 5;
+        assert!(kept.active_profile(10, 1, 1000).is_none(), "turned off by hand");
     }
 
     #[test]

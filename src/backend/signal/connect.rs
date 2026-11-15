@@ -233,6 +233,8 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
             }
             _ = sweeping.tick() => {
                 super::expiry::sweep(state, manager.store()).await;
+                // A notification profile's schedule turns on and off with the clock.
+                super::storage::apply_profile(state, account_id, &super::storage::current(account_id, manager.store()));
             }
             command = incoming.recv() => {
                 match command {

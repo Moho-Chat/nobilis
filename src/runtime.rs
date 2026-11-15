@@ -370,6 +370,13 @@ struct ReactionEvent {
     sender: String,
 }
 
+/// Notifications held for an account: only these conversations (by remote id), and mentions if `mentions`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Quiet {
+    pub allowed: Vec<String>,
+    pub mentions: bool,
+}
+
 /// Live, in-memory state that sits alongside the persisted AccountStore:
 /// connection state per account, active IRC senders, and the buffer
 /// registry. Mirrors what libpurple itself tracked at runtime
@@ -695,6 +702,9 @@ pub struct Runtime {
     /// account id -> "online" | "idle". Absent means online, which is what
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
+    /// Accounts whose service has notifications held (a Signal notification profile that is on): only these
+    /// conversations (by remote id) are announced, and mentions when it says so.
+    quiet: Mutex<HashMap<String, Quiet>>,
     /// What each account says beside its status, where the service has a place for it.
     account_status_text: Mutex<HashMap<String, String>>,
     /// Whether the person has stepped away from the machine, as the window last
@@ -1199,6 +1209,7 @@ impl Runtime {
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
+            quiet: Mutex::new(HashMap::new()),
             account_status_text: Mutex::new(HashMap::new()),
             user_idle: std::sync::atomic::AtomicBool::new(false),
             discord_member_list_targets: Mutex::new(HashMap::new()),
@@ -3069,6 +3080,27 @@ impl Runtime {
             all.remove(account_id);
         } else {
             all.insert(account_id.to_string(), text.to_string());
+        }
+    }
+
+    /// Holds an account's notifications to these conversations (and mentions, if `mentions`), or lets them go (`None`).
+    pub fn set_quiet(&self, account_id: &str, quiet: Option<Quiet>) {
+        let mut all = self.quiet.lock().unwrap();
+        match quiet {
+            Some(q) => {
+                all.insert(account_id.to_string(), q);
+            }
+            None => {
+                all.remove(account_id);
+            }
+        }
+    }
+
+    /// Whether a held account still announces this message.
+    fn quiet_allows(&self, account_id: &str, remote: Option<&str>, is_highlight: bool) -> bool {
+        match self.quiet.lock().unwrap().get(account_id) {
+            None => true,
+            Some(q) => (is_highlight && q.mentions) || remote.is_some_and(|r| q.allowed.iter().any(|a| a == r)),
         }
     }
 
@@ -5004,6 +5036,7 @@ impl Runtime {
         if spoken && from != own_nick && !self.is_replaying(&buffer.id)
             && self.notify_level(state, &buffer.id).announces(is_dm, is_highlight)
             && !focused
+            && self.quiet_allows(account_id, buffer.remote_id.as_deref(), is_highlight)
         {
             state.events.emit(
                 "notification",
@@ -5926,7 +5959,7 @@ impl Runtime {
         }
 
         sweep!(
-            conn_states, connected_at, irc_handles, buffers,
+            conn_states, connected_at, irc_handles, buffers, quiet,
             buffer_groups, task_handles, last_connect_attempt,
             restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,
