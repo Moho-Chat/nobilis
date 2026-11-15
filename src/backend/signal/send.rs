@@ -1249,6 +1249,7 @@ pub async fn stickers(state: &AppState, buffer: &Buffer) -> Result<serde_json::V
                 "id": format!("{}:{}", ids::hex(&pack.id), sticker.id),
                 "name": if emoji.is_empty() { "sticker".to_string() } else { emoji.clone() },
                 "pack": pack.manifest.title,
+                "packId": ids::hex(&pack.id),
                 "body": emoji,
                 "url": format!("file://{}", path.display()),
             }));

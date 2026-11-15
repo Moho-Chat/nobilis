@@ -602,6 +602,10 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                 }
                 let _ = done.send(result);
             }
+            Command::StickerPack { id, key, install, done } => {
+                let result = if install { manager.install_sticker_pack(&id, &key).await } else { manager.remove_sticker_pack(&id, &key).await };
+                let _ = done.send(result.map_err(|e| format!("Signal did not {} the pack: {}", if install { "add" } else { "remove" }, explain(&e))));
+            }
             Command::ImportHistory => {
                 let Some(key) = handle.store.blob(super::history::KEY_BLOB).ok().flatten().and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok()) else { return };
                 // Taken now, whatever comes of it: a history the phone did not send is not waited for on every connect.

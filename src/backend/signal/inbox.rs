@@ -766,6 +766,10 @@ pub(super) async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, a
     if let (true, Some(pointer)) = (recorded, &held) {
         super::viewonce::hold(ctx, &buffer.id, &id, pointer);
     }
+    // Somebody else's sticker from a pack the account does not have: offered.
+    if let (true, false, Some(sticker)) = (recorded, own, &dm.sticker) {
+        super::sticker_packs::offer(ctx, &buffer.id, &id, sticker).await;
+    }
     if recorded {
         if let (Some(pointer), Some(handle)) = (long_text, ctx.state.runtime.signal_handle(ctx.account_id)) {
             // The whole text, fetched now rather than on look: it is the message, not an attachment to it.

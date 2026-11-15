@@ -35,6 +35,7 @@ pub mod send;
 pub mod storage;
 pub mod storage_write;
 pub mod store;
+pub mod sticker_packs;
 pub mod stories;
 pub mod unlink;
 pub mod viewonce;
@@ -157,6 +158,8 @@ pub enum Command {
     SharedChange { target: storage_write::Target, change: storage_write::Change, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Make a new story list; the answer is its id.
     CreateStoryList { name: String, people: Vec<uuid::Uuid>, done: tokio::sync::oneshot::Sender<Result<uuid::Uuid, String>> },
+    /// Install (or remove) a sticker pack, on every device of the account.
+    StickerPack { id: Vec<u8>, key: Vec<u8>, install: bool, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Bring over the message history the phone transfers to a fresh link (once; see `history`).
     ImportHistory,
     /// Share a contact card.

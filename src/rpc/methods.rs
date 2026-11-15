@@ -6067,6 +6067,22 @@ pub async fn dispatch(
             }
         }
         // What an edited message said before, oldest first, with when each was replaced. Any service.
+        "signalStickerPackFromMessage" => match backend::signal::sticker_packs::install_from_message(state, p_str(params, "bufferId", ""), p_str(params, "messageId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalStickerPacks" => match backend::signal::sticker_packs::list(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalStickerPackLink" => match backend::signal::sticker_packs::from_link(state, p_str(params, "accountId", ""), p_str(params, "link", ""), true).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalRemoveStickerPack" => match backend::signal::sticker_packs::remove(state, p_str(params, "accountId", ""), p_str(params, "packId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
         "getEditHistory" => match state.store.edit_history(p_str(params, "bufferId", ""), p_str(params, "messageId", "")) {
             Ok(rows) => (Some(serde_json::json!(rows.into_iter().map(|(body, ts)| serde_json::json!({ "body": body, "replacedAt": ts })).collect::<Vec<_>>())), None),
             Err(e) => (None, Some(format!("{e:#}"))),
