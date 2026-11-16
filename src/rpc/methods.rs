@@ -1329,7 +1329,7 @@ pub async fn dispatch(
                 return (None, Some("setNotifyLevel requires a known \"bufferId\"".to_string()));
             };
             let Some(level) = p_str_opt(params, "level").and_then(crate::notify::NotifyLevel::parse) else {
-                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions or mute".to_string()));
+                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions, direct or mute".to_string()));
             };
             match crate::notify::set_level(state, &buffer, level).await {
                 Ok(()) => (Some(ok_node()), None),
@@ -3188,6 +3188,32 @@ pub async fn dispatch(
             };
             backend::irc::dcc::cancel(state, id, "declined");
             (Some(Value::Bool(true)), None)
+        }
+
+        // Clearing the history of what came and went: the ones named, or a kind
+        // of them (failed, finished, missing, all), optionally only those older
+        // than so many days. Never the files, and never one still moving.
+        "forgetTransfers" => {
+            let ids: Vec<String> = params
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let which = match p_str_opt(params, "which") {
+                Some(w) => match backend::irc::dcc::Forget::parse(w) {
+                    Some(which) => which,
+                    None => return (None, Some(format!("forgetTransfers does not know \"{w}\": failed, finished, missing or all"))),
+                },
+                None if !ids.is_empty() => backend::irc::dcc::Forget::Named,
+                None => return (None, Some("forgetTransfers requires \"ids\" or \"which\"".to_string())),
+            };
+            let older_than = params
+                .get("olderThanDays")
+                .and_then(Value::as_i64)
+                .filter(|days| *days > 0)
+                .map(|days| backend::irc::dcc::now_seconds() - days * 86_400);
+            let gone = backend::irc::dcc::forget(state, which, &ids, older_than);
+            (Some(serde_json::json!({ "removed": gone.len(), "ids": gone })), None)
         }
 
         // The resolved directory goes out alongside the setting, so a window

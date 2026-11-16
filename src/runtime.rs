@@ -2530,6 +2530,26 @@ impl Runtime {
         Some(t.clone())
     }
 
+    /// Takes settled transfers out of the list, and says which went.
+    ///
+    /// Only what has finished, failed or been turned down: one that is still
+    /// offered or moving is a socket and a decision, not a line of history,
+    /// and is cancelled first if it is to go.
+    pub fn forget_dcc(&self, mut goes: impl FnMut(&DccTransfer) -> bool) -> Vec<String> {
+        let mut list = self.dcc_transfers.lock().unwrap();
+        let mut gone = Vec::new();
+        list.retain(|t| {
+            let settled = matches!(t.state, DccState::Done | DccState::Failed | DccState::Declined);
+            if settled && goes(t) {
+                gone.push(t.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        gone
+    }
+
     /// Stops everything belonging to an account that is going away.
     ///
     /// A transfer outliving the connection that carried its offer would be a
@@ -3827,7 +3847,25 @@ impl Runtime {
     /// as a bug - and one that learned only the second could not say why.
     pub fn set_notify_level(&self, state: &AppState, buffer_id: &str, shown: crate::notify::NotifyLevel, applies: crate::notify::NotifyLevel) {
         self.notify_held.lock().unwrap().insert(buffer_id.to_string(), (shown, applies));
-        self.show_notify_level(state, buffer_id, shown, applies);
+        // Kept as the service said it; shown, and applied, as it means here
+        // (see `NotifyLevel::Direct`).
+        let levels = &state.notify_levels;
+        self.show_notify_level(state, buffer_id, levels.overlaid(buffer_id, shown), levels.overlaid(buffer_id, applies));
+    }
+
+    /// Shows a conversation's level again from what is already known, for
+    /// when what it means here changed and the service had nothing new to say.
+    pub fn reshow_notify_level(&self, state: &AppState, buffer_id: &str) {
+        let held = self.notify_held.lock().unwrap().get(buffer_id).copied();
+        if let Some((shown, applies)) = held {
+            let levels = &state.notify_levels;
+            self.show_notify_level(state, buffer_id, levels.overlaid(buffer_id, shown), levels.overlaid(buffer_id, applies));
+        }
+    }
+
+    /// Whether what is aimed at everybody is left out of this conversation's mentions.
+    pub fn direct_only(&self, state: &AppState, buffer_id: &str) -> bool {
+        self.notify_level(state, buffer_id) == crate::notify::NotifyLevel::Direct
     }
 
     /// Lets go of a level the account's service held on a conversation (a mute set on Signal's phone that was lifted
@@ -3871,7 +3909,7 @@ impl Runtime {
     /// account's answer where it keeps one, and this daemon's own otherwise.
     pub fn notify_level(&self, state: &AppState, buffer_id: &str) -> crate::notify::NotifyLevel {
         match self.notify_held.lock().unwrap().get(buffer_id) {
-            Some((_, applies)) => *applies,
+            Some((_, applies)) => state.notify_levels.overlaid(buffer_id, *applies),
             None => state.notify_levels.get(buffer_id),
         }
     }
@@ -4917,7 +4955,14 @@ impl Runtime {
             // addressed. Only where the service acts on the word: "@everyone"
             // on IRC is somebody typing a phrase, and highlighting it would be
             // this client inventing a mention the network does not have.
-            || (spoken && from != own_nick && mentions_the_room(model::service_of(account_id), body))
+            //
+            // And not where somebody set the conversation to direct mentions
+            // only: there, a word aimed at everybody is not a mention at all,
+            // so it does not light the row, count, or announce itself.
+            || (spoken
+                && from != own_nick
+                && mentions_the_room(model::service_of(account_id), body)
+                && !self.direct_only(state, &buffer.id))
             // And the words somebody asked to be told about, which is the
             // same question asked about a different list - your name is
             // simply the one word everybody has.
@@ -5373,6 +5418,75 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct mentions only: what is aimed at everybody is not a mention of
+    /// you, and what is aimed at you still is.
+    ///
+    /// On Sneedchat, which keeps no level of its own (so the daemon's is the
+    /// whole of it), and on Discord, where the account keeps "mentions only"
+    /// and that the room-wide ones are left out is this daemon's.
+    #[tokio::test]
+    async fn direct_mentions_only_leaves_out_what_is_aimed_at_everybody() {
+        use crate::notify::NotifyLevel;
+        let state = crate::backend::kick::testkit::simulated_daemon("direct-mentions");
+        let flagged = |account: &str, room: &str| -> Vec<(String, bool)> {
+            state
+                .store
+                .get_backlog(&crate::model::buffer_id(account, room), 0, 20)
+                .expect("backlog")
+                .iter()
+                .map(|m| (m.body.clone(), m.is_highlight))
+                .collect()
+        };
+        let say = |account: &str, room: &str, body: &str, forced: bool| {
+            state.runtime.record_message(
+                &state, account, room, "channel", "stranger", body, false, "chat",
+                None, None, forced, None, Vec::new(), Vec::new(), None,
+            );
+        };
+
+        // Kept by the daemon.
+        let sneed = "sneedchat:tester";
+        state.runtime.set_own_identity(sneed, "Salastil");
+        say(sneed, "#room", "@everyone look at this", false);
+        let buffer = state.runtime.get_buffer(&crate::model::buffer_id(sneed, "#room")).expect("the room");
+        crate::notify::set_level(&state, &buffer, NotifyLevel::Direct).await.expect("kept here");
+        assert_eq!(state.runtime.notify_level(&state, &buffer.id), NotifyLevel::Direct);
+        say(sneed, "#room", "@everyone and again", false);
+        say(sneed, "#room", "@everyone but Salastil in particular", false);
+        assert_eq!(
+            flagged(sneed, "#room"),
+            vec![
+                ("@everyone look at this".to_string(), true),
+                ("@everyone and again".to_string(), false),
+                ("@everyone but Salastil in particular".to_string(), true),
+            ]
+        );
+
+        // Kept by the account: Discord says "mentions only", and here that reads as direct once it was asked for.
+        let discord = "discord:1";
+        say(discord, "Guild/#general", "@here raid in five", false);
+        let id = crate::model::buffer_id(discord, "Guild/#general");
+        state.runtime.set_notify_level(&state, &id, NotifyLevel::Mentions, NotifyLevel::Mentions);
+        assert_eq!(state.runtime.notify_level(&state, &id), NotifyLevel::Mentions);
+        state.notify_levels.set_direct(&id, true);
+        state.runtime.reshow_notify_level(&state, &id);
+        assert_eq!(state.runtime.get_buffer(&id).expect("the channel").notify, NotifyLevel::Direct);
+        say(discord, "Guild/#general", "@here raid in two", false);
+        // Discord's own word that this account was named, which is not a word in the body.
+        say(discord, "Guild/#general", "@everyone and <@1> especially", true);
+        assert_eq!(
+            flagged(discord, "Guild/#general"),
+            vec![
+                ("@here raid in five".to_string(), true),
+                ("@here raid in two".to_string(), false),
+                ("@everyone and <@1> especially".to_string(), true),
+            ]
+        );
+        // Set to everything from a phone: the account's word, not quietly something else here.
+        state.runtime.set_notify_level(&state, &id, NotifyLevel::All, NotifyLevel::All);
+        assert_eq!(state.runtime.notify_level(&state, &id), NotifyLevel::All);
     }
 
     /// Two accounts can be in the same room, and each has its own buffer for

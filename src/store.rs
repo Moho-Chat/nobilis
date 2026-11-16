@@ -1270,6 +1270,20 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
+    /// Takes transfers out of the record, by id. What they wrote to disk is not touched: this is the list, not the files.
+    pub fn forget_transfers(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut drop = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
+            for id in ids {
+                drop.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drops the oldest transfers beyond `keep`.
     /// Replaces the saved layout - every buffer and rail entry - in one go.
     pub fn save_layout(&self, buffers: &[crate::model::Buffer], groups: &[crate::model::BufferGroup]) -> Result<()> {

@@ -1775,7 +1775,69 @@ pub fn transfer_json(t: &crate::runtime::DccTransfer) -> serde_json::Value {
         "kind": t.kind.as_str(),
         "path": t.path,
         "error": t.error,
+        "startedAt": t.started_at,
     })
+}
+
+/// Which settled transfers a clearing of the history takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forget {
+    /// The ones named, and nothing else.
+    Named,
+    /// What failed or was turned down: the rows that are only noise once read.
+    Failed,
+    /// What arrived, or was sent.
+    Finished,
+    /// What arrived and is no longer where it was put - moved, renamed or deleted since.
+    Missing,
+    /// Everything that is over.
+    All,
+}
+
+impl Forget {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "failed" => Some(Self::Failed),
+            "finished" => Some(Self::Finished),
+            "missing" => Some(Self::Missing),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Whether one settled transfer is among those being cleared.
+///
+/// `older_than` narrows any of them to what started before that moment, so "failed, and more than a week old" is one
+/// request. `exists` is asked only for `Missing`, and only of a transfer that says where it landed.
+pub fn forgets(which: Forget, ids: &[String], older_than: Option<i64>, t: &crate::runtime::DccTransfer, exists: impl Fn(&str) -> bool) -> bool {
+    use crate::runtime::DccState;
+    if older_than.is_some_and(|before| t.started_at >= before) {
+        return false;
+    }
+    match which {
+        Forget::Named => ids.contains(&t.id),
+        Forget::Failed => matches!(t.state, DccState::Failed | DccState::Declined),
+        Forget::Finished => t.state == DccState::Done,
+        Forget::Missing => t.state == DccState::Done && !t.outgoing && t.path.as_deref().is_some_and(|p| !exists(p)),
+        Forget::All => true,
+    }
+}
+
+/// Clears transfers from the history, in memory and on disk, and tells every window which went.
+///
+/// The files themselves are left exactly where they are: this forgets that a transfer happened, and deletes nothing
+/// anybody downloaded.
+pub fn forget(state: &AppState, which: Forget, ids: &[String], older_than: Option<i64>) -> Vec<String> {
+    let gone = state.runtime.forget_dcc(|t| forgets(which, ids, older_than, t, |p| std::path::Path::new(p).exists()));
+    if gone.is_empty() {
+        return gone;
+    }
+    if let Err(e) = state.store.forget_transfers(&gone) {
+        tracing::warn!("dcc: forgetting transfers: {e}");
+    }
+    state.events.emit("transfersForgotten", serde_json::json!({ "ids": gone }));
+    gone
 }
 
 /// A line in the conversation the offer arrived in.
@@ -2435,5 +2497,74 @@ mod auto_resume_tests {
         }
         assert_eq!(asked, MAX_AUTO_RESUMES, "the cap is what ended it");
         stop_chasing(&part);
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::{forgets, Forget};
+    use crate::runtime::{DccState, DccTransfer, TransferKind};
+
+    fn row(id: &str, state: DccState, started_at: i64, path: Option<&str>) -> DccTransfer {
+        DccTransfer {
+            id: id.to_string(),
+            account_id: "irc:a".to_string(),
+            outgoing: false,
+            from: "bot".to_string(),
+            file_name: "f.mkv".to_string(),
+            raw_name: "f.mkv".to_string(),
+            size: 10,
+            received: 10,
+            rate: 0,
+            state,
+            path: path.map(str::to_string),
+            error: None,
+            kind: TransferKind::from_str("dcc"),
+            cancel: Default::default(),
+            paused: Default::default(),
+            offer: None,
+            started_at,
+        }
+    }
+
+    #[test]
+    fn each_kind_of_clearing_takes_only_its_own() {
+        let done = row("d", DccState::Done, 100, Some("/here"));
+        let gone = row("g", DccState::Done, 100, Some("/moved"));
+        let failed = row("f", DccState::Failed, 100, None);
+        let declined = row("x", DccState::Declined, 100, None);
+        let exists = |p: &str| p == "/here";
+        let takes = |which, t: &DccTransfer| forgets(which, &[], None, t, exists);
+
+        assert!(takes(Forget::Failed, &failed) && takes(Forget::Failed, &declined));
+        assert!(!takes(Forget::Failed, &done));
+        assert!(takes(Forget::Finished, &done) && !takes(Forget::Finished, &failed));
+        assert!(takes(Forget::Missing, &gone), "a file no longer where it landed");
+        assert!(!takes(Forget::Missing, &done), "one that is still there stays");
+        assert!(!takes(Forget::Missing, &failed), "and one that never landed is not missing");
+        assert!([&done, &gone, &failed, &declined].iter().all(|t| takes(Forget::All, t)));
+    }
+
+    #[test]
+    fn named_takes_the_ones_named_and_age_narrows_any_of_them() {
+        let old = row("old", DccState::Failed, 100, None);
+        let new = row("new", DccState::Failed, 900, None);
+        let ids = vec!["new".to_string()];
+        assert!(forgets(Forget::Named, &ids, None, &new, |_| true));
+        assert!(!forgets(Forget::Named, &ids, None, &old, |_| true));
+        // Older than the moment 500: the old one goes, the new one stays.
+        assert!(forgets(Forget::Failed, &[], Some(500), &old, |_| true));
+        assert!(!forgets(Forget::Failed, &[], Some(500), &new, |_| true));
+    }
+
+    #[test]
+    fn the_list_only_ever_gives_up_what_is_over() {
+        let rt = crate::runtime::Runtime::new();
+        rt.push_dcc_transfer(row("moving", DccState::Receiving, 3, None));
+        rt.push_dcc_transfer(row("offered", DccState::Offered, 2, None));
+        rt.push_dcc_transfer(row("done", DccState::Done, 1, Some("/p")));
+        let gone = rt.forget_dcc(|_| true);
+        assert_eq!(gone, vec!["done".to_string()]);
+        assert_eq!(rt.dcc_transfers().len(), 2);
     }
 }

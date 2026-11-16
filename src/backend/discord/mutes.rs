@@ -95,7 +95,7 @@ fn override_body(channel_id: &str, level: NotifyLevel) -> Value {
     let mut over = json!({ "muted": level == NotifyLevel::Mute, "mute_config": null });
     let number = match level {
         NotifyLevel::All => Some(0),
-        NotifyLevel::Mentions => Some(1),
+        NotifyLevel::Mentions | NotifyLevel::Direct => Some(1),
         NotifyLevel::Default => Some(3),
         NotifyLevel::Mute => None,
     };

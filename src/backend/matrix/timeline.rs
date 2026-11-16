@@ -258,12 +258,12 @@ pub(super) async fn handle_timeline_event(
     // client guesses. Matrix used to leave every client to scan every message
     // for its own name, which is why the same mention could be seen by one
     // client and missed by another.
-    let mentioned = content["m.mentions"]["user_ids"]
+    let mentioned_by_name = content["m.mentions"]["user_ids"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|id| id.as_str() == Some(own_user_id))
-        || content["m.mentions"]["room"].as_bool() == Some(true);
+        .any(|id| id.as_str() == Some(own_user_id));
+    let mentioned_with_the_room = content["m.mentions"]["room"].as_bool() == Some(true);
 
     // What this account told its server it wants to hear about. A keyword set
     // on another client notifies here; a room muted there stays quiet here,
@@ -278,6 +278,10 @@ pub(super) async fn handle_timeline_event(
         None => (crate::notify::NotifyLevel::Default, false, false),
     };
     state.runtime.set_notify_level(state, buffer_id, level, level);
+    // The whole room being addressed is a mention of everybody in it, unless
+    // this room was set to direct mentions only - asked once the level is
+    // known, which is the line above.
+    let mentioned = mentioned_by_name || (mentioned_with_the_room && !state.runtime.direct_only(state, buffer_id));
     // A notice does not announce itself while the account's own override
     // rule says so - which is the state every homeserver ships. Without
     // this, a bridge relaying a room full of somebody's name would light up

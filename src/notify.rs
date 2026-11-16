@@ -1,7 +1,8 @@
 //! How much a conversation is allowed to interrupt somebody.
 //!
-//! One answer per conversation, the same four everywhere: what the service
-//! would do unasked, every message, only what is aimed at you, or nothing.
+//! One answer per conversation, the same few everywhere: what the service
+//! would do unasked, every message, only what is aimed at you - with or
+//! without what is aimed at everybody - or nothing.
 //! Element offers exactly these for a room, and Discord, Stoat and Steam have
 //! the same four under other names - so a frontend asks one question and the
 //! services differ only in where the answer is kept.
@@ -21,7 +22,7 @@
 //! was never sent.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -39,6 +40,18 @@ pub enum NotifyLevel {
     /// Only what mentions you, or matches a word you asked to hear about -
     /// in a direct message as well as in a channel.
     Mentions,
+    /// Only what is aimed at you in particular: your name, a reply to you, a
+    /// word you asked to hear about. What is aimed at the whole place -
+    /// `@everyone`, `@here`, `@room`, `@all` - is not a mention here, so it
+    /// neither announces itself nor counts as one. For a channel where those
+    /// are used to get attention nobody asked to give, and where somebody may
+    /// still have something to say to you.
+    ///
+    /// No service keeps this. It is this daemon's own refinement of
+    /// `Mentions`: a service that holds the level on the account is asked for
+    /// its mentions-only, and that the room-wide ones are left out is
+    /// remembered here (`NotifyStore::set_direct`).
+    Direct,
     /// Nothing announces itself. What is waiting still counts.
     Mute,
 }
@@ -49,6 +62,7 @@ impl NotifyLevel {
             "default" => Some(Self::Default),
             "all" => Some(Self::All),
             "mentions" => Some(Self::Mentions),
+            "direct" => Some(Self::Direct),
             "mute" => Some(Self::Mute),
             _ => None,
         }
@@ -59,6 +73,7 @@ impl NotifyLevel {
             Self::Default => "default",
             Self::All => "all",
             Self::Mentions => "mentions",
+            Self::Direct => "direct",
             Self::Mute => "mute",
         }
     }
@@ -78,7 +93,9 @@ impl NotifyLevel {
         match self {
             Self::Mute => false,
             Self::All => true,
-            Self::Mentions => is_highlight,
+            // The same question for both: what was left out of `Direct` was
+            // left out when the highlight was decided, before this is asked.
+            Self::Mentions | Self::Direct => is_highlight,
             Self::Default => is_dm || is_highlight,
         }
     }
@@ -106,16 +123,37 @@ pub fn held_on_account(account_id: &str) -> bool {
 /// menu that offered it would be promising a setting that would quietly be
 /// something else.
 pub async fn set_level(state: &crate::state::AppState, buffer: &crate::model::Buffer, level: NotifyLevel) -> Result<(), String> {
+    // No service has a "direct mentions only" to be asked for. Where the
+    // service keeps the level, it is asked for the nearest it has - mentions
+    // only - and that the room-wide ones are left out is kept here.
+    let direct = level == NotifyLevel::Direct;
+    let keeps_it = held_on_account(&buffer.account_id) || (buffer.account_id.starts_with("xmpp:") && buffer.kind == "channel");
+    if !keeps_it {
+        state.runtime.set_local_notify(state, &buffer.id, level);
+        return Ok(());
+    }
+    let was = state.notify_levels.is_direct(&buffer.id);
+    state.notify_levels.set_direct(&buffer.id, direct);
+    let asked = if direct { NotifyLevel::Mentions } else { level };
+    let result = set_service_level(state, buffer, asked).await;
+    if result.is_err() {
+        // The service would not take it, so nothing here says it did.
+        state.notify_levels.set_direct(&buffer.id, was);
+    }
+    // Shown again whatever the service said: it says nothing when it was
+    // already at mentions only, and the conversation still changed.
+    state.runtime.reshow_notify_level(state, &buffer.id);
+    result
+}
+
+/// Asks the service that keeps a conversation's level to set it.
+async fn set_service_level(state: &crate::state::AppState, buffer: &crate::model::Buffer, level: NotifyLevel) -> Result<(), String> {
     use crate::backend;
     let account = buffer.account_id.as_str();
     // An XMPP room keeps it in its bookmark, for every client of the account (XEP-0492); a conversation with a person has no
     // such place and keeps it here.
     if account.starts_with("xmpp:") && buffer.kind == "channel" {
         return backend::xmpp::bookmarks::set_notify(state, buffer, level).await;
-    }
-    if !held_on_account(account) {
-        state.runtime.set_local_notify(state, &buffer.id, level);
-        return Ok(());
     }
     let plain = |e: anyhow::Error| format!("{e:#}");
     if account.starts_with("matrix:") {
@@ -160,6 +198,10 @@ struct NotifyPrefs {
     /// leaves something in the file.
     #[serde(default)]
     levels: BTreeMap<String, NotifyLevel>,
+    /// Conversations whose service keeps "mentions only" for them, and where
+    /// this daemon leaves the room-wide mentions out of it (`NotifyLevel::Direct`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    direct: BTreeSet<String>,
 }
 
 /// The levels of conversations whose service has nowhere to keep one.
@@ -197,10 +239,43 @@ impl NotifyStore {
         changed
     }
 
+    /// Whether a conversation's mentions-only leaves out what is aimed at everybody.
+    pub fn is_direct(&self, buffer_id: &str) -> bool {
+        self.inner.lock().unwrap().direct.contains(buffer_id)
+    }
+
+    /// Marks, or stops marking, a conversation whose service holds its level as direct mentions only.
+    pub fn set_direct(&self, buffer_id: &str, direct: bool) {
+        if self.is_direct(buffer_id) == direct {
+            return;
+        }
+        self.update(|prefs| {
+            if direct {
+                prefs.direct.insert(buffer_id.to_string());
+            } else {
+                prefs.direct.remove(buffer_id);
+            }
+        });
+    }
+
+    /// What a level the service reported means here: its mentions-only is
+    /// direct mentions only where that was asked for, and anything else it
+    /// says is what it says.
+    pub fn overlaid(&self, buffer_id: &str, level: NotifyLevel) -> NotifyLevel {
+        if level == NotifyLevel::Mentions && self.is_direct(buffer_id) {
+            NotifyLevel::Direct
+        } else {
+            level
+        }
+    }
+
     /// Drops everything kept for an account, for one being removed.
     pub fn forget_account(&self, account_id: &str) {
         let prefix = format!("{account_id}|");
-        self.update(|prefs| prefs.levels.retain(|id, _| !id.starts_with(&prefix)));
+        self.update(|prefs| {
+            prefs.levels.retain(|id, _| !id.starts_with(&prefix));
+            prefs.direct.retain(|id| !id.starts_with(&prefix));
+        });
     }
 
     fn update(&self, edit: impl FnOnce(&mut NotifyPrefs)) {
@@ -295,6 +370,40 @@ mod tests {
         let path = dir.join("notify.toml");
         std::fs::write(&path, "levels = [not toml").unwrap();
         assert_eq!(NotifyStore::open(path).get("anything"), NotifyLevel::Default);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_announces_what_mentions_does_and_is_spelled_direct() {
+        // What is left out of it is left out before this is asked: by the time
+        // a message is a highlight here, it is one aimed at this account.
+        assert!(NotifyLevel::Direct.announces(false, true));
+        assert!(!NotifyLevel::Direct.announces(false, false));
+        assert!(!NotifyLevel::Direct.announces(true, false), "in a direct message too");
+        assert_eq!(NotifyLevel::parse("direct"), Some(NotifyLevel::Direct));
+        assert_eq!(NotifyLevel::Direct.as_str(), "direct");
+    }
+
+    #[test]
+    fn a_service_s_mentions_only_reads_as_direct_where_that_was_asked() {
+        let dir = std::env::temp_dir().join(format!("nobilis-notify-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("notify.toml");
+        let store = NotifyStore::open(path.clone());
+        let id = "discord:1|chan";
+        assert_eq!(store.overlaid(id, NotifyLevel::Mentions), NotifyLevel::Mentions);
+        store.set_direct(id, true);
+        assert_eq!(store.overlaid(id, NotifyLevel::Mentions), NotifyLevel::Direct);
+        // Whatever else the service says is what it says: a room set to
+        // everything on a phone is not quietly something else here.
+        assert_eq!(store.overlaid(id, NotifyLevel::All), NotifyLevel::All);
+        assert_eq!(store.overlaid(id, NotifyLevel::Mute), NotifyLevel::Mute);
+        assert_eq!(store.overlaid("discord:1|other", NotifyLevel::Mentions), NotifyLevel::Mentions);
+        // Kept across a restart, and gone with the account.
+        let reopened = NotifyStore::open(path.clone());
+        assert!(reopened.is_direct(id));
+        reopened.forget_account("discord:1");
+        assert!(!NotifyStore::open(path).is_direct(id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

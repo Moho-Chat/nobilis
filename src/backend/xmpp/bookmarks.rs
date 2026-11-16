@@ -67,7 +67,7 @@ pub fn with_notify(b: &Bookmark, level: crate::notify::NotifyLevel) -> Bookmark 
     }
     let name = match level {
         NotifyLevel::All => Some("always"),
-        NotifyLevel::Mentions => Some("on-mention"),
+        NotifyLevel::Mentions | NotifyLevel::Direct => Some("on-mention"),
         NotifyLevel::Mute => Some("never"),
         NotifyLevel::Default => None,
     };
