@@ -1217,11 +1217,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             .unwrap_or("unknown")
                             .to_string();
                         let embeds = extract_embeds(d);
-                        let mut attachments = extract_attachments(d);
-                        attachments.extend(extract_stickers(d));
-                        // A forwarded picture is a picture, and belongs in the message the
-                        // way any other attachment does.
-                        attachments.extend(forwarded_attachments(d));
+                        let attachments = all_attachments(d);
                         let body = extract_body(d).unwrap_or_default();
                         if is_empty_message(&body, &embeds, &attachments) {
                             tracing::info!("discord[{account_id}]: a message in {buffer_name} was dropped - it has nothing to show (type {})", d["type"]);
@@ -1331,11 +1327,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             continue;
                         }
                         let embeds = extract_embeds(d);
-                        let mut attachments = extract_attachments(d);
-                        attachments.extend(extract_stickers(d));
-                        // A forwarded picture is a picture, and belongs in the message the
-                        // way any other attachment does.
-                        attachments.extend(forwarded_attachments(d));
+                        let attachments = all_attachments(d);
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);

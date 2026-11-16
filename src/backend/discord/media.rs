@@ -80,17 +80,42 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
 /// endpoint. What arrives while one runs is queued for it rather than dropped:
 /// dropping was what left a page scrolled to mid-sweep with dead links for
 /// good, because nothing would ask for it again.
-pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
-    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
+pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashMap<String, Waiting>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Waiting>>> =
         std::sync::OnceLock::new();
     IN_FLIGHT.get_or_init(Default::default)
 }
 
+/// What is queued behind a buffer's running re-sign.
+#[derive(Default)]
+pub(super) struct Waiting {
+    ids: Vec<String>,
+    /// Whether the window named any of them, which is what decides how far
+    /// the next round will go to reach them.
+    named: bool,
+}
+
+/// Messages a sweep already asked about and got nothing new for: a link
+/// somebody typed that Discord will not sign again, a message since deleted.
+/// Asking again on every page read would cost a request each time and change
+/// nothing, so a sweep leaves them alone until the daemon next starts. What
+/// the window names is asked for regardless.
+fn given_up() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static GIVEN_UP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    GIVEN_UP.get_or_init(Default::default)
+}
+
 /// How many history pages one sweep will pull. Each covers ~50 messages, so
 /// this reaches a few screenfuls; past that the remaining stale messages are
-/// left for the per-message refresh a click triggers, rather than hammering a
-/// rate-limited endpoint on every buffer open.
+/// left for the window to name as they come on screen, rather than hammering
+/// a rate-limited endpoint on every buffer open.
 pub(super) const MAX_RESIGN_FETCHES: usize = 3;
+
+/// How many pages a round goes to for messages the window named. Those are
+/// on screen with a dead picture, so they are reached however spread out they
+/// are - short only of a runaway, since every request is paced as it is.
+pub(super) const MAX_NAMED_FETCHES: usize = 24;
 
 /// Re-signs every expired attachment across a page of scrollback, in as few
 /// requests as it can manage.
@@ -104,7 +129,17 @@ pub(super) const MAX_RESIGN_FETCHES: usize = 3;
 /// Runs in the background: the buffer opens immediately showing cached
 /// previews, and re-signed links arrive as messageUpdated events.
 pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[crate::model::Message]) {
-    resign_messages(state, buffer_id, stale_message_ids(messages));
+    // Somebody pasting a Discord link into another service's room is not
+    // something this account can ask Discord about.
+    if !buffer_id.starts_with("discord:") {
+        return;
+    }
+    let mut ids = stale_message_ids(messages);
+    {
+        let tried = given_up().lock().unwrap();
+        ids.retain(|id| !tried.contains(&(buffer_id.clone(), id.clone())));
+    }
+    queue_resign(state, buffer_id, ids, false);
 }
 
 /// Re-signs these messages' attachments, batched with whatever else this
@@ -114,6 +149,10 @@ pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[
 /// load - a link that lapsed between the page being read and being drawn, or
 /// one that failed for a reason its expiry does not show.
 pub fn resign_messages(state: AppState, buffer_id: String, ids: Vec<String>) {
+    queue_resign(state, buffer_id, ids, true);
+}
+
+fn queue_resign(state: AppState, buffer_id: String, ids: Vec<String>, named: bool) {
     if ids.is_empty() {
         return;
     }
@@ -121,20 +160,23 @@ pub fn resign_messages(state: AppState, buffer_id: String, ids: Vec<String>) {
         let mut all = resigning().lock().unwrap();
         if let Some(queued) = all.get_mut(&buffer_id) {
             for id in ids {
-                if !queued.contains(&id) {
-                    queued.push(id);
+                if !queued.ids.contains(&id) {
+                    queued.ids.push(id);
                 }
             }
+            queued.named |= named;
             return;
         }
-        all.insert(buffer_id.clone(), Vec::new());
+        all.insert(buffer_id.clone(), Waiting::default());
     }
 
     tokio::spawn(async move {
         let mut batch = ids;
+        let mut named = named;
         loop {
             sort_newest_first(&mut batch);
-            if let Err(e) = run_resign(&state, &buffer_id, batch).await {
+            let pages = if named { MAX_NAMED_FETCHES } else { MAX_RESIGN_FETCHES };
+            if let Err(e) = run_resign(&state, &buffer_id, batch, pages).await {
                 tracing::debug!("discord: re-signing {buffer_id}: {e}");
             }
             // Whatever queued up meanwhile is the next batch; the entry goes
@@ -143,7 +185,10 @@ pub fn resign_messages(state: AppState, buffer_id: String, ids: Vec<String>) {
             // already finished.
             let mut all = resigning().lock().unwrap();
             match all.get_mut(&buffer_id) {
-                Some(queued) if !queued.is_empty() => batch = std::mem::take(queued),
+                Some(queued) if !queued.ids.is_empty() => {
+                    batch = std::mem::take(&mut queued.ids);
+                    named = std::mem::take(&mut queued.named);
+                }
                 _ => {
                     all.remove(&buffer_id);
                     break;
@@ -159,7 +204,8 @@ fn sort_newest_first(ids: &mut [String]) {
     ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
 }
 
-/// Which messages in a page carry a lapsed attachment link, newest first.
+/// Which messages in a page carry a lapsed link, newest first - in their
+/// files, in a card under them, or in what was typed.
 ///
 /// Newest first because those are the ones most likely to be on screen, so
 /// the first fetch re-signs what the reader is actually looking at.
@@ -175,6 +221,8 @@ pub(super) fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<Strin
                 .iter()
                 .any(|a| a.url.as_deref().is_some_and(attachment_expired))
                 || stored_in_old_shape(m)
+                || cdn_links(&m.body).any(attachment_expired)
+                || m.embeds.iter().any(|e| embed_links(e).any(|u| is_cdn_link(u) && attachment_expired(u)))
         })
         .map(|m| m.id.clone())
         .collect();
@@ -207,6 +255,164 @@ fn unsigned(url: &str) -> String {
     url.split('?').next().unwrap_or(url).replace("media.discordapp.net", "cdn.discordapp.com")
 }
 
+/// The two hosts Discord serves files from. The same file is on both.
+const CDN_HOSTS: [&str; 2] = ["https://cdn.discordapp.com/", "https://media.discordapp.net/"];
+
+fn is_cdn_link(url: &str) -> bool {
+    CDN_HOSTS.iter().any(|host| url.starts_with(host))
+}
+
+/// Where each of Discord's file links sits in a piece of text: from the host
+/// to whatever ends a link in prose or in markdown.
+fn cdn_link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let Some(start) = CDN_HOSTS.iter().filter_map(|host| rest.find(host)).min() else { break };
+        let link = &rest[start..];
+        let len = link
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '>' | '<' | '"' | '\'' | '|' | ']'))
+            .unwrap_or(link.len());
+        out.push(at + start..at + start + len);
+        at += start + len;
+    }
+    out
+}
+
+fn cdn_links(text: &str) -> impl Iterator<Item = &str> {
+    cdn_link_ranges(text).into_iter().map(move |range| &text[range])
+}
+
+/// The addresses a card carries that a window might fetch.
+fn embed_links(embed: &Embed) -> impl Iterator<Item = &str> {
+    [&embed.media_url, &embed.image_url, &embed.url].into_iter().filter_map(|u| u.as_deref())
+}
+
+/// A link without its signature, host kept: what a stored link is matched to
+/// its freshly signed self by.
+fn bare(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
+/// Every signed file link anywhere in a message as Discord just sent it, by
+/// what it is a link to.
+///
+/// Anywhere, rather than field by field: Discord signs a link wherever it
+/// appears - an attachment, a card's picture or video, a forward's files, a
+/// link typed into the text - and a list of the places would be one short the
+/// next time it adds one.
+pub(super) fn fresh_links(message: &Value) -> std::collections::HashMap<String, String> {
+    fn walk(value: &Value, out: &mut std::collections::HashMap<String, String>) {
+        match value {
+            Value::String(text) => {
+                for link in cdn_links(text) {
+                    if link.contains("ex=") && !attachment_expired(link) {
+                        out.insert(bare(link).to_string(), link.to_string());
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            Value::Object(map) => map.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    walk(message, &mut out);
+    out
+}
+
+/// The text with each lapsed link in it swapped for its fresh one, or nothing
+/// if there was none to swap. Everything that is not such a link is left
+/// exactly as stored.
+pub(super) fn resign_text(text: &str, fresh: &std::collections::HashMap<String, String>) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut changed = false;
+    for range in cdn_link_ranges(text) {
+        let link = &text[range.clone()];
+        out.push_str(&text[at..range.start]);
+        match fresh.get(bare(link)) {
+            Some(new) if new != link => {
+                out.push_str(new);
+                changed = true;
+            }
+            _ => out.push_str(link),
+        }
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    changed.then_some(out)
+}
+
+/// The same for the cards under a message. Says whether any changed.
+fn resign_embeds(embeds: &mut [Embed], fresh: &std::collections::HashMap<String, String>) -> bool {
+    let mut changed = false;
+    for embed in embeds {
+        for field in [&mut embed.media_url, &mut embed.image_url, &mut embed.url] {
+            let Some(old) = field.as_deref().filter(|u| is_cdn_link(u)) else { continue };
+            if let Some(new) = fresh.get(bare(old)).filter(|new| new.as_str() != old) {
+                *field = Some(new.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Puts the fresh links from Discord's copy of a message into the stored one,
+/// and tells the windows. Says whether anything changed, and what the
+/// message's files now are.
+///
+/// Its files are replaced whole, since the list is rebuilt from the message
+/// the same way it was when it arrived. Its text and cards are not rebuilt -
+/// names resolved into the text and cards described after the fact would be
+/// lost - so there only the links change.
+fn store_fresh(state: &AppState, buffer_id: &str, id: &str, message: &Value) -> (bool, Vec<Attachment>) {
+    let Some(stored) = state.store.get_message(buffer_id, id).ok().flatten() else { return (false, Vec::new()) };
+    let attachments = merge_cached_thumbnails(state, buffer_id, id, all_attachments(message));
+    let fresh = fresh_links(message);
+    let mut update = serde_json::Map::new();
+    let mut body = stored.body.clone();
+
+    if !attachments.is_empty() {
+        // Stored in the old shape: the links come out of the text as the
+        // list goes in, or the picture would show twice - once as itself
+        // and once as a dead link under it.
+        if stored_in_old_shape(&stored) {
+            body = strip_attachment_links(&stored.body, &attachments);
+            if state.store.repair_message_media(buffer_id, id, &body, &attachments).unwrap_or(false) {
+                update.insert("body".into(), json!(body));
+                update.insert("attachments".into(), json!(attachments));
+            }
+        } else if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
+            update.insert("attachments".into(), json!(attachments));
+        }
+    }
+    if let Some(signed) = resign_text(&body, &fresh) {
+        if state.store.update_message_body_silent(buffer_id, id, &signed).unwrap_or(false) {
+            update.insert("body".into(), json!(signed));
+        }
+    }
+    let mut embeds = stored.embeds.clone();
+    if resign_embeds(&mut embeds, &fresh) && state.store.set_message_embeds(buffer_id, id, &embeds).unwrap_or(false) {
+        update.insert("embeds".into(), json!(embeds));
+    }
+
+    if update.is_empty() {
+        return (false, attachments);
+    }
+    update.insert("bufferId".into(), json!(buffer_id));
+    update.insert("id".into(), json!(id));
+    update.insert("edited".into(), json!(false));
+    state.events.emit("messageUpdated", Value::Object(update));
+    // The links are valid again right now, and this message reached a re-sign
+    // because its preview was needed - so take one while it can still be
+    // fetched, and the next expiry has something to show.
+    cache_thumbnails(state.clone(), buffer_id.to_string(), id.to_string(), attachments.clone());
+    (true, attachments)
+}
+
 /// The text with the links that are really these attachments taken out, and
 /// whatever else it said left exactly as stored.
 pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> String {
@@ -236,12 +442,12 @@ pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> 
     kept.join("\n").trim().to_string()
 }
 
-pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -> Result<()> {
+pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>, pages: usize) -> Result<()> {
     let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
     let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel")?;
 
-    for _ in 0..MAX_RESIGN_FETCHES {
+    for _ in 0..pages {
         let Some(anchor) = stale.first().cloned() else { break };
         // `around` centres the page on the message, so one fetch covers what
         // sits either side of it - usually the rest of the same screenful.
@@ -260,56 +466,32 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
             break;
         }
 
-        let mut handled = 0usize;
+        let mut unchanged: Vec<String> = Vec::new();
         for message in &page {
             let Some(id) = message["id"].as_str() else { continue };
             if !stale.iter().any(|s| s == id) {
                 continue;
             }
-            let attachments = merge_cached_thumbnails(state, buffer_id, id, extract_attachments(message));
-            if attachments.is_empty() {
-                continue;
+            if !store_fresh(state, buffer_id, id, message).0 {
+                unchanged.push(id.to_string());
             }
-            // Stored in the old shape: the links come out of the text as the
-            // list goes in, or the picture would show twice - once as itself
-            // and once as a dead link under it.
-            let old = state.store.get_message(buffer_id, id).ok().flatten().filter(stored_in_old_shape);
-            if let Some(old) = old {
-                let body = strip_attachment_links(&old.body, &attachments);
-                if state.store.repair_message_media(buffer_id, id, &body, &attachments).unwrap_or(false) {
-                    state.events.emit(
-                        "messageUpdated",
-                        json!({ "bufferId": buffer_id, "id": id, "edited": false, "body": body, "attachments": attachments.clone() }),
-                    );
-                }
-            } else if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
-                state.events.emit(
-                    "messageUpdated",
-                    json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments.clone() }),
-                );
-            }
-            // The link is valid again right now, and this message reached a
-            // re-sign because its preview was needed - so take one while it can
-            // still be fetched, and the next expiry has something to show.
-            cache_thumbnails(state.clone(), buffer_id.to_string(), id.to_string(), attachments);
-            handled += 1;
         }
 
         let covered: std::collections::HashSet<&str> = page.iter().filter_map(|m| m["id"].as_str()).collect();
-        // Drop everything this page spanned, not just what it re-signed - a
-        // message inside the returned range that came back without
-        // attachments was deleted or edited, and asking again won't change
-        // that. Without this the anchor would not advance and the loop would
-        // refetch the same page.
-        stale.retain(|id| !covered.contains(id.as_str()));
-        if stale.is_empty() {
-            break;
+        // What came back with nothing new has nothing new to give, and an
+        // anchor that did not come back at all was deleted. Neither is worth
+        // a sweep asking about again.
+        {
+            let mut tried = given_up().lock().unwrap();
+            if !covered.contains(anchor.as_str()) {
+                unchanged.push(anchor.clone());
+            }
+            tried.extend(unchanged.into_iter().map(|id| (buffer_id.to_string(), id)));
         }
-        // Nothing in range matched and nothing was dropped: give up rather
-        // than spin.
-        if handled == 0 && covered.is_empty() {
-            break;
-        }
+        // Drop everything this page spanned, not just what it re-signed, and
+        // the anchor whether or not it came back - without that the loop
+        // would fetch the same page again.
+        stale.retain(|id| id != &anchor && !covered.contains(id.as_str()));
     }
     Ok(())
 }
@@ -370,20 +552,10 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
         .find(|m| m["id"].as_str() == Some(message_id))
         .context("Discord no longer has that message")?;
 
-    let attachments = extract_attachments(message);
-    if attachments.is_empty() {
-        bail!("that message no longer has any attachments");
+    let (changed, attachments) = store_fresh(state, buffer_id, message_id, message);
+    if !changed && attachments.is_empty() {
+        bail!("Discord has no fresh link for that message");
     }
-    let attachments = merge_cached_thumbnails(state, buffer_id, message_id, attachments);
-
-    state.store.update_message_attachments(buffer_id, message_id, &attachments)?;
-    state.events.emit(
-        "messageUpdated",
-        json!({ "bufferId": buffer_id, "id": message_id, "edited": false, "attachments": attachments.clone() }),
-    );
-    // Same reasoning as the batch sweep: capture a preview while this link is
-    // freshly signed, so the next expiry is not another round-trip.
-    cache_thumbnails(state.clone(), buffer_id.to_string(), message_id.to_string(), attachments.clone());
     Ok(attachments)
 }
 
@@ -782,5 +954,72 @@ mod tests {
     #[test]
     fn only_discord_hosted_images_are_proxied() {
         assert!(thumbnail_source("https://example.com/a.png", 10, 10).is_none());
+    }
+
+    /// A forward's files are inside what it forwards, and a sticker is beside
+    /// the attachments: a re-sign that read only `attachments` found neither.
+    #[test]
+    fn a_forward_and_a_sticker_are_among_a_messages_files() {
+        let forward = json!({
+            "attachments": [],
+            "message_snapshots": [{ "message": { "attachments": [
+                { "url": FUTURE, "content_type": "image/jpeg", "filename": "a.jpg" },
+                { "url": FUTURE, "content_type": "image/jpeg", "filename": "b.jpg" }
+            ] } }]
+        });
+        let files = all_attachments(&forward);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].filename.as_deref(), Some("b.jpg"));
+    }
+
+    #[test]
+    fn fresh_links_are_found_wherever_discord_put_them() {
+        let message = json!({
+            "content": format!("see {FUTURE} there"),
+            "embeds": [{ "video": { "proxy_url": "https://media.discordapp.net/attachments/7/8/v.mp4?ex=f4143f80&is=1&hm=9" } }],
+            "message_snapshots": [{ "message": { "attachments": [{ "url": "https://cdn.discordapp.com/attachments/3/4/f.png?ex=f4143f80&is=1&hm=5" }] } }]
+        });
+        let fresh = fresh_links(&message);
+        assert_eq!(fresh.get("https://cdn.discordapp.com/attachments/1/2/a.png").map(String::as_str), Some(FUTURE));
+        assert!(fresh.contains_key("https://media.discordapp.net/attachments/7/8/v.mp4"));
+        assert!(fresh.contains_key("https://cdn.discordapp.com/attachments/3/4/f.png"));
+        // A link that came back already lapsed is no improvement on the stored one.
+        assert!(fresh_links(&json!({ "content": PAST })).is_empty());
+    }
+
+    #[test]
+    fn a_typed_link_is_signed_again_where_it_stands() {
+        let fresh = fresh_links(&json!({ "content": FUTURE }));
+        let body = format!("before [shot]({PAST}) and <{PAST}> after\nhttps://example.com/x.png?ex=1");
+        let signed = resign_text(&body, &fresh).expect("the lapsed links are swapped");
+        assert_eq!(signed, format!("before [shot]({FUTURE}) and <{FUTURE}> after\nhttps://example.com/x.png?ex=1"));
+        // Nothing to swap is said as nothing, so nothing is written.
+        assert!(resign_text("no links", &fresh).is_none());
+        assert!(resign_text(FUTURE, &fresh).is_none());
+        assert!(resign_text("https://cdn.discordapp.com/attachments/9/9/gone.png?ex=386d4380", &fresh).is_none());
+    }
+
+    #[test]
+    fn a_lapsed_link_in_the_text_or_on_a_card_needs_re_signing() {
+        let mut typed = msg("7", &[]);
+        typed.body = format!("look {PAST}");
+        // Not the old shape's catch-all: this one also has a file of its own.
+        typed.attachments = msg("x", &[FUTURE]).attachments;
+        let mut card = msg("8", &[]);
+        card.embeds = vec![Embed { media_url: Some(PAST.into()), ..Default::default() }];
+        let mut fine = msg("9", &[FUTURE]);
+        fine.body = format!("look {FUTURE}");
+        fine.embeds = vec![Embed { media_url: Some("https://images-ext-1.discordapp.net/x.mp4".into()), ..Default::default() }];
+        assert_eq!(stale_message_ids(&[typed, card, fine]), ["8", "7"]);
+    }
+
+    #[test]
+    fn a_cards_links_are_signed_again() {
+        let fresh = fresh_links(&json!({ "embeds": [{ "video": { "proxy_url": FUTURE } }] }));
+        let mut embeds = vec![Embed { media_url: Some(PAST.into()), url: Some("https://example.com".into()), ..Default::default() }];
+        assert!(resign_embeds(&mut embeds, &fresh));
+        assert_eq!(embeds[0].media_url.as_deref(), Some(FUTURE));
+        assert_eq!(embeds[0].url.as_deref(), Some("https://example.com"));
+        assert!(!resign_embeds(&mut embeds, &fresh));
     }
 }
