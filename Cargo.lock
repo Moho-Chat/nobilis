@@ -5291,6 +5291,7 @@ dependencies = [
  "md5",
  "num-bigint 0.5.1",
  "opus2",
+ "pbkdf2 0.12.2",
  "presage",
  "prost",
  "protobuf",

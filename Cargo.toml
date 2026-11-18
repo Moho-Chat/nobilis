@@ -43,6 +43,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", features = ["ring"] }
 rsa = "0.9"
 sha2 = "0.10"
+# Fluxer's ALTCHA proof of work (backend/fluxer/altcha.rs): PBKDF2-SHA256, as the server derives it.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # The login captcha's proof of work; see backend/sneedchat/captcha.rs.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 rand = "0.8"

@@ -122,6 +122,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_stoat(id) {
             backend::stoat::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("fluxer:") {
+        if let Some(cfg) = state.accounts.get_fluxer(id) {
+            backend::fluxer::spawn(state.clone(), cfg);
+        }
     } else if id.starts_with("signal:") {
         // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
         // where an account set to strict Tor stayed on its direct connection).
@@ -156,6 +160,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => Some("fluxer"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -474,6 +479,7 @@ pub async fn dispatch(
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "fluxer", "name": "Fluxer", "available": true },
                 { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
             ])),
@@ -561,6 +567,15 @@ pub async fn dispatch(
                             let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
                             if let Err(e) = backend::stoat::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("stoat history: {e:#}");
+                            }
+                        }
+                    }
+                    // Fluxer too: its history is paged by message id.
+                    if buffer.account_id.starts_with("fluxer:") {
+                        if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) {
+                            let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
+                            if let Err(e) = backend::fluxer::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
+                                tracing::debug!("fluxer history: {e:#}");
                             }
                         }
                     }
@@ -873,6 +888,8 @@ pub async fn dispatch(
                 // A Stoat session this client made is ended at Stoat; a token that was pasted belongs to another app
                 // of the person's, which ending would sign out.
                 let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
+                // The same for Fluxer: only a session moho made is ended there.
+                let fluxer_session = state.accounts.get_fluxer(id).filter(|a| a.made_here && !a.token.is_empty());
                 // A Signal device is taken off the account at Signal, and its file deleted.
                 let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
@@ -884,6 +901,16 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        if let Some(config) = fluxer_session {
+                            tokio::spawn(async move {
+                                let origin = if config.instance.is_empty() { backend::fluxer::discovery::DEFAULT_ORIGIN.to_string() } else { config.instance.clone() };
+                                if let Ok(instance) = backend::fluxer::discovery::fetch(&config.account_id(), &origin).await {
+                                    let api = backend::fluxer::api::Api::new(&config.account_id(), &instance.api, Some(config.token.clone()));
+                                    let _ = api.post("/auth/logout", &serde_json::Value::Null).await;
+                                }
+                            });
+                        }
+                        state.runtime.clear_fluxer_handle(id);
                         if let Some(config) = signal_account {
                             backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
@@ -1237,6 +1264,14 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    if typing {
+                        if let Err(e) = backend::fluxer::send::typing(state, &buffer).await {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
                     if let Err(e) = backend::signal::send::typing(state, &buffer, typing) {
                         tracing::debug!("sendTyping: {e}");
@@ -1398,6 +1433,7 @@ pub async fn dispatch(
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "fluxer" => backend::fluxer::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "signal" => backend::signal::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
@@ -1492,6 +1528,12 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     if let Err(e) = backend::stoat::send::mark_read(state, &buffer).await {
                         tracing::debug!("stoat read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    if let Err(e) = backend::fluxer::send::mark_read(state, &buffer).await {
+                        tracing::debug!("fluxer read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1953,6 +1995,8 @@ pub async fn dispatch(
                 true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(account_id).filter(|_| account_id.starts_with("fluxer:")) {
+                backend::fluxer::own::apply_status(&handle, status, text.as_deref()).await
             } else if account_id.starts_with("telegram:") {
                 // Online or not, which is all Telegram shows; recorded above for the next connection either way.
                 backend::telegram::account::presence_changed(state, account_id)
@@ -2010,6 +2054,11 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if let Some(handle) = state.runtime.fluxer_handle(id).filter(|_| id.starts_with("fluxer:")) {
+                    let handle = handle.clone();
+                    let shown = shown.clone();
+                    tokio::spawn(async move { backend::fluxer::own::apply_status(&handle, &shown, None).await });
+                    true
                 } else if id.starts_with("telegram:") {
                     backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
@@ -2059,6 +2108,18 @@ pub async fn dispatch(
                             tokio::spawn(async move {
                                 if let Err(e) = backend::stoat::members::refresh(&state, &handle, &buffer).await {
                                     tracing::debug!("stoat members: {e}");
+                                }
+                            });
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(buffer) if buffer.account_id.starts_with("fluxer:") => match state.runtime.fluxer_handle(&buffer.account_id) {
+                        Some(handle) => {
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backend::fluxer::members::refresh(&state, &handle, &buffer).await {
+                                    tracing::debug!("fluxer members: {e}");
                                 }
                             });
                             true
@@ -3899,6 +3960,24 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e)),
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -4146,6 +4225,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4202,6 +4285,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4241,6 +4328,10 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
@@ -5142,6 +5233,29 @@ pub async fn dispatch(
                     return (None, Some("addStoatAccountToken requires \"token\"".to_string()));
                 };
                 backend::stoat::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
+            }
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Signing in to Fluxer: an id now and the rest as events (backend/fluxer/login.rs). The instance is optional and
+        // is the official one when it is left out.
+        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => {
+            let instance = p_str(params, "instance", "").to_string();
+            let login_id = format!("fluxer-{}", crate::model::next_message_id());
+            match method {
+                "addFluxerAccount" => {
+                    let (Some(login), Some(password)) = (p_str_opt(params, "login"), p_str_opt(params, "password")) else {
+                        return (None, Some("addFluxerAccount requires \"login\" and \"password\"".to_string()));
+                    };
+                    backend::fluxer::login::start(state.clone(), login_id.clone(), instance, login.to_string(), password.to_string());
+                }
+                "addFluxerAccountToken" => {
+                    let Some(token) = p_str_opt(params, "token") else {
+                        return (None, Some("addFluxerAccountToken requires \"token\"".to_string()));
+                    };
+                    backend::fluxer::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
+                }
+                _ => backend::fluxer::login::start_handoff(state.clone(), login_id.clone(), instance),
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
@@ -6321,6 +6435,24 @@ pub async fn dispatch(
         "cancelSignalLink" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
                 backend::signal::link::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
+        // The second factor Fluxer asked for, for a sign-in that is waiting.
+        "submitFluxerCode" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some("submitFluxerCode requires \"loginId\" and \"value\"".to_string()));
+            };
+            match backend::fluxer::login::submit_code(login_id, value) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelFluxerLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::fluxer::login::cancel(login_id);
             }
             (Some(ok_node()), None)
         }

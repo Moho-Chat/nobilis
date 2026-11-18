@@ -1432,7 +1432,7 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
         // backend/telegram/media.rs and backend/stoat/media.rs): a file that is not there yet is the usual state of one,
         // not a sign it was swept.
         let path = std::path::Path::new(rest);
-        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
+        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::fluxer::media::MEDIA, crate::backend::fluxer::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
         if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| named_first.contains(&n)) {
             return false;
         }

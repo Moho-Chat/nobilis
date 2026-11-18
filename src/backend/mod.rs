@@ -18,6 +18,7 @@ pub mod signal;
 pub mod sneedchat;
 pub mod steam;
 pub mod stoat;
+pub mod fluxer;
 pub mod telegram;
 pub mod twitch;
 pub mod xmpp;
