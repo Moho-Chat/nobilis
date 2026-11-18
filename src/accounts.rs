@@ -2427,6 +2427,7 @@ pub fn fluxer_account_to_json(a: &FluxerAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         stop_reason: String::new(),
+        reactions: false,
     }
 }
 
