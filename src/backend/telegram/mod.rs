@@ -79,6 +79,8 @@ pub mod polls;
 pub mod profile;
 pub mod reactions;
 pub mod search;
+pub mod secret;
+pub mod secret_flow;
 pub mod send;
 pub mod stickers;
 pub mod threads;

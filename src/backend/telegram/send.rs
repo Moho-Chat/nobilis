@@ -81,6 +81,9 @@ pub fn input_for(body: &str) -> Result<InputMessage, String> {
 
 /// Sends a message, as an answer to another if `reply_to` names one.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::send_text(state, buffer, body, reply_to).await;
+    }
     if let Some(topic) = super::topics::topic_of_buffer(buffer) {
         return send_in_topic(state, buffer, body, reply_to, topic).await;
     }
@@ -158,6 +161,9 @@ pub(crate) fn sent_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i3
 
 /// Changes what one of the account's own messages says.
 pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -> Result<(), String> {
+    if super::secret_flow::is_secret(buffer) {
+        return Err("A message in a secret chat cannot be edited: delete it and send it again".to_string());
+    }
     let id: i32 = msg_id.parse().map_err(|_| "that message cannot be edited".to_string())?;
     let input = input_for(body)?;
     let (handle, peer) = peer_for(state, buffer).await?;
@@ -169,6 +175,10 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
 
 /// Removes a message: for everyone where Telegram allows it, or only from this account's own view.
 pub async fn delete(state: &AppState, buffer: &Buffer, msg_id: &str, for_everyone: bool) -> Result<(), String> {
+    // A secret chat's are always deleted on both sides.
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::delete(state, buffer, msg_id).await;
+    }
     let id: i32 = msg_id.parse().map_err(|_| "that message cannot be deleted".to_string())?;
     let (handle, peer) = peer_for(state, buffer).await?;
     if for_everyone || peer.id.kind() == grammers_session::types::PeerKind::Channel {
@@ -182,12 +192,18 @@ pub async fn delete(state: &AppState, buffer: &Buffer, msg_id: &str, for_everyon
 
 /// Says the account is typing. Telegram lets it lapse after a few seconds, so there is no "stopped".
 pub async fn typing(state: &AppState, buffer: &Buffer) -> Result<(), String> {
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::typing(state, buffer).await;
+    }
     let (handle, peer) = peer_for(state, buffer).await?;
     handle.client.action(peer).oneshot(tl::enums::SendMessageAction::SendMessageTypingAction).await.map_err(|e| explain(&e))
 }
 
 /// Says everything in the conversation has been read, so its unread count goes down on the account's other apps.
 pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::mark_read(state, buffer).await;
+    }
     let (handle, peer) = peer_for(state, buffer).await?;
     // A topic is read on its own: to the newest message of it that is here.
     if let Some(topic) = super::topics::topic_of_buffer(buffer) {
@@ -268,6 +284,9 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
     if files.is_empty() {
         return send(state, buffer, caption, reply_to).await;
     }
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::send_files(state, buffer, caption, files, reply_to).await;
+    }
     let (text, entities) = if caption.trim().is_empty() { (String::new(), Vec::new()) } else { checked(caption)? };
     // Telegram's limit on a caption is much smaller than on a message.
     if units(&text) > 1024 {
@@ -330,6 +349,10 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
 
 /// Sends a recording as a voice message (an Ogg file of Opus, which is what the recorder writes).
 pub async fn send_voice(state: &AppState, buffer: &Buffer, path: &std::path::Path, duration_secs: f64) -> Result<(), String> {
+    // In a secret chat a recording goes as an encrypted file.
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::send_files(state, buffer, "", &[(path.to_string_lossy().to_string(), false)], None).await;
+    }
     let (handle, peer) = peer_for(state, buffer).await?;
     let none = |_: u64, _: u64| {};
     let (up, _) = upload(&handle.client, &path.to_string_lossy(), 0, 0, &none).await?;

@@ -7657,6 +7657,38 @@ pub async fn dispatch(
             }
         }
 
+        // Secret chats: asking somebody for one, the asks waiting, answering one, and a chat's timer and safety picture.
+        "startTelegramSecretChat" | "telegramSecretRequests" | "answerTelegramSecretChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::secret_flow as secret;
+            let done = match method {
+                "startTelegramSecretChat" => secret::start(state, account_id, p_str(params, "userId", "")).await.map(|b| serde_json::json!({ "bufferId": b })),
+                "telegramSecretRequests" => secret::requests(state, account_id).await,
+                _ => secret::answer(state, account_id, p_str(params, "chatId", ""), params.get("accept").and_then(|v| v.as_bool()).unwrap_or(false)).await.map(|b| serde_json::json!({ "bufferId": b })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "telegramSecretInfo" | "setTelegramSecretTimer" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = if method == "telegramSecretInfo" {
+                backend::telegram::secret_flow::info(state, &buffer).await
+            } else {
+                let seconds = params.get("seconds").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                backend::telegram::secret_flow::set_timer(state, &buffer, seconds).await.map(|()| ok_node())
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Reporting a message to Telegram's moderators, a step at a time: the reasons, then perhaps a comment.
         "reportTelegramMessage" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
