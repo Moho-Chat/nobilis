@@ -117,6 +117,7 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 // and asking on the strength of a stale answer is a command
                 // answered with an error.
                 state.runtime.clear_irc_caps(&account_id);
+                super::reactions::announce(&state, &account_id);
                 state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
                 let because = detail.unwrap_or_else(|| "Connection closed".to_string());
                 let wait = state.runtime.next_retry_delay(&account_id, &mut backoff, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);

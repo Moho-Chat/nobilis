@@ -941,8 +941,8 @@ pub struct Runtime {
     kick_pins: Mutex<HashMap<String, crate::backend::kick::pins::Pin>>,
     /// account -> what its homeserver says it can do.
     matrix_server_facts: Mutex<HashMap<String, crate::backend::matrix::server::ServerFacts>>,
-    /// account -> the RPL_ISUPPORT tokens that server advertised.
-    irc_isupport: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// account -> the RPL_ISUPPORT tokens that server advertised, and their values.
+    irc_isupport: Mutex<HashMap<String, HashMap<String, String>>>,
     /// Channel buffers whose roster has been asked for on this connection.
     irc_rostered: Mutex<std::collections::HashSet<String>>,
     /// account -> the room catalogue last read off the site.
@@ -1293,6 +1293,9 @@ impl Runtime {
             // fills edits one account's list, and showing everybody's words
             // in it would mean saving them onto this account as well.
             account.highlight_keywords = state.highlights.account(&account.id);
+            if account.service == "irc" {
+                account.reactions = crate::backend::irc::reactions::supported(state, &account.id);
+            }
         }
         out
     }
@@ -4397,8 +4400,15 @@ impl Runtime {
         let known = all.entry(account_id.to_string()).or_default();
         for token in tokens.split_whitespace() {
             // `TOKEN=value` and a bare `TOKEN` both count; the name is the
-            // part that answers "does this server do that".
-            known.insert(token.split('=').next().unwrap_or(token).to_ascii_uppercase());
+            // part that answers "does this server do that", and the value is
+            // kept for the few tokens whose answer is a list (CLIENTTAGDENY).
+            // `-TOKEN` withdraws one announced earlier.
+            let (name, value) = token.split_once('=').unwrap_or((token, ""));
+            if let Some(gone) = name.strip_prefix('-') {
+                known.remove(&gone.to_ascii_uppercase());
+            } else {
+                known.insert(name.to_ascii_uppercase(), value.to_string());
+            }
         }
     }
 
@@ -4426,7 +4436,13 @@ impl Runtime {
             .lock()
             .unwrap()
             .get(account_id)
-            .is_some_and(|tokens| tokens.contains(&token.to_ascii_uppercase()))
+            .is_some_and(|tokens| tokens.contains_key(&token.to_ascii_uppercase()))
+    }
+
+    /// The value a server gave an ISUPPORT token, where it announced one.
+    /// `Some("")` for a token announced bare.
+    pub fn irc_isupport_value(&self, account_id: &str, token: &str) -> Option<String> {
+        self.irc_isupport.lock().unwrap().get(account_id)?.get(&token.to_ascii_uppercase()).cloned()
     }
 
     pub fn discord_last_interaction(&self, account_id: &str) -> Option<String> {
@@ -5869,6 +5885,19 @@ mod irc_cap_tests {
         // And only that one.
         assert!(rt.irc_has_cap("a", "server-time"));
         assert!(rt.irc_has_cap("a", "chghost"));
+    }
+
+    /// ISUPPORT keeps a token's value, and `-TOKEN` takes one back.
+    #[test]
+    fn isupport_keeps_values_and_takes_withdrawals() {
+        let rt = Runtime::new();
+        rt.note_irc_isupport("a", "WHOX CLIENTTAGDENY=*,-draft/react NETWORK=Libera");
+        assert!(rt.irc_has_isupport("a", "whox"));
+        assert_eq!(rt.irc_isupport_value("a", "WHOX").as_deref(), Some(""));
+        assert_eq!(rt.irc_isupport_value("a", "clienttagdeny").as_deref(), Some("*,-draft/react"));
+        rt.note_irc_isupport("a", "-CLIENTTAGDENY");
+        assert_eq!(rt.irc_isupport_value("a", "CLIENTTAGDENY"), None);
+        assert!(rt.irc_has_isupport("a", "NETWORK"));
     }
 
     /// Withdrawn by name, whatever value it was granted with.

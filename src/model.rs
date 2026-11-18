@@ -197,6 +197,11 @@ pub struct Account {
     /// moderate, whisper and change its colour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub moderation: bool,
+    /// IRC only: whether this connection carries reactions - the server relays
+    /// client tags and does not refuse `+draft/react`. Read off the live
+    /// connection, so false while it is down.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reactions: bool,
     /// XMPP only: why an account that stopped did (`password`, `certificate`, `certificate-changed`, `setup`), so the card can
     /// say it in a word and offer the one thing that helps.
     #[serde(rename = "stopReason", default, skip_serializing_if = "String::is_empty")]
