@@ -2061,6 +2061,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2103,6 +2104,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2144,6 +2146,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2194,6 +2197,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2243,6 +2247,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2287,6 +2292,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: !a.web_token.is_empty(),
         moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2332,6 +2338,7 @@ pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Accou
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2375,6 +2382,7 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2460,6 +2468,7 @@ pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: if state == "auth_failed" { crate::backend::xmpp::connect::stop_reason(&a.account_id()) } else { String::new() },
     }
 }
@@ -2503,6 +2512,7 @@ pub fn signal_account_to_json(a: &SignalAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }
@@ -2548,6 +2558,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         dehydration: a.dehydration_enabled,
         web_session: false,
         moderation: false,
+        reactions: false,
         stop_reason: String::new(),
     }
 }

@@ -636,6 +636,7 @@ pub(super) async fn handle_message(
             // with no capability of its own to negotiate.
             if code == Response::RPL_ISUPPORT && args.len() > 2 {
                 state.runtime.note_irc_isupport(account_id, &args[1..args.len() - 1].join(" "));
+                reactions::announce(state, account_id);
             }
             if let Some(text) = banner_text(code, &args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
@@ -659,6 +660,7 @@ pub(super) async fn handle_message(
             // the late login in latesasl.rs is what follows it up.
             let caps: Vec<&str> = caps.split_whitespace().filter(|c| c.split('=').next() != Some("sasl")).collect();
             state.runtime.grant_irc_caps(account_id, &caps.join(" "));
+            reactions::announce(state, account_id);
         }
 
         // Something became available after registration.
@@ -694,6 +696,7 @@ pub(super) async fn handle_message(
             let caps = cap_list(param.as_deref(), suffix.as_deref());
             tracing::debug!("irc[{account_id}]: capabilities withdrawn: {caps}");
             state.runtime.revoke_irc_caps(account_id, caps);
+            reactions::announce(state, account_id);
         }
 
         // The frame around a multiline message. Only multiline batches are
@@ -963,6 +966,7 @@ pub(super) async fn handle_message(
                 if let Some(value) = tags.iter().find(|t| t.0 == "+typing").and_then(|t| t.1.as_deref()) {
                     note_typing(state, account_id, &from, target, value);
                 }
+                reactions::note(state, account_id, &from, target, tags);
             }
         }
 
