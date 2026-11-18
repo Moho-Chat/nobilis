@@ -65,7 +65,8 @@ pub fn card(buffer_id: &str, msg_id: i32, poll: &tl::types::Poll, results: &tl::
         "resultDisplayDuration": 0,
         "hasVoted": voted.is_some(),
         "votedOptionId": voted,
-        "noEnd": true,
+        // Only whoever started a poll may close it, and Telegram says when that is this account.
+        "noEnd": !poll.creator,
     })
 }
 
@@ -206,6 +207,50 @@ pub async fn start(state: &AppState, buffer: &Buffer, question: &str, answers: &
     Ok(())
 }
 
+/// Closes the poll the conversation's card shows: no more votes, and the result is final. Telegram allows it only to
+/// whoever started the poll.
+pub async fn end(state: &AppState, buffer: &Buffer, poll_id: &str) -> Result<(), String> {
+    let msg_id: i32 = poll_id.parse().map_err(|_| "that poll cannot be closed".to_string())?;
+    let (handle, peer) = peer_for(state, buffer).await?;
+    let found = handle.client.get_messages_by_id(peer, &[msg_id]).await.map_err(|e| explain(&e))?;
+    let message = found.into_iter().next().flatten().ok_or_else(|| "that poll is no longer there".to_string())?;
+    let tl::enums::Message::Message(raw) = &message.raw else { return Err("that is not a poll".to_string()) };
+    let Some(tl::enums::MessageMedia::Poll(media)) = &raw.media else { return Err("that is not a poll".to_string()) };
+    let tl::enums::Poll::Poll(poll) = &media.poll;
+    let media = tl::types::InputMediaPoll { poll: tl::enums::Poll::Poll(closed(poll)), correct_answers: None, attached_media: None, solution: None, solution_entities: None, solution_media: None };
+    handle
+        .client
+        .invoke(&tl::functions::messages::EditMessage {
+            no_webpage: false,
+            invert_media: false,
+            peer: peer.into(),
+            id: msg_id,
+            message: None,
+            media: Some(tl::enums::InputMedia::Poll(Box::new(media))),
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            quick_reply_shortcut_id: None,
+            rich_message: None,
+        })
+        .await
+        .map_err(|e| match &e {
+            grammers_client::InvocationError::Rpc(r) if r.name == "MESSAGE_AUTHOR_REQUIRED" || r.name == "MESSAGE_EDIT_TIME_EXPIRED" => "Only whoever started a poll can close it".to_string(),
+            grammers_client::InvocationError::Rpc(r) if r.name == "MESSAGE_NOT_MODIFIED" || r.name == "POLL_CLOSED" => "That poll is already closed".to_string(),
+            _ => explain(&e),
+        })?;
+    // Telegram's update with the closed poll redraws the card.
+    Ok(())
+}
+
+/// The same poll, closed: the one change Telegram takes when a poll is edited.
+fn closed(poll: &tl::types::Poll) -> tl::types::Poll {
+    let mut poll = poll.clone();
+    poll.closed = true;
+    poll
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +313,18 @@ mod tests {
         assert_eq!((card["hasVoted"].as_bool(), card["votedOptionId"].as_str()), (Some(true), Some(option_id(b"1").as_str())));
         let closed = super::card("b", 1, &poll(true), &results);
         assert_eq!(closed["open"], false);
+    }
+
+    #[test]
+    fn only_the_polls_creator_is_offered_to_close_it_and_closing_changes_nothing_else() {
+        let empty = tl::types::PollResults { min: false, has_unread_votes: false, can_view_stats: false, results: None, total_voters: None, recent_voters: None, solution: None, solution_entities: None, solution_media: None };
+        assert_eq!(card("b", 1, &poll(false), &empty)["noEnd"], true);
+        let mut mine = poll(false);
+        mine.creator = true;
+        assert_eq!(card("b", 1, &mine, &empty)["noEnd"], false);
+        let shut = closed(&mine);
+        assert!(shut.closed);
+        assert_eq!((shut.id, shut.answers.len()), (77, 2));
     }
 
     #[test]

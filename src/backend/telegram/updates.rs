@@ -29,7 +29,7 @@ fn who(handle: &Handle, user: i64) -> Option<String> {
     handle.names.lock().unwrap_or_else(|e| e.into_inner()).get(&user).cloned()
 }
 
-fn say_typing(state: &AppState, account_id: &str, buffer: &crate::model::Buffer, name: String) {
+pub(crate) fn say_typing(state: &AppState, account_id: &str, buffer: &crate::model::Buffer, name: String) {
     state.events.emit("typing", serde_json::json!({ "accountId": account_id, "bufferId": buffer.id, "nicks": [name], "expiresInMs": TYPING_FOR_MS }));
 }
 
@@ -64,6 +64,10 @@ fn pins_changed(state: &AppState, account_id: &str, _handle: &Handle, remote: &s
 /// Handles one raw update.
 pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enums::Update) {
     use tl::enums::Update as U;
+    // Secret chats' own: handled in order by their worker.
+    super::secret_flow::update(state, account_id, handle, update);
+    // Voice chats': passed up to the window, which holds the call.
+    super::voicechat::update(state, account_id, update);
     match update {
         U::UserTyping(u) if is_typing(&u.action) => {
             if let (Some(buffer), Some(name)) = (buffer_of(state, account_id, &u.user_id.to_string()), who(handle, u.user_id)) {

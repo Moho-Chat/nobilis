@@ -86,11 +86,18 @@ async fn read(state: &AppState, buffer: &Buffer, before: Option<i64>) -> Result<
 
 /// Opening a conversation: its recent end.
 pub async fn open(state: &AppState, buffer: &Buffer) -> Result<usize> {
+    // A secret chat has no history on Telegram's side: what is here is all there is.
+    if super::secret_flow::is_secret(buffer) {
+        return Ok(0);
+    }
     read(state, buffer, None).await
 }
 
 /// Scrolling back: what came before `before` (a Unix time).
 pub async fn older(state: &AppState, buffer: &Buffer, before: i64) -> Result<usize> {
+    if super::secret_flow::is_secret(buffer) {
+        return Ok(0);
+    }
     read(state, buffer, Some(before)).await
 }
 

@@ -68,6 +68,13 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        // Telegram's block list is the account's, so it holds on the phone too; recorded here as well, because what a
+        // blocked person says in a group still arrives. Only a person's number can be blocked: a name is only hidden.
+        "telegram" if target.parse::<i64>().is_ok_and(|n| n > 0) => {
+            backend::telegram::people::block(state, account_id, target, ignored).await.map_err(|e| anyhow::anyhow!(e))?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         _ => {
             state.ignores.set(account_id, target, ignored);
             Ok("window")
@@ -1946,6 +1953,9 @@ pub async fn dispatch(
                 true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
+            } else if account_id.starts_with("telegram:") {
+                // Online or not, which is all Telegram shows; recorded above for the next connection either way.
+                backend::telegram::account::presence_changed(state, account_id)
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
@@ -2000,6 +2010,8 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if id.starts_with("telegram:") {
+                    backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
                     let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
                     sender.send(irc::proto::Command::AWAY(away)).is_ok()
@@ -2706,6 +2718,8 @@ pub async fn dispatch(
                 backend::discord::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji, 10).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 // Nothing else says who: the count is all there is.
                 Ok(serde_json::json!({ "users": [] }))
@@ -7197,6 +7211,12 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 };
             }
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("telegram:")) {
+                return match backend::telegram::polls::end(state, &buffer, p_str(params, "pollId", "")).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("matrix:")) {
                 let Some(poll_id) = p_str_opt(params, "pollId") else {
                     return (None, Some("ending a Matrix poll needs its \"pollId\"".to_string()));
@@ -7615,6 +7635,122 @@ pub async fn dispatch(
             }
         }
 
+        // The Telegram account itself: its profile, its @username, its picture, and the sessions signed in to it.
+        "telegramOwnProfile" | "telegramSessions" | "setTelegramProfile" | "setTelegramUsername" | "setTelegramProfilePhoto" | "endTelegramSession" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::account as tg;
+            let done: Result<serde_json::Value, String> = match method {
+                "telegramOwnProfile" => tg::own_profile(state, account_id).await,
+                "telegramSessions" => tg::sessions(state, account_id).await,
+                "setTelegramProfile" => tg::set_profile(state, account_id, p_str_opt(params, "firstName"), p_str_opt(params, "lastName"), p_str_opt(params, "bio")).await.map(|()| ok_node()),
+                "setTelegramUsername" => tg::set_username(state, account_id, p_str(params, "username", "")).await.map(|()| ok_node()),
+                "setTelegramProfilePhoto" => tg::set_photo(state, account_id, p_str(params, "path", "")).await.map(|()| ok_node()),
+                _ => tg::end_session(state, account_id, p_str(params, "sessionId", "")).await.map(|()| ok_node()),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Making a Telegram group or channel, with the people named in it.
+        "createTelegramChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some("createTelegramChat requires a Telegram \"accountId\"".to_string()));
+            };
+            let broadcast = p_str(params, "kind", "group") == "channel";
+            match backend::telegram::chats::create(state, account_id, p_str(params, "title", ""), broadcast, p_str(params, "about", ""), p_str(params, "members", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A Telegram group or channel's own settings, the people banned from it, and changing one setting.
+        "telegramChatInfo" | "telegramBanned" | "telegramChatChange" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = match method {
+                "telegramChatInfo" => backend::telegram::chats::info(state, &buffer).await,
+                "telegramBanned" => backend::telegram::chats::banned(state, &buffer).await,
+                _ => backend::telegram::chats::change(state, &buffer, p_str(params, "action", ""), params).await.map(|note| serde_json::json!({ "ok": true, "note": note })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Secret chats: asking somebody for one, the asks waiting, answering one, and a chat's timer and safety picture.
+        "startTelegramSecretChat" | "telegramSecretRequests" | "answerTelegramSecretChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::secret_flow as secret;
+            let done = match method {
+                "startTelegramSecretChat" => secret::start(state, account_id, p_str(params, "userId", "")).await.map(|b| serde_json::json!({ "bufferId": b })),
+                "telegramSecretRequests" => secret::requests(state, account_id).await,
+                _ => secret::answer(state, account_id, p_str(params, "chatId", ""), params.get("accept").and_then(|v| v.as_bool()).unwrap_or(false)).await.map(|b| serde_json::json!({ "bufferId": b })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "telegramSecretInfo" | "setTelegramSecretTimer" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = if method == "telegramSecretInfo" {
+                backend::telegram::secret_flow::info(state, &buffer).await
+            } else {
+                let seconds = params.get("seconds").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                backend::telegram::secret_flow::set_timer(state, &buffer, seconds).await.map(|()| ok_node())
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A group's or channel's voice chat: what it is like, starting it, joining with the window's offer, leaving,
+        // muting, ending, and who is in it. See backend/telegram/voicechat.rs.
+        "telegramVoice" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("telegramVoice requires a Telegram \"bufferId\"".to_string()));
+            };
+            use backend::telegram::voicechat as voice;
+            let call = p_str(params, "call", "");
+            let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let done = match p_str(params, "op", "") {
+                "info" => voice::info(state, &buffer).await,
+                "start" => voice::start(state, &buffer).await.map(|()| ok_node()),
+                "join" => voice::join(state, &buffer, call, p_str(params, "params", ""), flag("muted")).await,
+                "leave" => voice::leave(state, &buffer, call, params.get("source").and_then(|v| v.as_i64()).unwrap_or(0) as i32).await.map(|()| ok_node()),
+                "mute" => voice::mute(state, &buffer, call, flag("muted"), p_str_opt(params, "userId")).await.map(|()| ok_node()),
+                "end" => voice::end(state, &buffer, call).await.map(|()| ok_node()),
+                "participants" => voice::participants(state, &buffer, call).await,
+                other => Err(format!("telegramVoice has no \"{other}\"")),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Reporting a message to Telegram's moderators, a step at a time: the reasons, then perhaps a comment.
+        "reportTelegramMessage" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("reportTelegramMessage requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::people::report(state, &buffer, p_str(params, "messageId", ""), p_str(params, "option", ""), p_str(params, "comment", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // What this Telegram account may do to others in a conversation, and doing it.
         "telegramPermissions" | "moderateTelegramMember" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
@@ -7779,6 +7915,7 @@ pub async fn dispatch(
                     None => Err(anyhow::anyhow!("that Signal account is not connected")),
                     Some(handle) => backend::signal::inbox::open_dm(state, &handle, user_id).await,
                 },
+                "telegram" => backend::telegram::people::open_dm(state, account_id, user_id).await.map_err(|e| anyhow::anyhow!(e)),
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };
             match opened {
@@ -8787,9 +8924,13 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
+                ("telegram", "telegram") => match backend::telegram::people::forward(state, &source, message_id, &target).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 _ => (
                     None,
-                    Some("forwarding goes within one Discord account, or between Matrix rooms".to_string()),
+                    Some("forwarding goes within one Discord or Telegram account, or between Matrix rooms".to_string()),
                 ),
             }
         }

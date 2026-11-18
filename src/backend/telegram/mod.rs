@@ -24,7 +24,9 @@
 //! - `polls` - a poll as the conversation's card, voted in from it
 //! - `threads` - replies in a thread, and a channel post's comments
 //! - `membership` - joining by @name or link, leaving
+//! - `chats` - a group or channel's own settings, and making a new one
 //! - `admin` - what an administrator may do to a member
+//! - `account` - the account itself: its profile, its sessions, whether it shows as online
 //! - `notify` - muting a chat on the account
 //! - `instant` - an Instant View article as a page of its own
 //! - `keyboards` - a bot's inline buttons
@@ -33,6 +35,7 @@
 //! - `folders` - the account's chat folders, kept in step with moho's categories
 //! - `gifs` - saved GIFs and the GIF search
 //! - `stickers` - the account's sticker packs, and sending one
+//! - `people` - a person met in a group: a conversation with them, blocking, who reacted; forwarding and reporting
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -49,8 +52,10 @@
 //! and says what this is: the device is "moho" on this operating system, the version is moho's own. A session is
 //! saved and reused; nothing here signs in afresh to get over a hiccup.
 
+pub mod account;
 pub mod admin;
 pub mod bots;
+pub mod chats;
 pub mod connect;
 pub mod dialogs;
 pub mod folders;
@@ -67,17 +72,21 @@ pub mod members;
 pub mod membership;
 pub mod messages;
 pub mod notify;
+pub mod people;
 pub mod peers;
 pub mod pins;
 pub mod polls;
 pub mod profile;
 pub mod reactions;
 pub mod search;
+pub mod secret;
+pub mod secret_flow;
 pub mod send;
 pub mod stickers;
 pub mod threads;
 pub mod topics;
 pub mod updates;
+pub mod voicechat;
 pub mod session;
 
 use grammers_mtsender::ConnectionParams;

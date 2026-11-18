@@ -103,7 +103,7 @@ pub fn parse_avatar_name(name: &str) -> Option<(i64, String, i64)> {
     parts.next().is_none().then_some((account, remote, photo))
 }
 
-fn local(dir: &str, name: &str) -> String {
+pub fn local(dir: &str, name: &str) -> String {
     format!("file://{}", crate::media_cache::dir(dir).join(name).display())
 }
 
@@ -133,7 +133,7 @@ pub fn extension_of(name: Option<&str>, mime: Option<&str>) -> String {
 }
 
 /// The broad shape of a document, which decides how the window draws it.
-fn kind_of_mime(mime: &str) -> &'static str {
+pub fn kind_of_mime(mime: &str) -> &'static str {
     if mime.starts_with("image/") && mime != "image/gif" {
         "image"
     } else if mime.starts_with("video/") || mime == "image/gif" {
@@ -409,6 +409,10 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
     // A GIF the picker listed is fetched from what the picker remembered of it.
     if name.starts_with("tgif_") {
         return super::gifs::restore(state, name, path).await?.context("not a cached Telegram GIF");
+    }
+    // A secret chat's file: fetched and decrypted with its own key.
+    if name.starts_with("tsec_") {
+        return super::secret_flow::restore(state, name, path).await;
     }
     // So is a sticker's picture.
     if name.starts_with("tstk_") {
