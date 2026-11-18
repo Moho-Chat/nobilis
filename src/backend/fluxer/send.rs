@@ -196,6 +196,26 @@ pub async fn react(state: &AppState, buffer: &Buffer, message_id: &str, emoji: &
     Ok(())
 }
 
+/// Who put a reaction on a message, by name (the first ten).
+pub async fn reactors(handle: &Handle, buffer: &Buffer, message_id: &str, emoji: &str) -> Result<Value, String> {
+    let channel = buffer.remote_id.clone().ok_or_else(|| "this is not a Fluxer conversation".to_string())?;
+    let wire = messages::reaction_wire(&handle.world.lock().unwrap_or_else(|e| e.into_inner()), emoji);
+    let path = format!("/channels/{channel}/messages/{message_id}/reactions/{}", url::form_urlencoded::byte_serialize(wire.as_bytes()).collect::<String>());
+    let answer = handle.api.get(&path, &[("limit", "10".to_string())]).await.map_err(|e| e.to_string())?;
+    let list = answer.as_array().cloned().or_else(|| answer["users"].as_array().cloned()).unwrap_or_default();
+    let guild = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get(&channel).and_then(|c| c.guild.clone());
+    let users: Vec<Value> = list
+        .iter()
+        .filter_map(|u| {
+            let id = u["id"].as_str()?;
+            let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+            let name = if world.users.contains_key(id) { world.name_in(guild.as_deref(), id) } else { u["global_name"].as_str().or(u["username"].as_str()).unwrap_or("someone").to_string() };
+            Some(json!({ "id": id, "name": name }))
+        })
+        .collect();
+    Ok(json!({ "users": users }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

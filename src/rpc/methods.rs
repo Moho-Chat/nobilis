@@ -2845,6 +2845,8 @@ pub async fn dispatch(
                 backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::send::reactors(&handle, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 // Nothing else says who: the count is all there is.
                 Ok(serde_json::json!({ "users": [] }))

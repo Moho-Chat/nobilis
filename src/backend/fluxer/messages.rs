@@ -180,8 +180,24 @@ pub fn buffer_of(state: &AppState, account_id: &str, channel_id: &str) -> Option
     state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(channel_id))
 }
 
+/// A message with its forwards in the shape Discord's readers take: Fluxer's snapshot is the forwarded message itself
+/// (`content`, `attachments`...), where Discord's holds it under `message`.
+pub fn discord_shaped(message: &Value) -> Value {
+    let mut out = message.clone();
+    if let Some(list) = out["message_snapshots"].as_array_mut() {
+        for snapshot in list.iter_mut() {
+            if !snapshot["message"].is_object() {
+                *snapshot = json!({ "message": snapshot.clone() });
+            }
+        }
+    }
+    out
+}
+
 /// Records a message, as heard live or read from history. Answers whether it was new.
 pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
+    let shaped = discord_shaped(message);
+    let message = &shaped;
     let (Some(id), Some(channel_id)) = (message["id"].as_str(), message["channel_id"].as_str()) else { return false };
     let account_id = &handle.account_id;
     let Some(buffer) = buffer_of(state, account_id, channel_id) else {
@@ -315,6 +331,15 @@ mod tests {
         assert_eq!(reaction_wire(&w, "👍"), "👍");
         assert_eq!(reaction_wire(&w, "[fluxer:emoji:party:file:///x/fluxer-media/a.webp]"), "party:500000000000000001");
         assert_eq!(reaction_wire(&w, "<:party:500000000000000001>"), "party:500000000000000001");
+    }
+
+    #[test]
+    fn a_forward_is_put_in_discords_shape_and_discords_reader_finds_its_words() {
+        let m = json!({ "content": "", "message_reference": { "type": 1, "message_id": "1" }, "message_snapshots": [{ "content": "said elsewhere", "type": 0 }] });
+        let shaped = discord_shaped(&m);
+        assert_eq!(shaped["message_snapshots"][0]["message"]["content"], "said elsewhere");
+        assert_eq!(discord_shaped(&shaped), shaped, "already in shape, left alone");
+        assert_eq!(crate::backend::discord::messages::extract_body(&shaped).as_deref(), Some("> said elsewhere"));
     }
 
     #[test]
