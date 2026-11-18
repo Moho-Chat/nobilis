@@ -5143,6 +5143,38 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Fluxer's guild settings and moderation answer to the same calls, in the same shapes (backend/fluxer/manage.rs).
+        "stoatManage" | "getStoatPowers" | "moderateStoatMember" | "setStoatMemberRole" | "createStoatInvite" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "stoatManage" => {
+                    return match backend::fluxer::manage::run(&handle, &buffer, p_str(params, "action", ""), params).await {
+                        Ok(answer) => (Some(answer), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "getStoatPowers" => return (Some(backend::fluxer::moderation::powers(&handle, &buffer)), None),
+                "createStoatInvite" => {
+                    return match backend::fluxer::moderation::invite(&handle, &buffer).await {
+                        Ok(link) => (Some(serde_json::json!({ "link": link })), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "moderateStoatMember" => backend::fluxer::moderation::moderate(&handle, &buffer, user, p_str(params, "action", ""), params.get("minutes").and_then(|v| v.as_i64()), p_str_opt(params, "reason")).await,
+                _ => backend::fluxer::moderation::set_role(&handle, &buffer, user, p_str(params, "roleId", ""), p_bool(params, "give", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Looking after the Stoat server a conversation is in (backend/stoat/manage.rs): one call, with the action to run.
         "stoatManage" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
