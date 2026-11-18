@@ -564,6 +564,11 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             }
         }
+        "CHANNEL_PINS_UPDATE" => {
+            if let Some(buffer) = data["channel_id"].as_str().and_then(|c| messages::buffer_of(state, account_id, c)) {
+                super::search::announce(state, handle, &buffer);
+            }
+        }
         "USER_GUILD_SETTINGS_UPDATE" => {
             super::settings::keep(handle, data);
             super::settings::apply(state, handle);
@@ -575,7 +580,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 super::members::presence(state, handle, p);
             }
         }
-        "SESSIONS_REPLACE" | "VOICE_STATE_UPDATE" | "CHANNEL_PINS_UPDATE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
+        "SESSIONS_REPLACE" | "VOICE_STATE_UPDATE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
         other => tracing::debug!("fluxer[{account_id}]: {other} not handled"),
     }
 }

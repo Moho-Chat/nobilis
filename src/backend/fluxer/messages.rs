@@ -256,6 +256,9 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
     if recorded && !reactions.is_empty() && state.store.set_reactions(&buffer.id, id, &reactions).unwrap_or(false) {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": reactions }));
     }
+    if recorded {
+        super::invites::cards_later(state, handle, &buffer.id, id, content);
+    }
     recorded
 }
 

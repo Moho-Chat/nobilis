@@ -2698,6 +2698,8 @@ pub async fn dispatch(
                 backend::telegram::history::context(state, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::context(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::context(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2742,6 +2744,8 @@ pub async fn dispatch(
                 backend::telegram::history::newer(state, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::newer(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::newer(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -2771,6 +2775,8 @@ pub async fn dispatch(
                 backend::telegram::pins::list(state, &buffer).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::pins(&handle, &buffer).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::pins(&handle, &buffer).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2826,6 +2832,8 @@ pub async fn dispatch(
                 backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::set_pinned(&handle, &buffer, message_id, pinned).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::set_pinned(&handle, &buffer, message_id, pinned).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2843,6 +2851,16 @@ pub async fn dispatch(
             };
             if query.trim().is_empty() {
                 return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            // Fluxer's search answers to the same name: one channel at a time, the same rows.
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("fluxer:")) {
+                let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                    return (None, Some("that Fluxer account is not connected".to_string()));
+                };
+                return match backend::fluxer::search::run(&handle, &buffer, query.trim(), p_i64(params, "limit", 25) as usize).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
             }
             let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("stoat:")) else {
                 return (None, Some("that conversation is not on Stoat".to_string()));
