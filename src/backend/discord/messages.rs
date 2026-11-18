@@ -656,6 +656,21 @@ pub(super) fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
         .collect()
 }
 
+/// Everything a message shows as a file: its own attachments, its stickers,
+/// and the files inside what it forwards - in that order, always.
+///
+/// One function because the list is replaced whole when its links are signed
+/// again, and a re-sign that read only the message's own attachments found
+/// none on a forward and left its pictures dead for good.
+pub(super) fn all_attachments(d: &Value) -> Vec<Attachment> {
+    let mut attachments = extract_attachments(d);
+    attachments.extend(extract_stickers(d));
+    // A forwarded picture is a picture, and belongs in the message the way
+    // any other attachment does.
+    attachments.extend(forwarded_attachments(d));
+    attachments
+}
+
 pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
     let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
     // Whether somebody spoke this message rather than attaching a sound file.
@@ -941,11 +956,7 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
         let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown");
         let is_own = author["id"].as_str() == Some(user_id);
         let embeds = extract_embeds(msg);
-        let mut attachments = extract_attachments(msg);
-        attachments.extend(extract_stickers(msg));
-        // A forwarded picture is a picture, and belongs in the message the
-        // way any other attachment does.
-        attachments.extend(forwarded_attachments(msg));
+        let attachments = all_attachments(msg);
         let body = extract_body(msg).unwrap_or_default();
         if is_empty_message(&body, &embeds, &attachments) {
             continue;

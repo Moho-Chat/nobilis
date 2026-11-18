@@ -866,6 +866,20 @@ pub struct Message {
     /// this says it should be drawn as removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moderated: Option<Moderated>,
+    /// How far one of the account's own messages has got, where the service says: "sent", "delivered" or "read".
+    /// Only ever moves forward (see `Store::set_delivery`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+}
+
+/// The order a message's delivery moves through; anything else is not a delivery state.
+pub fn delivery_rank(state: &str) -> Option<u8> {
+    match state {
+        "sent" => Some(1),
+        "delivered" => Some(2),
+        "read" => Some(3),
+        _ => None,
+    }
 }
 
 pub fn buffer_id(account_id: &str, name: &str) -> String {
@@ -948,6 +962,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("twitch") => "twitch",
         Some("telegram") => "telegram",
         Some("stoat") => "stoat",
+        Some("signal") => "signal",
         Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
@@ -1118,7 +1133,7 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:") || account_id.starts_with("telegram:"),
         // Stoat's own: only mentions reach the account.
         "focus" => account_id.starts_with("stoat:"),
         _ => false,

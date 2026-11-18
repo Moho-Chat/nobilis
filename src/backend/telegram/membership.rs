@@ -95,6 +95,10 @@ pub async fn join(state: &AppState, account_id: &str, input: &str) -> Result<(),
 
 /// Leaves a conversation: a channel or supergroup is left, a small group is left, a private chat is cleared.
 pub async fn leave(state: &AppState, buffer: &Buffer) -> Result<(), String> {
+    // A secret chat is ended on both sides.
+    if super::secret_flow::is_secret(buffer) {
+        return super::secret_flow::end(state, buffer).await;
+    }
     let (handle, peer) = peer_for(state, buffer).await?;
     match peer.id.kind() {
         PeerKind::Channel => {

@@ -1,0 +1,44 @@
+# Patched copy of libsignal-service-rs
+
+A copy of [libsignal-service-rs](https://github.com/whisperfish/libsignal-service-rs) at commit `7a7526741dfd9ad4c4894717f22651eb0506fb7e`
+(the commit presage `4b81740` pins), AGPL-3.0 like the original (`LICENSE.md`), wired in through `[patch]` in nobilis's `Cargo.toml`.
+
+What is changed, and nothing else:
+
+- `src/push_service/mod.rs`: `push_service::network`, a per-thread setting for the proxy and the user agent that every
+  `PushService::new` on that thread reads (and whether presage, patched beside it, may fetch link previews). The library builds one `reqwest` client per `PushService` and carries REST,
+  the attachment CDNs and both websockets over it, but presage constructs them where no proxy can be handed in.
+- `src/push_service/mod.rs`: `patch_group`, `create_group` and `group_join_info` (`/v2/groups/`, `/v1/groups/join/`),
+  the group server's requests for changing, making and looking at a group through its link.
+- `src/websocket/profile.rs`: `retrieve_profile_key_credential`, a person's expiring profile key credential.
+- `src/groups_v2/operations.rs`: a few encryption helpers made public (`encrypt_aci`, `encrypt_service_id`,
+  `encrypt_profile_key`, `decrypt_title`, `decrypt_description_text`, `decrypt_disappearing_messages_timer`).
+- `Cargo.toml`: reqwest's `socks` feature.
+- `src/account_manager.rs`, `update_device_name`: the name is encrypted to the account's own identity key (from the
+  identity key pair), as Signal's clients do; upstream looked the account up among the identities it had seen, which
+  a freshly linked device has not yet, so renaming it failed.
+- Group pictures: `GroupOperations::encrypt_avatar` (the blob members decrypt with `decrypt_avatar`), and
+  `PushService::upload_group_avatar` (`GET /v1/groups/avatar/form` from the group server, then CDN 0 through
+  `upload_to_cdn0`, whose upload attributes are now crate-visible so the form can be made into them).
+- Stories: a `StoryMessage` is sent with `?story=true` (`OutgoingPushMessages::story`), and its sent copy is synced to
+  the account's other devices with `story_message` and a `StoryMessageRecipient` per member (upstream syncs only data
+  and edit messages). `MessageSender::send_message_to_many` sends to a set of people naming the story lists
+  (distribution list ids) in that sync; `send_message_to_group` is it with none.
+- Profile pictures: `ProfileCipher::encrypt_avatar`, `SignalWebSocket::write_profile_with_new_avatar` (the profile write
+  that answers the CDN form; upstream's `write_profile` panics on a new avatar) and
+  `AccountManager::upload_versioned_profile_with_new_avatar`; the `cdn` module is crate-visible.
+- Number lookup (CDSI, `websocket/directory.rs`): the enclave connection goes through this thread's proxy
+  (`push_service::network`) as libsignal-net's own SOCKS/HTTP proxy, and a proxy it cannot use is refused rather than
+  bypassed. Upstream always connects directly.
+- Storage service writes: `StorageService::read_raw_items` (an item's decrypted bytes as they are),
+  `encrypt_raw_item`, `write` (`PUT /v1/storage`, a 409 answered as `StorageServiceError::Conflict` with the server's
+  manifest) and `open_manifest`.
+- Group calls: `PushService::group_external_credential` (`GET /v1/groups/token`, a group call's membership proof).
+- Message history at link time: the link address says `capabilities=backup4,backup5` (so the phone offers its
+  history), `SignalWebSocket::transfer_archive` (`GET /v1/devices/transfer_archive`) and `PushService::download_cdn_file`.
+- Usernames: `reserve_username_hash`, `confirm_username_hash`, `delete_username_hash`, `reset_username_link` (answering
+  the link's entropy and handle); the `usernames` crate is re-exported and `websocket::usernames` is public.
+- Call links (`websocket/call_links.rs`): `call_link_auth_credentials` (the `callLinkAuthCredentials` the group
+  credential request also answers) and `create_call_link_credential` (`POST /v1/call-link/create-auth`).
+
+Drop this copy when upstream takes a way to set the client's proxy and user agent.

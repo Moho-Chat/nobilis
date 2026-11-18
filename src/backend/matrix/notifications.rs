@@ -154,7 +154,8 @@ pub async fn set_room_level(state: &AppState, account_id: &str, buffer_id: &str,
             });
             http::put_json(&rule("override"), token, body).await.context("muting the room")?;
         }
-        NotifyLevel::Mentions => {
+        // Direct mentions only is this daemon's reading of the same rule (see `NotifyLevel::Direct`).
+        NotifyLevel::Mentions | NotifyLevel::Direct => {
             remove("override").await?;
             http::put_json(&rule("room"), token, serde_json::json!({ "actions": ["dont_notify"] })).await.context("setting the room to mentions only")?;
         }

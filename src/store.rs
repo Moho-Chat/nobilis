@@ -129,6 +129,14 @@ impl Store {
                One row per card, replaced as the votes come in: card_id is
                whatever the service uses to mean the same poll, or the moment
                it started where the service names nothing. */
+            /* What a message said before each edit, oldest first: its earlier versions, for showing an edit's history. */
+            CREATE TABLE IF NOT EXISTS message_edits (
+                buffer_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                body TEXT NOT NULL,
+                replaced_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(buffer_id, msg_id);
             CREATE TABLE IF NOT EXISTS live_cards (
                 buffer_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -170,6 +178,8 @@ impl Store {
             // pressed for months, so a client that lost them on restart would
             // be showing a message whose whole point had gone.
             "ALTER TABLE messages ADD COLUMN components TEXT NOT NULL DEFAULT '[]'",
+            // How far one of the account's own messages has got (sent, delivered, read), where the service says.
+            "ALTER TABLE messages ADD COLUMN delivery TEXT",
             // Which kind of conversation this was said in.
             //
             // Buffers live only as long as the daemon does - they are rebuilt
@@ -495,6 +505,17 @@ impl Store {
     /// our loaded history isn't something there's a visible row to update.
     pub fn update_message_body(&self, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // The words it is replacing are kept, so the edit's history can be shown. The same words again (a service that
+        // repeats an edit) are no new version.
+        let before: Option<String> = conn
+            .query_row("SELECT body FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id], |r| r.get(0))
+            .optional()?;
+        if let Some(before) = before.filter(|b| b != body) {
+            conn.execute(
+                "INSERT INTO message_edits (buffer_id, msg_id, body, replaced_at) VALUES (?1, ?2, ?3, ?4)",
+                params![buffer_id, msg_id, before, chrono::Utc::now().timestamp()],
+            )?;
+        }
         let embeds_json = serde_json::to_string(embeds)?;
         let attachments_json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
@@ -502,6 +523,14 @@ impl Store {
             params![body, buffer_id, msg_id, embeds_json, attachments_json, chrono::Utc::now().timestamp().max(2)],
         )?;
         Ok(rows > 0)
+    }
+
+    /// A message's earlier versions, oldest first: what it said, and when that was replaced (unix seconds).
+    pub fn edit_history(&self, buffer_id: &str, msg_id: &str) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT body, replaced_at FROM message_edits WHERE buffer_id = ?1 AND msg_id = ?2 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![buffer_id, msg_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Like update_message_body, but doesn't set `edited` - for backend-
@@ -886,6 +915,7 @@ impl Store {
             html: row.get("html")?,
             components,
             moderated,
+            delivery: row.get::<_, Option<String>>("delivery").ok().flatten(),
         })
     }
 
@@ -893,7 +923,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -922,6 +952,22 @@ impl Store {
             params![buffer_id, msg_id, json],
         )?;
         Ok(())
+    }
+
+    /// Moves one of the account's own messages on to `state` (sent, delivered, read). Never backwards: a late delivery
+    /// receipt does not undo a read. Answers whether it moved.
+    pub fn set_delivery(&self, buffer_id: &str, msg_id: &str, state: &str) -> Result<bool> {
+        let Some(rank) = crate::model::delivery_rank(state) else { return Ok(false) };
+        let conn = self.conn.lock().unwrap();
+        let now: Option<Option<String>> = conn
+            .query_row("SELECT delivery FROM messages WHERE buffer_id = ?1 AND msg_id = ?2 AND is_own = 1", params![buffer_id, msg_id], |r| r.get(0))
+            .optional()?;
+        let Some(now) = now else { return Ok(false) };
+        if now.as_deref().and_then(crate::model::delivery_rank).is_some_and(|r| r >= rank) {
+            return Ok(false);
+        }
+        conn.execute("UPDATE messages SET delivery = ?3 WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id, state])?;
+        Ok(true)
     }
 
     /// Takes the buttons off a message, for an edit that removed them.
@@ -976,7 +1022,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2
              ORDER BY ts ASC LIMIT ?3",
@@ -999,7 +1045,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 500 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
              ORDER BY ts ASC LIMIT ?4",
@@ -1040,7 +1086,7 @@ impl Store {
     pub fn messages_around(&self, buffer_id: &str, ts: i64, span: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let span = if span > 0 { span } else { 50 };
-        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated";
+        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery";
 
         let mut older = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
@@ -1086,7 +1132,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -1224,6 +1270,20 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
+    /// Takes transfers out of the record, by id. What they wrote to disk is not touched: this is the list, not the files.
+    pub fn forget_transfers(&self, ids: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut drop = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
+            for id in ids {
+                drop.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drops the oldest transfers beyond `keep`.
     /// Replaces the saved layout - every buffer and rail entry - in one go.
     pub fn save_layout(&self, buffers: &[crate::model::Buffer], groups: &[crate::model::BufferGroup]) -> Result<()> {
@@ -1347,7 +1407,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -1372,7 +1432,7 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
         // backend/telegram/media.rs and backend/stoat/media.rs): a file that is not there yet is the usual state of one,
         // not a sign it was swept.
         let path = std::path::Path::new(rest);
-        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS];
+        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
         if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| named_first.contains(&n)) {
             return false;
         }
@@ -1420,7 +1480,7 @@ impl Store {
     pub fn thread_messages(&self, buffer_id: &str, root_id: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR reply_thread_root = ?2 OR msg_id = ?2)
              ORDER BY ts ASC, rowid ASC",
@@ -1432,7 +1492,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, reply_chat, moderated, delivery
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
@@ -1637,6 +1697,33 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    #[test]
+    fn an_own_message_moves_on_through_sent_delivered_and_read_and_never_back() {
+        let (s, dir) = store();
+        s.append_message("b", "mine", "me", "hi", 1, false, false, "chat", None, &[], true, None, &[], &[], None, None, "dm", None, &[]).unwrap();
+        append(&s, "b", "theirs");
+        assert!(s.set_delivery("b", "mine", "sent").unwrap());
+        assert!(s.set_delivery("b", "mine", "read").unwrap());
+        assert!(!s.set_delivery("b", "mine", "delivered").unwrap(), "a late delivery does not undo a read");
+        assert_eq!(s.get_message("b", "mine").unwrap().unwrap().delivery.as_deref(), Some("read"));
+        assert!(!s.set_delivery("b", "theirs", "sent").unwrap(), "only the account's own messages");
+        assert!(!s.set_delivery("b", "mine", "lost").unwrap(), "not a state");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_edit_keeps_what_the_message_said_before() {
+        let (s, dir) = store();
+        append(&s, "b", "m1");
+        assert!(s.update_message_body("b", "m1", "second", &[], &[]).unwrap());
+        assert!(s.update_message_body("b", "m1", "second", &[], &[]).unwrap(), "the same again");
+        assert!(s.update_message_body("b", "m1", "third", &[], &[]).unwrap());
+        let history = s.edit_history("b", "m1").unwrap();
+        assert_eq!(history.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(), vec!["hi", "second"]);
+        assert!(s.edit_history("b", "nope").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -68,6 +68,13 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        // Telegram's block list is the account's, so it holds on the phone too; recorded here as well, because what a
+        // blocked person says in a group still arrives. Only a person's number can be blocked: a name is only hidden.
+        "telegram" if target.parse::<i64>().is_ok_and(|n| n > 0) => {
+            backend::telegram::people::block(state, account_id, target, ignored).await.map_err(|e| anyhow::anyhow!(e))?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         _ => {
             state.ignores.set(account_id, target, ignored);
             Ok("window")
@@ -105,6 +112,22 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_xmpp(id) {
             backend::xmpp::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("telegram:") {
+        // Telegram and Stoat were missing here, so changing their route (or restarting Tor) left the old connection
+        // running on the old path until the next restart.
+        if let Some(cfg) = state.accounts.get_telegram(id) {
+            backend::telegram::connect::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("stoat:") {
+        if let Some(cfg) = state.accounts.get_stoat(id) {
+            backend::stoat::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("signal:") {
+        // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
+        // where an account set to strict Tor stayed on its direct connection).
+        if let Some(cfg) = state.accounts.get_signal(id) {
+            backend::signal::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -133,6 +156,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
     }
@@ -450,6 +474,7 @@ pub async fn dispatch(
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
             ])),
             None,
@@ -848,6 +873,8 @@ pub async fn dispatch(
                 // A Stoat session this client made is ended at Stoat; a token that was pasted belongs to another app
                 // of the person's, which ending would sign out.
                 let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
+                // A Signal device is taken off the account at Signal, and its file deleted.
+                let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
                     Ok(true) => {
                         if let Some(config) = stoat_session {
@@ -857,6 +884,9 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        if let Some(config) = signal_account {
+                            backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
+                        }
                         backend::xmpp::transport::forget_refused(id);
                         if let Some(config) = telegram_account {
                             backend::telegram::folders::forget(&config.account_id());
@@ -928,6 +958,14 @@ pub async fn dispatch(
                         match state.accounts.get_twitch(id) {
                             Some(cfg) => {
                                 backend::twitch::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("signal:") {
+                        match state.accounts.get_signal(id) {
+                            Some(cfg) => {
+                                backend::signal::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -1199,6 +1237,12 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    if let Err(e) = backend::signal::send::typing(state, &buffer, typing) {
+                        tracing::debug!("sendTyping: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     // It lapses by itself, so only "typing" is said.
                     if typing {
@@ -1292,7 +1336,7 @@ pub async fn dispatch(
                 return (None, Some("setNotifyLevel requires a known \"bufferId\"".to_string()));
             };
             let Some(level) = p_str_opt(params, "level").and_then(crate::notify::NotifyLevel::parse) else {
-                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions or mute".to_string()));
+                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions, direct or mute".to_string()));
             };
             match crate::notify::set_level(state, &buffer, level).await {
                 Ok(()) => (Some(ok_node()), None),
@@ -1354,6 +1398,7 @@ pub async fn dispatch(
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "signal" => backend::signal::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
@@ -1451,6 +1496,12 @@ pub async fn dispatch(
                     (Some(ok_node()), None)
                 }
                 // Telegram keeps a read position for each conversation too, and tells the account's other apps.
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    if let Err(e) = backend::signal::send::mark_read(state, &buffer) {
+                        tracing::debug!("signal read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     if let Err(e) = backend::telegram::send::mark_read(state, &buffer).await {
                         tracing::debug!("telegram read position: {e}");
@@ -1614,6 +1665,10 @@ pub async fn dispatch(
                 .await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("signal:") {
+                // An Ogg Opus file marked as a voice note, as the attachment's flag says on Signal.
+                let path = finished.path.to_string_lossy().to_string();
+                backend::signal::send::voice_message(state, &buffer, &path).await.map_err(|e| anyhow::anyhow!(e))
             } else if buffer.account_id.starts_with("xmpp:") {
                 // An Ogg Opus file over HTTP Upload that says how long it is: what XMPP clients play as a voice message.
                 let path = finished.path.to_string_lossy().to_string();
@@ -1898,6 +1953,9 @@ pub async fn dispatch(
                 true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
+            } else if account_id.starts_with("telegram:") {
+                // Online or not, which is all Telegram shows; recorded above for the next connection either way.
+                backend::telegram::account::presence_changed(state, account_id)
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
@@ -1952,6 +2010,8 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if id.starts_with("telegram:") {
+                    backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
                     let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
                     sender.send(irc::proto::Command::AWAY(away)).is_ok()
@@ -2658,6 +2718,8 @@ pub async fn dispatch(
                 backend::discord::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji, 10).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 // Nothing else says who: the count is all there is.
                 Ok(serde_json::json!({ "users": [] }))
@@ -3140,6 +3202,32 @@ pub async fn dispatch(
             };
             backend::irc::dcc::cancel(state, id, "declined");
             (Some(Value::Bool(true)), None)
+        }
+
+        // Clearing the history of what came and went: the ones named, or a kind
+        // of them (failed, finished, missing, all), optionally only those older
+        // than so many days. Never the files, and never one still moving.
+        "forgetTransfers" => {
+            let ids: Vec<String> = params
+                .get("ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let which = match p_str_opt(params, "which") {
+                Some(w) => match backend::irc::dcc::Forget::parse(w) {
+                    Some(which) => which,
+                    None => return (None, Some(format!("forgetTransfers does not know \"{w}\": failed, finished, missing or all"))),
+                },
+                None if !ids.is_empty() => backend::irc::dcc::Forget::Named,
+                None => return (None, Some("forgetTransfers requires \"ids\" or \"which\"".to_string())),
+            };
+            let older_than = params
+                .get("olderThanDays")
+                .and_then(Value::as_i64)
+                .filter(|days| *days > 0)
+                .map(|days| backend::irc::dcc::now_seconds() - days * 86_400);
+            let gone = backend::irc::dcc::forget(state, which, &ids, older_than);
+            (Some(serde_json::json!({ "removed": gone.len(), "ids": gone })), None)
         }
 
         // The resolved directory goes out alongside the setting, so a window
@@ -3811,6 +3899,25 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e)),
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    // The window's spoiler mark: Signal has no hidden files, and sends the marked one as view-once.
+                    let marked: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), marked.contains(&p.as_str()))).collect();
+                    let sent = backend::signal::send::files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") && params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false) && attachment_path.is_none() && reply_to_id.is_some() => {
                     match backend::telegram::threads::reply(state, &buffer, reply_to_id.unwrap_or_default(), body).await {
                         Ok(()) => (Some(ok_node()), None),
@@ -4039,6 +4146,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4091,6 +4202,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4126,6 +4241,10 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
@@ -5866,6 +5985,346 @@ pub async fn dispatch(
             }
         }
 
+        // Linking Signal: a QR code to scan with Signal on the phone that has the account (backend/signal/link.rs). An id
+        // now and the rest as events.
+        "addSignalAccount" => {
+            let link_id = format!("signal-{}", crate::model::next_message_id());
+            backend::signal::link::start(state.clone(), link_id.clone());
+            (Some(serde_json::json!({ "loginId": link_id })), None)
+        }
+
+        // The devices linked to a Signal account, and renaming this one. Signal lets only the phone remove another device.
+        "signalDevices" | "renameSignalDevice" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            if method == "signalDevices" {
+                return match backend::signal::send::devices(state, account_id).await {
+                    Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::signal::send::rename_device(state, account_id, p_str(params, "name", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "listSignalStickers" | "sendSignalSticker" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let result = if method == "listSignalStickers" {
+                backend::signal::send::stickers(state, &buffer).await
+            } else {
+                backend::signal::send::sticker(state, &buffer, p_str(params, "id", "")).await.map(|()| ok_node())
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "sendSignalGif" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("sendSignalGif requires a Signal \"bufferId\"".to_string()));
+            };
+            match backend::signal::send::gif(state, &buffer, p_str(params, "url", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "signalGroup" | "signalGroupInfo" | "signalSetTimer" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let result = match method {
+                "signalGroupInfo" => backend::signal::send::group_info(state, &buffer).await,
+                "signalSetTimer" => backend::signal::send::set_timer(state, &buffer, params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(0) as u32).await.map(|()| ok_node()),
+                _ => backend::signal::send::edit_group(state, &buffer, params).await.map(|()| ok_node()),
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A view-once picture: opened (the file to show, and from then on it is gone), and the shown file taken away.
+        "openSignalViewOnce" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("openSignalViewOnce requires a Signal \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.signal_handle(&buffer.account_id) else {
+                return (None, Some("that Signal account is not connected".to_string()));
+            };
+            match backend::signal::viewonce::open(state, &handle, p_str(params, "messageId", "")).await {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "signalConnections" => match backend::signal::send::connections(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalStoryLists" => match backend::signal::send::story_lists(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        // To a group (by its conversation) or to My Story / a custom list (by account and list id).
+        "postSignalStory" if p_str_opt(params, "listId").is_some() => {
+            match backend::signal::send::post_story_to_list(state, p_str(params, "accountId", ""), p_str(params, "listId", ""), p_str(params, "text", ""), p_str_opt(params, "path")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "postSignalStory" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some("postSignalStory requires a Signal \"bufferId\"".to_string()));
+            };
+            let replies = params.get("allowReplies").and_then(|v| v.as_bool()).unwrap_or(true);
+            match backend::signal::send::post_story(state, &buffer, p_str(params, "text", ""), p_str_opt(params, "path"), replies).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "signalSendLocation" | "signalSendContact" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"bufferId\"")));
+            };
+            let list = |name: &str| -> Vec<String> { params.get(name).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default() };
+            let result = if method == "signalSendLocation" {
+                backend::signal::send::location(state, &buffer, p_str(params, "place", ""), p_str(params, "label", "")).await
+            } else {
+                match backend::signal::send::contact_card(p_str(params, "name", ""), &list("numbers"), &list("emails"), p_str(params, "organization", "")) {
+                    Ok(card) => backend::signal::send::contact(state, &buffer, card).await,
+                    Err(e) => Err(e),
+                }
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        // What an edited message said before, oldest first, with when each was replaced. Any service.
+        "signalStickerPackFromMessage" => match backend::signal::sticker_packs::install_from_message(state, p_str(params, "bufferId", ""), p_str(params, "messageId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalFolders" | "signalProfiles" => {
+            let account_id = p_str(params, "accountId", "");
+            let Some(handle) = state.runtime.signal_handle(account_id) else {
+                return (None, Some("that Signal account is not connected".to_string()));
+            };
+            let kept = backend::signal::storage::current(account_id, &handle.store);
+            if method == "signalFolders" {
+                (Some(backend::signal::storage::folders_for_window(state, account_id, &kept)), None)
+            } else {
+                let list: Vec<serde_json::Value> = kept.notification_profiles.iter().map(|p| serde_json::json!({ "id": p.id.to_string(), "name": p.name, "emoji": p.emoji, "scheduled": p.scheduled, "start": p.start, "end": p.end, "days": p.days, "allowMentions": p.allow_mentions, "allowed": p.allowed.len() })).collect();
+                (Some(serde_json::json!({ "profiles": list })), None)
+            }
+        }
+        "signalStickerPacks" => match backend::signal::sticker_packs::list(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalStickerPackLink" => match backend::signal::sticker_packs::from_link(state, p_str(params, "accountId", ""), p_str(params, "link", ""), true).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalRemoveStickerPack" => match backend::signal::sticker_packs::remove(state, p_str(params, "accountId", ""), p_str(params, "packId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "getEditHistory" => match state.store.edit_history(p_str(params, "bufferId", ""), p_str(params, "messageId", "")) {
+            Ok(rows) => (Some(serde_json::json!(rows.into_iter().map(|(body, ts)| serde_json::json!({ "body": body, "replacedAt": ts })).collect::<Vec<_>>())), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
+        "signalUsername" => match backend::signal::send::username(state, p_str(params, "accountId", ""), params).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalUsernameLink" => match backend::signal::send::username_link(state, p_str(params, "accountId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCreateStoryList" => {
+            let people: Vec<String> = params.get("people").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            match backend::signal::send::create_story_list(state, p_str(params, "accountId", ""), p_str(params, "name", ""), &people).await {
+                Ok(id) => (Some(serde_json::json!({ "listId": id })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "signalSharedChange" => match backend::signal::send::shared_change(state, p_str(params, "accountId", ""), params).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalSafetyQr" => match backend::signal::profile::safety_qr(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCompareSafetyQr" => match backend::signal::profile::compare_safety_qr(state, p_str(params, "accountId", ""), p_str(params, "userId", ""), p_str(params, "picture", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalResetSession" => match backend::signal::send::reset_session(state, p_str(params, "accountId", ""), p_str(params, "userId", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallEnded" => match backend::signal::calls::ended(
+            state,
+            p_str(params, "accountId", ""),
+            p_str(params, "remote", ""),
+            p_str(params, "callId", "0").parse().unwrap_or(0),
+            p_bool(params, "video", false),
+            p_bool(params, "incoming", false),
+            p_bool(params, "accepted", false),
+        ) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalSendAnyway" => match backend::signal::send::send_anyway(state, p_str(params, "accountId", ""), p_str(params, "userId", "")) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        // A linked account sealed into a file with a passphrase, and brought back from one (see signal::backup).
+        "exportSignalAccount" => match backend::signal::backup::export(state, p_str(params, "accountId", ""), p_str(params, "path", ""), p_str(params, "passphrase", "")).await {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+        "importSignalAccount" => match backend::signal::backup::import(state, p_str(params, "path", ""), p_str(params, "passphrase", "")).await {
+            Ok(account_id) => (Some(serde_json::json!({ "accountId": account_id })), None),
+            Err(e) => (None, Some(e)),
+        },
+        // RingRTC (in the app) places and takes Signal calls; the daemon carries their messages and fetches the relays.
+        "signalCallSettings" => match backend::signal::calls::settings(state, p_str(params, "accountId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkJoinInfo" => match backend::signal::call_links::join_info(state, p_str(params, "accountId", ""), p_str(params, "rootKey", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkCreateInfo" => match backend::signal::call_links::create_info(state, p_str(params, "accountId", ""), p_str(params, "rootKey", ""), p_str(params, "roomId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkSave" => match backend::signal::call_links::save(state, p_str(params, "accountId", ""), p_str(params, "rootKey", ""), p_str(params, "adminPasskey", "")).await {
+            Ok(()) => (Some(serde_json::Value::Bool(true)), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinkForget" => match backend::signal::call_links::forget(state, p_str(params, "accountId", ""), p_str(params, "rootKey", "")).await {
+            Ok(()) => (Some(serde_json::Value::Bool(true)), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalCallLinks" => match backend::signal::call_links::list(state, p_str(params, "accountId", "")) {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalGroupCallInfo" => match backend::signal::calls::group_info(state, p_str(params, "bufferId", "")).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalGroupCallBuffer" => match backend::signal::calls::group_buffer(state, p_str(params, "accountId", ""), p_str(params, "groupId", "")).await {
+            Ok(value) => (Some(serde_json::json!({ "bufferId": value })), None),
+            Err(e) => (None, Some(e)),
+        },
+        "signalSendGroupCallMessage" => {
+            let message = params.get("message").cloned().unwrap_or_default();
+            let recipients: Vec<String> = params.get("recipients").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            match backend::signal::calls::send_to_group(state, p_str(params, "accountId", ""), p_str(params, "groupId", ""), &message, &recipients).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "signalSendCallMessage" => {
+            let message = params.get("message").cloned().unwrap_or_default();
+            match backend::signal::calls::send(state, p_str(params, "accountId", ""), p_str(params, "to", ""), &message).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        // A Signal call ringing here is silenced (nothing is sent; it is answered or turned down on the phone).
+        "silenceSignalCall" => (Some(serde_json::json!({ "silenced": backend::signal::calls::silence(state, p_str(params, "bufferId", "")) })), None),
+        "closeSignalViewOnce" => match backend::signal::viewonce::close(p_str(params, "path", "")) {
+            Ok(()) => (Some(ok_node()), None),
+            Err(e) => (None, Some(e)),
+        },
+
+        "signalCreateGroup" | "signalGroupLinkInfo" | "signalJoinGroupLink" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let result = match method {
+                "signalCreateGroup" => {
+                    let members: Vec<String> = params.get("userIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                    backend::signal::send::create_group(state, account_id, p_str(params, "title", ""), &members).await.map(|id| serde_json::json!({ "bufferId": id }))
+                }
+                "signalGroupLinkInfo" => backend::signal::send::link_info(state, account_id, p_str(params, "link", "")).await,
+                _ => backend::signal::send::join_link(state, account_id, p_str(params, "link", "")).await.map(|id| serde_json::json!({ "bufferId": id, "waiting": id.is_none() })),
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "signalOwnProfile" | "signalSetProfile" | "signalSettings" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let result = if method == "signalOwnProfile" {
+                backend::signal::send::own_profile(state, account_id).await
+            } else if method == "signalSettings" {
+                backend::signal::send::settings(state, account_id).await
+            } else {
+                backend::signal::send::set_profile(state, account_id, params).await.map(|()| ok_node())
+            };
+            match result {
+                Ok(value) => (Some(value), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "signalBlock" | "signalVerify" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            let on = |name: &str| params.get(name).and_then(|v| v.as_bool()).unwrap_or(true);
+            let result = if method == "signalBlock" {
+                backend::signal::send::block(state, account_id, p_str(params, "id", ""), on("blocked")).await
+            } else {
+                backend::signal::send::verify(state, account_id, p_str(params, "userId", ""), on("verified")).await
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "signalRequests" | "signalAnswerRequest" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            if method == "signalRequests" {
+                return match backend::signal::send::requests(state, account_id).await {
+                    Ok(listing) => (Some(listing), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::signal::send::answer_request(state, account_id, p_str(params, "id", ""), p_str(params, "answer", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "cancelSignalLink" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::signal::link::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
         "cancelStoatLogin" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
                 backend::stoat::login::cancel(login_id);
@@ -6430,6 +6889,14 @@ pub async fn dispatch(
             // running tally is what most people mean by a poll, and a hidden
             // one is the deliberate choice.
             let disclosed = params.get("disclosed").and_then(Value::as_bool).unwrap_or(true);
+            // Signal has no hidden tally; its choice is whether more than one answer may be picked.
+            if buffer.account_id.starts_with("signal:") {
+                let multiple = params.get("multiple").and_then(Value::as_bool).unwrap_or(false);
+                return match backend::signal::send::start_poll(state, &buffer, question, &answers, multiple).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if buffer.account_id.starts_with("telegram:") {
                 return match backend::telegram::polls::start(state, &buffer, question, &answers, disclosed).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -6464,6 +6931,23 @@ pub async fn dispatch(
                     return match backend::matrix::vote_in_poll(state, &buffer.account_id, buffer_id, &poll_id, &answer).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
+                    };
+                }
+
+                // A Signal poll is a message too; the vote is a message naming it.
+                if buffer.account_id.starts_with("signal:") {
+                    // Several answers ("optionIds", for a poll that allows them - an empty list takes the vote back),
+                    // else the one.
+                    let choices: Vec<u32> = match params.get("optionIds").and_then(Value::as_array) {
+                        Some(ids) => ids.iter().filter_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).filter_map(|n| u32::try_from(n).ok()).collect(),
+                        None => match u32::try_from(option_id) {
+                            Ok(choice) => vec![choice],
+                            Err(_) => return (None, Some("votePoll requires \"optionId\"".to_string())),
+                        },
+                    };
+                    return match backend::signal::send::vote(state, &buffer, &choices).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
                     };
                 }
 
@@ -6718,6 +7202,21 @@ pub async fn dispatch(
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("endPoll requires \"bufferId\"".to_string()));
             };
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("signal:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("endPoll requires \"pollId\" for a Signal poll".to_string()));
+                };
+                return match backend::signal::send::end_poll(state, &buffer, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("telegram:")) {
+                return match backend::telegram::polls::end(state, &buffer, p_str(params, "pollId", "")).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("matrix:")) {
                 let Some(poll_id) = p_str_opt(params, "pollId") else {
                     return (None, Some("ending a Matrix poll needs its \"pollId\"".to_string()));
@@ -7136,6 +7635,122 @@ pub async fn dispatch(
             }
         }
 
+        // The Telegram account itself: its profile, its @username, its picture, and the sessions signed in to it.
+        "telegramOwnProfile" | "telegramSessions" | "setTelegramProfile" | "setTelegramUsername" | "setTelegramProfilePhoto" | "endTelegramSession" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::account as tg;
+            let done: Result<serde_json::Value, String> = match method {
+                "telegramOwnProfile" => tg::own_profile(state, account_id).await,
+                "telegramSessions" => tg::sessions(state, account_id).await,
+                "setTelegramProfile" => tg::set_profile(state, account_id, p_str_opt(params, "firstName"), p_str_opt(params, "lastName"), p_str_opt(params, "bio")).await.map(|()| ok_node()),
+                "setTelegramUsername" => tg::set_username(state, account_id, p_str(params, "username", "")).await.map(|()| ok_node()),
+                "setTelegramProfilePhoto" => tg::set_photo(state, account_id, p_str(params, "path", "")).await.map(|()| ok_node()),
+                _ => tg::end_session(state, account_id, p_str(params, "sessionId", "")).await.map(|()| ok_node()),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Making a Telegram group or channel, with the people named in it.
+        "createTelegramChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some("createTelegramChat requires a Telegram \"accountId\"".to_string()));
+            };
+            let broadcast = p_str(params, "kind", "group") == "channel";
+            match backend::telegram::chats::create(state, account_id, p_str(params, "title", ""), broadcast, p_str(params, "about", ""), p_str(params, "members", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A Telegram group or channel's own settings, the people banned from it, and changing one setting.
+        "telegramChatInfo" | "telegramBanned" | "telegramChatChange" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = match method {
+                "telegramChatInfo" => backend::telegram::chats::info(state, &buffer).await,
+                "telegramBanned" => backend::telegram::chats::banned(state, &buffer).await,
+                _ => backend::telegram::chats::change(state, &buffer, p_str(params, "action", ""), params).await.map(|note| serde_json::json!({ "ok": true, "note": note })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Secret chats: asking somebody for one, the asks waiting, answering one, and a chat's timer and safety picture.
+        "startTelegramSecretChat" | "telegramSecretRequests" | "answerTelegramSecretChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::secret_flow as secret;
+            let done = match method {
+                "startTelegramSecretChat" => secret::start(state, account_id, p_str(params, "userId", "")).await.map(|b| serde_json::json!({ "bufferId": b })),
+                "telegramSecretRequests" => secret::requests(state, account_id).await,
+                _ => secret::answer(state, account_id, p_str(params, "chatId", ""), params.get("accept").and_then(|v| v.as_bool()).unwrap_or(false)).await.map(|b| serde_json::json!({ "bufferId": b })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "telegramSecretInfo" | "setTelegramSecretTimer" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = if method == "telegramSecretInfo" {
+                backend::telegram::secret_flow::info(state, &buffer).await
+            } else {
+                let seconds = params.get("seconds").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                backend::telegram::secret_flow::set_timer(state, &buffer, seconds).await.map(|()| ok_node())
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A group's or channel's voice chat: what it is like, starting it, joining with the window's offer, leaving,
+        // muting, ending, and who is in it. See backend/telegram/voicechat.rs.
+        "telegramVoice" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("telegramVoice requires a Telegram \"bufferId\"".to_string()));
+            };
+            use backend::telegram::voicechat as voice;
+            let call = p_str(params, "call", "");
+            let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let done = match p_str(params, "op", "") {
+                "info" => voice::info(state, &buffer).await,
+                "start" => voice::start(state, &buffer).await.map(|()| ok_node()),
+                "join" => voice::join(state, &buffer, call, p_str(params, "params", ""), flag("muted")).await,
+                "leave" => voice::leave(state, &buffer, call, params.get("source").and_then(|v| v.as_i64()).unwrap_or(0) as i32).await.map(|()| ok_node()),
+                "mute" => voice::mute(state, &buffer, call, flag("muted"), p_str_opt(params, "userId")).await.map(|()| ok_node()),
+                "end" => voice::end(state, &buffer, call).await.map(|()| ok_node()),
+                "participants" => voice::participants(state, &buffer, call).await,
+                other => Err(format!("telegramVoice has no \"{other}\"")),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Reporting a message to Telegram's moderators, a step at a time: the reasons, then perhaps a comment.
+        "reportTelegramMessage" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("reportTelegramMessage requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::people::report(state, &buffer, p_str(params, "messageId", ""), p_str(params, "option", ""), p_str(params, "comment", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // What this Telegram account may do to others in a conversation, and doing it.
         "telegramPermissions" | "moderateTelegramMember" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
@@ -7296,6 +7911,11 @@ pub async fn dispatch(
                     (_, true) => Err(anyhow::anyhow!("Stoat needs the person's id, not their name")),
                     (Some(handle), false) => backend::stoat::people::open_dm(state, &handle, user_id).await,
                 },
+                "signal" => match state.runtime.signal_handle(account_id) {
+                    None => Err(anyhow::anyhow!("that Signal account is not connected")),
+                    Some(handle) => backend::signal::inbox::open_dm(state, &handle, user_id).await,
+                },
+                "telegram" => backend::telegram::people::open_dm(state, account_id, user_id).await.map_err(|e| anyhow::anyhow!(e)),
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };
             match opened {
@@ -8304,9 +8924,13 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
+                ("telegram", "telegram") => match backend::telegram::people::forward(state, &source, message_id, &target).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 _ => (
                     None,
-                    Some("forwarding goes within one Discord account, or between Matrix rooms".to_string()),
+                    Some("forwarding goes within one Discord or Telegram account, or between Matrix rooms".to_string()),
                 ),
             }
         }

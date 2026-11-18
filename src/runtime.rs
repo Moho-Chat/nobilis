@@ -370,6 +370,13 @@ struct ReactionEvent {
     sender: String,
 }
 
+/// Notifications held for an account: only these conversations (by remote id), and mentions if `mentions`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Quiet {
+    pub allowed: Vec<String>,
+    pub mentions: bool,
+}
+
 /// Live, in-memory state that sits alongside the persisted AccountStore:
 /// connection state per account, active IRC senders, and the buffer
 /// registry. Mirrors what libpurple itself tracked at runtime
@@ -590,6 +597,8 @@ pub struct Runtime {
     telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
     /// A connected Stoat account's client, by account id (see backend/stoat).
     stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
+    /// A connected Signal account's way to its thread, by account id (see backend/signal).
+    signal_handles: Mutex<HashMap<String, crate::backend::signal::Handle>>,
     /// A connected XMPP account's stream, by account id (see backend/xmpp).
     xmpp_handles: Mutex<HashMap<String, crate::backend::xmpp::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
@@ -693,6 +702,9 @@ pub struct Runtime {
     /// account id -> "online" | "idle". Absent means online, which is what
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
+    /// Accounts whose service has notifications held (a Signal notification profile that is on): only these
+    /// conversations (by remote id) are announced, and mentions when it says so.
+    quiet: Mutex<HashMap<String, Quiet>>,
     /// What each account says beside its status, where the service has a place for it.
     account_status_text: Mutex<HashMap<String, String>>,
     /// Whether the person has stepped away from the machine, as the window last
@@ -1121,6 +1133,9 @@ fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
         // Groups are the usual channel; a broadcast channel moves to its own heading when its buffer is made.
         return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
     }
+    if account_id.starts_with("signal:") {
+        return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
+    }
     account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
 }
 
@@ -1171,6 +1186,7 @@ impl Runtime {
             steam_links: Mutex::new(HashMap::new()),
             telegram_handles: Mutex::new(HashMap::new()),
             stoat_handles: Mutex::new(HashMap::new()),
+            signal_handles: Mutex::new(HashMap::new()),
             xmpp_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
@@ -1193,6 +1209,7 @@ impl Runtime {
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
+            quiet: Mutex::new(HashMap::new()),
             account_status_text: Mutex::new(HashMap::new()),
             user_idle: std::sync::atomic::AtomicBool::new(false),
             discord_member_list_targets: Mutex::new(HashMap::new()),
@@ -1332,6 +1349,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::stoat_account_to_json(cfg, conn)
         }));
+        out.extend(state.accounts.all_signal().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::signal_account_to_json(cfg, conn)
+        }));
         out.extend(state.accounts.all_xmpp().iter().map(|cfg| {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
@@ -1423,6 +1445,12 @@ impl Runtime {
         if restored > 0 {
             tracing::info!("layout: restored {restored} conversation(s) from the last run");
         }
+    }
+
+    /// Whether a conversation put back from the last run is still waiting for its service to confirm it.
+    #[cfg(test)]
+    pub fn awaiting_confirmation(&self, buffer_id: &str) -> bool {
+        self.restored_buffers.lock().unwrap().contains_key(buffer_id)
     }
 
     /// Marks a restored entry as seen again from its service.
@@ -1703,6 +1731,12 @@ impl Runtime {
             }
             if let Some(avatar) = old.avatar_url {
                 self.set_buffer_avatar(state, &new_id, &avatar);
+            }
+            // And keeps the id its service knows it by. Without this the renamed conversation was no longer found by
+            // that id: an XMPP contact, room, Stoat channel or Telegram topic renamed was looked up afresh and made
+            // again, and a Signal group renamed from moho could no longer be changed or written to.
+            if let Some(remote) = old.remote_id {
+                self.set_buffer_remote_id(state, &new_id, &remote);
             }
         }
         self.refresh_buffer_activity(state, &new_id);
@@ -2496,6 +2530,26 @@ impl Runtime {
         Some(t.clone())
     }
 
+    /// Takes settled transfers out of the list, and says which went.
+    ///
+    /// Only what has finished, failed or been turned down: one that is still
+    /// offered or moving is a socket and a decision, not a line of history,
+    /// and is cancelled first if it is to go.
+    pub fn forget_dcc(&self, mut goes: impl FnMut(&DccTransfer) -> bool) -> Vec<String> {
+        let mut list = self.dcc_transfers.lock().unwrap();
+        let mut gone = Vec::new();
+        list.retain(|t| {
+            let settled = matches!(t.state, DccState::Done | DccState::Failed | DccState::Declined);
+            if settled && goes(t) {
+                gone.push(t.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        gone
+    }
+
     /// Stops everything belonging to an account that is going away.
     ///
     /// A transfer outliving the connection that carried its offer would be a
@@ -3046,6 +3100,27 @@ impl Runtime {
             all.remove(account_id);
         } else {
             all.insert(account_id.to_string(), text.to_string());
+        }
+    }
+
+    /// Holds an account's notifications to these conversations (and mentions, if `mentions`), or lets them go (`None`).
+    pub fn set_quiet(&self, account_id: &str, quiet: Option<Quiet>) {
+        let mut all = self.quiet.lock().unwrap();
+        match quiet {
+            Some(q) => {
+                all.insert(account_id.to_string(), q);
+            }
+            None => {
+                all.remove(account_id);
+            }
+        }
+    }
+
+    /// Whether a held account still announces this message.
+    fn quiet_allows(&self, account_id: &str, remote: Option<&str>, is_highlight: bool) -> bool {
+        match self.quiet.lock().unwrap().get(account_id) {
+            None => true,
+            Some(q) => (is_highlight && q.mentions) || remote.is_some_and(|r| q.allowed.iter().any(|a| a == r)),
         }
     }
 
@@ -3772,7 +3847,35 @@ impl Runtime {
     /// as a bug - and one that learned only the second could not say why.
     pub fn set_notify_level(&self, state: &AppState, buffer_id: &str, shown: crate::notify::NotifyLevel, applies: crate::notify::NotifyLevel) {
         self.notify_held.lock().unwrap().insert(buffer_id.to_string(), (shown, applies));
-        self.show_notify_level(state, buffer_id, shown, applies);
+        // Kept as the service said it; shown, and applied, as it means here
+        // (see `NotifyLevel::Direct`).
+        let levels = &state.notify_levels;
+        self.show_notify_level(state, buffer_id, levels.overlaid(buffer_id, shown), levels.overlaid(buffer_id, applies));
+    }
+
+    /// Shows a conversation's level again from what is already known, for
+    /// when what it means here changed and the service had nothing new to say.
+    pub fn reshow_notify_level(&self, state: &AppState, buffer_id: &str) {
+        let held = self.notify_held.lock().unwrap().get(buffer_id).copied();
+        if let Some((shown, applies)) = held {
+            let levels = &state.notify_levels;
+            self.show_notify_level(state, buffer_id, levels.overlaid(buffer_id, shown), levels.overlaid(buffer_id, applies));
+        }
+    }
+
+    /// Whether what is aimed at everybody is left out of this conversation's mentions.
+    pub fn direct_only(&self, state: &AppState, buffer_id: &str) -> bool {
+        self.notify_level(state, buffer_id) == crate::notify::NotifyLevel::Direct
+    }
+
+    /// Lets go of a level the account's service held on a conversation (a mute set on Signal's phone that was lifted
+    /// there), so the one chosen in this daemon applies again.
+    pub fn release_notify_level(&self, state: &AppState, buffer_id: &str) {
+        if self.notify_held.lock().unwrap().remove(buffer_id).is_none() {
+            return;
+        }
+        let local = state.notify_levels.get(buffer_id);
+        self.show_notify_level(state, buffer_id, local, local);
     }
 
     /// Sets the level of a conversation whose service has nowhere to keep one,
@@ -3806,7 +3909,7 @@ impl Runtime {
     /// account's answer where it keeps one, and this daemon's own otherwise.
     pub fn notify_level(&self, state: &AppState, buffer_id: &str) -> crate::notify::NotifyLevel {
         match self.notify_held.lock().unwrap().get(buffer_id) {
-            Some((_, applies)) => *applies,
+            Some((_, applies)) => state.notify_levels.overlaid(buffer_id, *applies),
             None => state.notify_levels.get(buffer_id),
         }
     }
@@ -4576,6 +4679,18 @@ impl Runtime {
         self.stoat_handles.lock().unwrap().get(account_id).cloned()
     }
 
+    pub fn set_signal_handle(&self, account_id: &str, handle: crate::backend::signal::Handle) {
+        self.signal_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_signal_handle(&self, account_id: &str) {
+        self.signal_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn signal_handle(&self, account_id: &str) -> Option<crate::backend::signal::Handle> {
+        self.signal_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     /// Every connected Stoat account.
     pub fn all_stoat_handles(&self) -> Vec<crate::backend::stoat::Handle> {
         self.stoat_handles.lock().unwrap().values().cloned().collect()
@@ -4840,7 +4955,14 @@ impl Runtime {
             // addressed. Only where the service acts on the word: "@everyone"
             // on IRC is somebody typing a phrase, and highlighting it would be
             // this client inventing a mention the network does not have.
-            || (spoken && from != own_nick && mentions_the_room(model::service_of(account_id), body))
+            //
+            // And not where somebody set the conversation to direct mentions
+            // only: there, a word aimed at everybody is not a mention at all,
+            // so it does not light the row, count, or announce itself.
+            || (spoken
+                && from != own_nick
+                && mentions_the_room(model::service_of(account_id), body)
+                && !self.direct_only(state, &buffer.id))
             // And the words somebody asked to be told about, which is the
             // same question asked about a different list - your name is
             // simply the one word everybody has.
@@ -4918,6 +5040,7 @@ impl Runtime {
             // returns - only Discord has any, and it is the one that knows.
             components: Vec::new(),
             moderated: None,
+            delivery: None,
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),
@@ -4958,6 +5081,7 @@ impl Runtime {
         if spoken && from != own_nick && !self.is_replaying(&buffer.id)
             && self.notify_level(state, &buffer.id).announces(is_dm, is_highlight)
             && !focused
+            && self.quiet_allows(account_id, buffer.remote_id.as_deref(), is_highlight)
         {
             state.events.emit(
                 "notification",
@@ -5042,6 +5166,16 @@ impl Runtime {
     /// resolution) - doesn't set the `edited` flag either in storage or in
     /// the emitted event, so the frontend's "(edited)" label doesn't show
     /// up for something the user never touched.
+    /// Moves one of the account's own messages on to a delivery state ("sent", "delivered", "read") and tells the
+    /// window, if that is further than it was.
+    pub fn set_message_delivery(&self, state: &AppState, buffer_id: &str, msg_id: &str, delivery: &str) {
+        match state.store.set_delivery(buffer_id, msg_id, delivery) {
+            Ok(true) => state.events.emit("messageDelivery", serde_json::json!({ "bufferId": buffer_id, "messageId": msg_id, "delivery": delivery })),
+            Ok(false) => {}
+            Err(e) => tracing::debug!("keeping how far {msg_id} got: {e:#}"),
+        }
+    }
+
     pub fn update_message_body_only(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str) -> bool {
         match state.store.update_message_body_silent(buffer_id, msg_id, body) {
             Ok(true) => {
@@ -5200,6 +5334,17 @@ impl Runtime {
 mod tests {
 
     #[test]
+    fn a_renamed_conversation_keeps_the_id_its_service_knows_it_by() {
+        let state = crate::backend::kick::testkit::simulated_daemon("rename-keeps-remote");
+        let buffer = state.runtime.ensure_buffer(&state, "xmpp:me@example.org", "Alice", "dm");
+        state.runtime.set_buffer_remote_id(&state, &buffer.id, "alice@example.org");
+        state.runtime.rename_buffer(&state, "xmpp:me@example.org", "Alice", "Alice Smith", "dm");
+        let renamed = state.runtime.get_buffer(&crate::model::buffer_id("xmpp:me@example.org", "Alice Smith")).expect("renamed");
+        assert_eq!(renamed.remote_id.as_deref(), Some("alice@example.org"));
+        assert!(state.runtime.get_buffer(&buffer.id).is_none());
+    }
+
+    #[test]
     fn a_cache_stops_at_its_ceiling() {
         let mut map: HashMap<u32, u32> = HashMap::new();
         for i in 0..20 {
@@ -5273,6 +5418,75 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct mentions only: what is aimed at everybody is not a mention of
+    /// you, and what is aimed at you still is.
+    ///
+    /// On Sneedchat, which keeps no level of its own (so the daemon's is the
+    /// whole of it), and on Discord, where the account keeps "mentions only"
+    /// and that the room-wide ones are left out is this daemon's.
+    #[tokio::test]
+    async fn direct_mentions_only_leaves_out_what_is_aimed_at_everybody() {
+        use crate::notify::NotifyLevel;
+        let state = crate::backend::kick::testkit::simulated_daemon("direct-mentions");
+        let flagged = |account: &str, room: &str| -> Vec<(String, bool)> {
+            state
+                .store
+                .get_backlog(&crate::model::buffer_id(account, room), 0, 20)
+                .expect("backlog")
+                .iter()
+                .map(|m| (m.body.clone(), m.is_highlight))
+                .collect()
+        };
+        let say = |account: &str, room: &str, body: &str, forced: bool| {
+            state.runtime.record_message(
+                &state, account, room, "channel", "stranger", body, false, "chat",
+                None, None, forced, None, Vec::new(), Vec::new(), None,
+            );
+        };
+
+        // Kept by the daemon.
+        let sneed = "sneedchat:tester";
+        state.runtime.set_own_identity(sneed, "Salastil");
+        say(sneed, "#room", "@everyone look at this", false);
+        let buffer = state.runtime.get_buffer(&crate::model::buffer_id(sneed, "#room")).expect("the room");
+        crate::notify::set_level(&state, &buffer, NotifyLevel::Direct).await.expect("kept here");
+        assert_eq!(state.runtime.notify_level(&state, &buffer.id), NotifyLevel::Direct);
+        say(sneed, "#room", "@everyone and again", false);
+        say(sneed, "#room", "@everyone but Salastil in particular", false);
+        assert_eq!(
+            flagged(sneed, "#room"),
+            vec![
+                ("@everyone look at this".to_string(), true),
+                ("@everyone and again".to_string(), false),
+                ("@everyone but Salastil in particular".to_string(), true),
+            ]
+        );
+
+        // Kept by the account: Discord says "mentions only", and here that reads as direct once it was asked for.
+        let discord = "discord:1";
+        say(discord, "Guild/#general", "@here raid in five", false);
+        let id = crate::model::buffer_id(discord, "Guild/#general");
+        state.runtime.set_notify_level(&state, &id, NotifyLevel::Mentions, NotifyLevel::Mentions);
+        assert_eq!(state.runtime.notify_level(&state, &id), NotifyLevel::Mentions);
+        state.notify_levels.set_direct(&id, true);
+        state.runtime.reshow_notify_level(&state, &id);
+        assert_eq!(state.runtime.get_buffer(&id).expect("the channel").notify, NotifyLevel::Direct);
+        say(discord, "Guild/#general", "@here raid in two", false);
+        // Discord's own word that this account was named, which is not a word in the body.
+        say(discord, "Guild/#general", "@everyone and <@1> especially", true);
+        assert_eq!(
+            flagged(discord, "Guild/#general"),
+            vec![
+                ("@here raid in five".to_string(), true),
+                ("@here raid in two".to_string(), false),
+                ("@everyone and <@1> especially".to_string(), true),
+            ]
+        );
+        // Set to everything from a phone: the account's word, not quietly something else here.
+        state.runtime.set_notify_level(&state, &id, NotifyLevel::All, NotifyLevel::All);
+        assert_eq!(state.runtime.notify_level(&state, &id), NotifyLevel::All);
     }
 
     /// Two accounts can be in the same room, and each has its own buffer for
@@ -5859,7 +6073,7 @@ impl Runtime {
         }
 
         sweep!(
-            conn_states, connected_at, irc_handles, buffers,
+            conn_states, connected_at, irc_handles, buffers, quiet,
             buffer_groups, task_handles, last_connect_attempt,
             restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,
@@ -5868,7 +6082,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, xmpp_handles, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

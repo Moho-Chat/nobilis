@@ -351,6 +351,9 @@ async fn run() -> Result<()> {
     for cfg in state.accounts.all_stoat() {
         backend::stoat::spawn(state.clone(), cfg);
     }
+    for cfg in state.accounts.all_signal() {
+        backend::signal::spawn(state.clone(), cfg);
+    }
     for cfg in state.accounts.all_xmpp() {
         backend::xmpp::spawn(state.clone(), cfg);
     }

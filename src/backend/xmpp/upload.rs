@@ -24,7 +24,9 @@ pub fn content_type_of(name: &str) -> &'static str {
         "mkv" => "video/x-matroska",
         "mp3" => "audio/mpeg",
         "ogg" | "oga" | "opus" => "audio/ogg",
-        "m4a" | "aac" => "audio/mp4",
+        // An .m4a is audio in an MP4 container; a bare .aac is the raw stream, which is not.
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
         "wav" => "audio/wav",
         "flac" => "audio/flac",
         "pdf" => "application/pdf",
@@ -179,6 +181,8 @@ mod tests {
     fn a_files_type_comes_from_its_name() {
         assert_eq!(content_type_of("A.PNG"), "image/png");
         assert_eq!(content_type_of("x.opus"), "audio/ogg");
+        assert_eq!(content_type_of("song.M4A"), "audio/mp4");
+        assert_eq!(content_type_of("raw.aac"), "audio/aac");
         assert_eq!(content_type_of("noext"), "application/octet-stream");
     }
 }

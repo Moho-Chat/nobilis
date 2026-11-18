@@ -665,6 +665,73 @@ impl XmppAccountConfig {
     }
 }
 
+/// A Signal account, linked to as a secondary device the way Signal Desktop is: the person scans a code shown here
+/// with Signal on their phone. Moho never registers a number and never answers a captcha (see backend/signal).
+///
+/// What the account is - the identity keys, the sessions with every correspondent, the profile key - is large, secret
+/// and changes with every message, so it is a file of its own in the daemon's data directory (backend/signal/store),
+/// not a field of this record. What is here is what the sidebar and the connection need to find it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SignalAccountConfig {
+    /// Signal's id for the account (the ACI, a UUID). It never changes with the number, and the account's id here is
+    /// built from it.
+    #[serde(default)]
+    pub aci: String,
+    /// The id Signal keeps for the account's number (the PNI). Only kept so the account can be recognised.
+    #[serde(default)]
+    pub pni: String,
+    /// The number the account was made with, in international form. Shown masked; this file is private to the owner.
+    #[serde(default)]
+    pub number: String,
+    /// This device's number among the account's devices (the phone is 1).
+    #[serde(default)]
+    pub device_id: u32,
+    /// The name the phone's list of linked devices shows for this one.
+    #[serde(default)]
+    pub device_name: String,
+    /// What to call this account here. Local: Signal is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+    /// When this device last held a connection to Signal (seconds since the epoch), `0` for never. Signal unlinks a
+    /// device it has not heard from for about thirty days, which is worth saying when that is what happened.
+    #[serde(default)]
+    pub last_connected: i64,
+}
+
+impl SignalAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("signal:{}", self.aci)
+    }
+
+    /// Whether there is a link behind this account: one that has been through is what has an id.
+    pub fn is_signed_in(&self) -> bool {
+        !self.aci.is_empty() && self.device_id != 0
+    }
+
+    /// The number with all but its first three and last two digits hidden (`+15••••••67`), for the sidebar and the
+    /// log: an account is recognised by it without it being read out.
+    pub fn masked_number(&self) -> String {
+        mask_number(&self.number)
+    }
+}
+
+/// See `SignalAccountConfig::masked_number`. Anything too short to hide part of is hidden entirely.
+pub fn mask_number(number: &str) -> String {
+    let chars: Vec<char> = number.chars().collect();
+    if chars.len() < 8 {
+        return if chars.is_empty() { String::new() } else { "•".repeat(chars.len()) };
+    }
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}{}{tail}", "•".repeat(chars.len() - 5))
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -689,6 +756,8 @@ struct AccountsFile {
     telegram: Vec<TelegramAccountConfig>,
     #[serde(default, rename = "stoat_account")]
     stoat: Vec<StoatAccountConfig>,
+    #[serde(default, rename = "signal_account")]
+    signal: Vec<SignalAccountConfig>,
     #[serde(default, rename = "xmpp_account")]
     xmpp: Vec<XmppAccountConfig>,
 }
@@ -713,6 +782,8 @@ pub struct AccountStore {
     /// And this one.
     telegram: Mutex<HashMap<String, TelegramAccountConfig>>,
     /// And this one.
+    signal: Mutex<HashMap<String, SignalAccountConfig>>,
+    /// And this one.
     stoat: Mutex<HashMap<String, StoatAccountConfig>>,
     /// And this one.
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
@@ -726,7 +797,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -741,9 +812,10 @@ impl AccountStore {
             let telegram = file.telegram.into_iter().map(|a| (a.account_id(), a)).collect();
             let stoat = file.stoat.into_iter().map(|a| (a.account_id(), a)).collect();
             let xmpp = file.xmpp.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp)
+            let signal = file.signal.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -751,6 +823,7 @@ impl AccountStore {
             discord: Mutex::new(discord),
             sneedchat: Mutex::new(sneedchat),
             matrix: Mutex::new(matrix),
+            signal: Mutex::new(signal),
             kick: Mutex::new(kick),
             steam: Mutex::new(steam),
             twitch: Mutex::new(twitch),
@@ -775,6 +848,7 @@ impl AccountStore {
             irc: irc.values().cloned().collect(),
             discord: discord.values().cloned().collect(),
             sneedchat: sneedchat.values().cloned().collect(),
+            signal: self.signal.lock().unwrap().values().cloned().collect(),
             matrix: matrix.values().cloned().collect(),
             kick: kick.values().cloned().collect(),
             steam: self.steam.lock().unwrap().values().cloned().collect(),
@@ -813,6 +887,12 @@ impl AccountStore {
             || self.get_sneedchat(account_id).is_some()
             || self.get_matrix(account_id).is_some()
             || self.get_kick(account_id).is_some()
+            || self.get_steam(account_id).is_some()
+            || self.get_twitch(account_id).is_some()
+            || self.get_telegram(account_id).is_some()
+            || self.get_stoat(account_id).is_some()
+            || self.get_xmpp(account_id).is_some()
+            || self.get_signal(account_id).is_some()
     }
 
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
@@ -1163,6 +1243,48 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_signal(&self, account_id: &str) -> Option<SignalAccountConfig> {
+        self.signal.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_signal(&self) -> Vec<SignalAccountConfig> {
+        self.signal.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: linking the same account again is how a link Signal has ended gets replaced. What the person set up on
+    /// the account - its route, its name here - stays.
+    pub fn add_signal(&self, mut config: SignalAccountConfig) -> Result<SignalAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut signal = self.signal.lock().unwrap();
+            if let Some(old) = signal.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            signal.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Signal account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_signal(&self, account_id: &str, change: impl FnOnce(&mut SignalAccountConfig)) -> Result<bool> {
+        {
+            let mut signal = self.signal.lock().unwrap();
+            match signal.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
     pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
@@ -1317,6 +1439,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.signal.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -1354,6 +1480,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_xmpp(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_signal(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1459,6 +1588,13 @@ impl AccountStore {
         }
         {
             let removed = self.xmpp.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.signal.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1637,6 +1773,9 @@ impl AccountStore {
         if self.mutate_xmpp(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_signal(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -1680,6 +1819,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.xmpp.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.signal.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -2163,6 +2305,49 @@ pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
     }
 }
 
+/// Signal has none of IRC's concepts either. `has_password` says there is a link behind the account.
+pub fn signal_account_to_json(a: &SignalAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "signal".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.masked_number()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.aci.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        stop_reason: String::new(),
+    }
+}
+
 /// Matrix has none of IRC's autojoin/SASL/NickServ concepts either - same
 /// zero-value convention as discord_account_to_json/sneedchat_account_to_json.
 /// `has_key_backup` comes from the caller (Runtime::list_accounts) rather
@@ -2582,5 +2767,95 @@ mod xmpp_account_tests {
         let named = xmpp_account_to_json(&XmppAccountConfig { display_name: Some("Me".into()), ..account("alice@example.org") }, "connected");
         assert_eq!(named.display_name, "Me");
         assert_eq!(crate::model::service_of("xmpp:alice@example.org"), "xmpp");
+    }
+}
+
+#[cfg(test)]
+mod signal_account_tests {
+    use super::*;
+
+    fn store(name: &str) -> (AccountStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("nobilis-signal-accounts-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        (AccountStore::open(path.clone()).unwrap(), path)
+    }
+
+    fn account(aci: &str) -> SignalAccountConfig {
+        SignalAccountConfig { aci: aci.into(), pni: "00000000-0000-4000-8000-0000000000aa".into(), number: "+15550100123".into(), device_id: 2, device_name: "moho (linux)".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_signal_account_survives_a_restart_and_is_found_by_the_id_built_from_its_aci() {
+        let (s, path) = store("restart");
+        s.add_signal(account("11111111-1111-4111-8111-111111111111")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[signal_account]]"), "{text}");
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        let got = reopened.get_signal("signal:11111111-1111-4111-8111-111111111111").expect("found");
+        assert_eq!((got.device_id, got.device_name.as_str()), (2, "moho (linux)"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn linking_again_keeps_what_the_person_set_and_removing_forgets() {
+        let (s, path) = store("again");
+        s.add_signal(account("a")).unwrap();
+        s.add_signal(account("b")).unwrap();
+        s.set_route_level("signal:a", "strict").unwrap();
+        s.set_display_name("signal:a", "Me on Signal").unwrap();
+        s.add_signal(SignalAccountConfig { device_id: 3, ..account("a") }).unwrap();
+        let got = s.get_signal("signal:a").unwrap();
+        assert_eq!((got.device_id, got.display_name.as_deref(), got.strict_route), (3, Some("Me on Signal"), true));
+        assert_eq!(s.route_level_of("signal:a").as_deref(), Some("strict"));
+        assert_eq!(s.all_signal().len(), 2);
+        assert!(s.remove("signal:a").unwrap());
+        assert!(!s.remove("signal:a").unwrap());
+        assert!(s.get_signal("signal:b").is_some());
+        assert!(AccountStore::open(path.clone()).unwrap().get_signal("signal:a").is_none(), "the file forgot too");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn the_listing_never_reads_the_number_out() {
+        let listed = signal_account_to_json(&account("c"), "connected");
+        assert_eq!((listed.service.as_str(), listed.id.as_str(), listed.has_password), ("signal", "signal:c", true));
+        assert_eq!(listed.display_name, "+15•••••••23");
+        assert!(!listed.display_name.contains("0100"));
+        let named = signal_account_to_json(&SignalAccountConfig { display_name: Some("Me".into()), ..account("c") }, "connected");
+        assert_eq!(named.display_name, "Me");
+        let unlinked = signal_account_to_json(&SignalAccountConfig { device_id: 0, ..account("c") }, "connected");
+        assert!(!unlinked.has_password);
+    }
+
+    #[test]
+    fn a_short_number_is_hidden_whole() {
+        assert_eq!(mask_number(""), "");
+        assert_eq!(mask_number("+1234"), "•••••");
+        assert_eq!(mask_number("+4915112345678"), "+49•••••••••78");
+    }
+}
+
+#[cfg(test)]
+mod has_account_tests {
+    use super::*;
+
+    #[test]
+    fn every_service_s_account_is_known_so_its_conversations_are_put_back_at_start() {
+        let path = std::env::temp_dir().join(format!("nobilis-has-account-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = AccountStore::open(path.clone()).unwrap();
+        let ids = [
+            s.add_steam(SteamAccountConfig { username: "steamer".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_twitch(TwitchAccountConfig { login: "twitcher".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_telegram(TelegramAccountConfig { user_id: 42, ..Default::default() }).unwrap().account_id(),
+            s.add_stoat(StoatAccountConfig { user_id: "01STOAT".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_xmpp(XmppAccountConfig { jid: "alice@example.org".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_signal(SignalAccountConfig { aci: "00000000-0000-4000-8000-000000000009".into(), ..Default::default() }).unwrap().account_id(),
+        ];
+        for id in &ids {
+            assert!(s.has_account(id), "{id} is not known, so the layout restore drops its conversations");
+        }
+        assert!(!s.has_account("xmpp:nobody@example.org"));
+        let _ = std::fs::remove_file(&path);
     }
 }

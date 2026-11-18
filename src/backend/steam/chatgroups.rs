@@ -871,7 +871,10 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             }
             learn(account_id, roster, [sender]);
             let from_us = sender == own;
-            let mentioned = n.mentions.as_ref().is_some_and(|m| m.mention_all.unwrap_or(false) || m.mention_here.unwrap_or(false) || m.mention_accountids.contains(&own));
+            // Everybody, everybody online, or this account by name - the first two only where the room has not been set to
+            // direct mentions only.
+            let everybody_counts = !state.runtime.direct_only(state, &crate::model::buffer_id(account_id, &name));
+            let mentioned = n.mentions.as_ref().is_some_and(|m| (everybody_counts && (m.mention_all.unwrap_or(false) || m.mention_here.unwrap_or(false))) || m.mention_accountids.contains(&own));
             if !roster.has_name(sender) && sender != 0 {
                 out.ask.push(sender);
             }
@@ -1516,7 +1519,7 @@ pub async fn act(state: &AppState, account_id: &str, action: Action) -> Result<V
 pub async fn set_level(state: &AppState, account_id: &str, group: u64, level: NotifyLevel) -> Result<(), String> {
     let (told, muted) = match level {
         NotifyLevel::Mute => (NOTIFY_NONE, true),
-        NotifyLevel::Mentions => (NOTIFY_MENTION_ME, false),
+        NotifyLevel::Mentions | NotifyLevel::Direct => (NOTIFY_MENTION_ME, false),
         NotifyLevel::All => (NOTIFY_ALL, false),
         NotifyLevel::Default => (with(account_id, |a| a.groups.get(&group).map(|g| if g.clan.is_some() { NOTIFY_MENTION_ME } else { NOTIFY_ALL })).unwrap_or(NOTIFY_ALL), false),
     };

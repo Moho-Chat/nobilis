@@ -40,3 +40,5 @@ GPL-3.0-or-later. See [LICENSE](LICENSE).
 The XMPP backend uses the xmpp-rs crates (`tokio-xmpp`, `xmpp-parsers`, `jid`, `minidom`, `sasl`, `xso`), which are MPL-2.0: their own files stay
 under that licence, and the daemon as a whole is distributed under the GPL as above, which MPL-2.0 section 3.3 allows. Nothing of
 theirs is modified. The OMEMO (Signal protocol) code in `src/backend/xmpp/omemo/` is written here from the specifications.
+
+The Signal backend uses Signal's `libsignal` and the Whisperfish crates built on it (`libsignal-service-rs`, `presage`), which are licensed **AGPL-3.0**. GPL-3.0 section 13 allows the two to be combined, and the combination as a whole is then offered under the terms of the AGPL as well: anyone who uses this daemon over a network must be able to get its source, which is this repository. Signal's fork of `curve25519-dalek` (BSD-3-Clause) replaces the upstream crate everywhere in the build, and a few `libcrux` crates are vendored in `vendor/` with one dependency pin loosened (see `Cargo.toml` for why).

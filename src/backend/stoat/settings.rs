@@ -87,7 +87,7 @@ pub fn with_channel_level(settings: &Value, channel: &str, level: NotifyLevel) -
         NotifyLevel::All => {
             levels.insert(channel.to_string(), json!("all"));
         }
-        NotifyLevel::Mentions => {
+        NotifyLevel::Mentions | NotifyLevel::Direct => {
             levels.insert(channel.to_string(), json!("mention"));
         }
         NotifyLevel::Default => {}

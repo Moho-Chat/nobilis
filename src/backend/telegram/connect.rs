@@ -174,8 +174,11 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
     let updates = link.updates.take().context("the updates were already taken")?;
     let mut stream = link.client.stream_updates(updates, UpdatesConfiguration { catch_up: true }).await.map_err(|e| anyhow::anyhow!("starting to read updates: {e}"))?;
     let mut save = tokio::time::interval(SAVE_EVERY);
+    // Online, said again before Telegram forgets it (or offline, said once more): see account.rs.
+    let mut presence = tokio::time::interval(super::account::ONLINE_EVERY);
     loop {
         tokio::select! {
+            _ = presence.tick() => super::account::apply_presence(state, account_id, &handle).await,
             _ = save.tick() => {
                 if let Err(e) = link.session.save_if_dirty() {
                     tracing::warn!("telegram[{account_id}]: saving the session: {e:#}");

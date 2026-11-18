@@ -56,7 +56,7 @@ davey = "0.1"
 # `image` for reading Discord's login code, `svg` (a default) for drawing
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Telegram backend (MTProto, pure Rust). `grammers-session` without its default `sqlite-storage` (libsql would sit
@@ -64,7 +64,25 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 grammers-client = { version = "=0.11.0", default-features = false, features = ["proxy", "fs"] }
 grammers-mtsender = { version = "=0.11.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
+# Secret chats: the DH check and AES-IGE grammers itself uses, the big numbers for the key, MD5 for a file key's fingerprint.
+grammers-crypto = "=0.11.0"
+num-bigint = "0.5"
+md5 = "0.8"
 
+# Signal backend (linked secondary device): presage is Whisperfish's client library over libsignal-service-rs and Signal's
+# own libsignal. All AGPL-3.0, pinned to a commit (its libsignal-service-rs and libsignal pins ride with it). The store
+# crate presage-store-sqlite is NOT used - it wants libsqlite3-sys 0.36 + SQLCipher, rusqlite here brings 0.38 - the Store
+# trait is implemented in backend/signal/store.rs instead. No `cdsi` (BoringSSL).
+presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false, features = ["cdsi"] }
+# Reading the message history a phone transfers to a newly linked device (Signal's backup format), at the libsignal
+# version presage uses. `test-util` makes its generated protobuf types public; nothing else of it is used.
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+# The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
+async-trait = "0.1"
+uuid = "1"
+# The rand 0.9 generators the Signal library's group encryption takes (the daemon itself is on 0.8).
+rand09 = { package = "rand", version = "0.9" }
 # XMPP backend: the xmpp-rs stack (MPL-2.0, which GPLv3 can include). `ring`, not the default aws-lc-rs, so the one TLS
 # provider main.rs installs is the one these use and no C compiler is needed - see backend/xmpp.
 tokio-xmpp = { version = "6.0", default-features = false, features = ["ring", "starttls", "direct-tls", "rustls-native-certs"] }
@@ -149,6 +167,8 @@ hickory-resolver = "0.26"
 idna = "1"
 thiserror = "2"
 x509-parser = { version = "0.17", default-features = false }
+rqrr = "0.10"
+protobuf = "3.7"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.
@@ -169,6 +189,29 @@ libc = "0.2"
 # which it has. Reported upstream; drop this once a release carries the fix.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+# DAVE (Discord voice, davey -> openmls -> hpke-rs) uses libcrux crates that pin hax-lib =0.3.6; libsignal's own, newer
+# libcrux crates want hax-lib ^0.3.7, and cargo keeps one hax-lib per 0.3 series. hax-lib is proof annotations only, so the
+# four older crates are vendored (vendor/libcrux-*, unchanged but for that one line, "=0.3.6" -> ">=0.3.6, <0.4").
+libcrux-intrinsics-0-0-6 = { path = "vendor/libcrux-intrinsics-0.0.6", package = "libcrux-intrinsics" }
+libcrux-ml-kem-0-0-8 = { path = "vendor/libcrux-ml-kem-0.0.8", package = "libcrux-ml-kem" }
+libcrux-secrets-0-0-5 = { path = "vendor/libcrux-secrets-0.0.5", package = "libcrux-secrets" }
+libcrux-sha3-0-0-8 = { path = "vendor/libcrux-sha3-0.0.8", package = "libcrux-sha3" }
+core-models-0-0-5 = { path = "vendor/core-models-0.0.5", package = "core-models" }
+# libsignal builds against Signal's own curve25519-dalek (extra functions it calls); a patch is global, so every other
+# crate here that uses dalek (Tor, Matrix) gets the fork too - same version number, checked by the build.
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
+
+# The service layer under presage, patched so an account's connections can be routed through Tor or a SOCKS5 proxy and
+# carry moho's own user agent: see vendor/libsignal-service-rs/PATCHED.md.
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "vendor/libsignal-service-rs" }
+# presage itself, patched so the link previews it fetches when sending follow the account's route and the person's
+# setting: see vendor/presage/PATCHED.md.
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
+
+[dev-dependencies]
+tempfile = "3"
 
 # Local debug builds keep line numbers for backtraces and not the full debug
 # information, which made each one several times the size of the program. A
