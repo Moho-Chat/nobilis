@@ -48,8 +48,11 @@ pub async fn own_profile(state: &AppState, account_id: &str) -> Result<Value, St
 const NAME_MAX: usize = 64;
 const BIO_MAX: usize = 70;
 
+/// A first name, last name and bio, each `None` where it is not being changed.
+pub type ProfileChange = (Option<String>, Option<String>, Option<String>);
+
 /// The profile's fields, checked before they are sent: a first name is required, the rest may be empty.
-pub fn checked_profile(first: Option<&str>, last: Option<&str>, bio: Option<&str>) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+pub fn checked_profile(first: Option<&str>, last: Option<&str>, bio: Option<&str>) -> Result<ProfileChange, String> {
     let first = first.map(|s| s.trim().to_string());
     let last = last.map(|s| s.trim().to_string());
     let bio = bio.map(|s| s.trim().to_string());
