@@ -2453,6 +2453,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::list(&handle, &buffer).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             if !buffer.account_id.starts_with("discord:") {
                 return (None, Some("that is not a Discord conversation".to_string()));
             }
@@ -2472,6 +2478,12 @@ pub async fn dispatch(
             };
             let sort = p_str_opt(params, "sort").unwrap_or("active");
             let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::forum_posts(&handle, &buffer, sort, offset).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::list_forum_posts(state, &buffer.account_id, buffer_id, sort, offset).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2488,6 +2500,12 @@ pub async fn dispatch(
                 return (None, Some("no such conversation".to_string()));
             };
             let tags: Vec<String> = params.get("tags").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::create_post(state, &handle, &buffer, title, body, &tags).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::create_forum_post(state, &buffer.account_id, buffer_id, title, body, &tags).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2503,6 +2521,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::open(state, &handle, thread_id).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::open_thread(state, &buffer.account_id, buffer_id, thread_id).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),

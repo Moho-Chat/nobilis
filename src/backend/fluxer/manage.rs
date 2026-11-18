@@ -97,7 +97,7 @@ fn powers(handle: &Handle, guild: &str) -> Value {
     let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
     let Some(g) = world.guilds.get(guild) else { return json!({}) };
     // The guild-wide mask is the permissions in a channel with no overwrites.
-    let probe = world::Channel { id: String::new(), kind: Kind::Text, guild: Some(guild.to_string()), name: String::new(), topic: None, position: 0, parent: None, overwrites: Vec::new(), nsfw: false, recipients: Vec::new(), icon: None, slowmode: 0, last_message_id: None, url: None };
+    let probe = world::Channel { id: String::new(), kind: Kind::Text, guild: Some(guild.to_string()), name: String::new(), topic: None, position: 0, parent: None, overwrites: Vec::new(), nsfw: false, recipients: Vec::new(), icon: None, slowmode: 0, last_message_id: None, url: None, tags: Vec::new(), joined: false };
     let bits = world.permissions(&probe);
     let has = |b: u64| bits & b != 0;
     json!({

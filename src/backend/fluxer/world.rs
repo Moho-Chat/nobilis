@@ -160,6 +160,10 @@ pub struct Channel {
     pub slowmode: u64,
     pub last_message_id: Option<String>,
     pub url: Option<String>,
+    /// A forum's tags, as Fluxer gives them (`available_tags`).
+    pub tags: Vec<Value>,
+    /// A thread's own membership: whether this account has joined it.
+    pub joined: bool,
 }
 
 pub fn parse_channel(v: &Value, guild: Option<&str>) -> Option<Channel> {
@@ -184,6 +188,8 @@ pub fn parse_channel(v: &Value, guild: Option<&str>) -> Option<Channel> {
         slowmode: v["rate_limit_per_user"].as_u64().unwrap_or(0),
         last_message_id: v["last_message_id"].as_str().map(str::to_string),
         url: v["url"].as_str().map(str::to_string),
+        tags: v["available_tags"].as_array().cloned().unwrap_or_default(),
+        joined: v["member"].is_object(),
     })
 }
 
@@ -290,7 +296,7 @@ impl World {
             }
         }
         self.channels.retain(|_, c| c.guild.as_deref() != Some(&id) || c.kind == Kind::Thread);
-        for c in g["channels"].as_array().into_iter().flatten() {
+        for c in g["channels"].as_array().into_iter().flatten().chain(g["threads"].as_array().into_iter().flatten()) {
             if let Some(channel) = parse_channel(c, Some(&id)) {
                 guild.channels.push(channel.id.clone());
                 self.channels.insert(channel.id.clone(), channel);

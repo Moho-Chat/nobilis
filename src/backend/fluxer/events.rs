@@ -44,9 +44,9 @@ fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &st
 /// and its category, and told whether the account may write in it.
 pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, place: i64, heading: Option<(&str, i64)>) {
     let account_id = &handle.account_id;
-    // Categories are headings, a link channel is only a link, and threads and forums are a later round. A voice channel
-    // is a conversation too: it has a call, and messages beside it.
-    if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Thread | Kind::Forum | Kind::Other(_)) {
+    // Categories are headings and a link channel is only a link. A voice channel is a conversation too: it has a call,
+    // and messages beside it. A forum is a list of posts; a thread is a conversation once this account has joined it.
+    if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Other(_)) || (channel.kind == Kind::Thread && !channel.joined) {
         return;
     }
     let (title, read_only, avatar, unread) = {
@@ -104,9 +104,11 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
     let icon = match channel.kind {
         Kind::Announcement => Some("campaign"),
         Kind::Voice => Some("volume_up"),
+        Kind::Thread => Some("forum"),
         _ => None,
     };
     state.runtime.set_buffer_name_icon(state, &buffer.id, icon);
+    state.runtime.set_buffer_forum(state, &buffer.id, channel.kind == Kind::Forum);
     if let Some(url) = avatar {
         state.runtime.set_buffer_avatar(state, &buffer.id, &media::cached(account_id, media::AVATARS, &url, None, Some("image/webp")));
     }
@@ -116,7 +118,7 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
 }
 
 /// A guild's channels, under its categories, in its own order.
-fn register_guild_channels(state: &AppState, handle: &Handle, guild_id: &str) {
+pub fn register_guild_channels(state: &AppState, handle: &Handle, guild_id: &str) {
     let channels: Vec<Channel> = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let Some(guild) = world.guilds.get(guild_id) else { return };
@@ -124,10 +126,25 @@ fn register_guild_channels(state: &AppState, handle: &Handle, guild_id: &str) {
     };
     let mut categories: Vec<&Channel> = channels.iter().filter(|c| c.kind == Kind::Category).collect();
     categories.sort_by_key(|c| (c.position, c.id.parse::<u64>().unwrap_or(0)));
-    let mut rest: Vec<&Channel> = channels.iter().filter(|c| c.kind != Kind::Category).collect();
+    let mut rest: Vec<&Channel> = channels.iter().filter(|c| c.kind != Kind::Category && c.kind != Kind::Thread).collect();
     rest.sort_by_key(|c| (c.position, c.id.parse::<u64>().unwrap_or(0)));
-    for (place, channel) in rest.iter().enumerate() {
-        let heading = channel.parent.as_ref().and_then(|p| categories.iter().position(|c| &c.id == p).map(|at| (categories[at].name.as_str(), at as i64 + 1)));
+    // A thread goes just after the channel it is in, under the same heading.
+    let mut ordered: Vec<&Channel> = Vec::new();
+    for channel in rest {
+        ordered.push(channel);
+        let mut threads: Vec<&Channel> = channels.iter().filter(|t| t.kind == Kind::Thread && t.parent.as_deref() == Some(channel.id.as_str())).collect();
+        threads.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(0));
+        ordered.extend(threads);
+    }
+    let parent_of = |c: &Channel| -> Option<String> {
+        if c.kind == Kind::Thread {
+            c.parent.as_ref().and_then(|p| channels.iter().find(|x| &x.id == p)).and_then(|p| p.parent.clone())
+        } else {
+            c.parent.clone()
+        }
+    };
+    for (place, channel) in ordered.iter().enumerate() {
+        let heading = parent_of(channel).and_then(|p| categories.iter().position(|c| c.id == p).map(|at| (categories[at].name.as_str(), at as i64 + 1)));
         register_channel(state, handle, channel, place as i64, heading);
     }
 }
@@ -434,7 +451,21 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 register_guild_channels(state, handle, &g);
             }
         }
-        "CHANNEL_DELETE" => {
+        "THREAD_CREATE" | "THREAD_UPDATE" => {
+            let channel = {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                let was_joined = data["id"].as_str().and_then(|id| world.channels.get(id)).is_some_and(|c| c.joined);
+                let id = world.put_channel(data);
+                if let Some(c) = id.as_ref().and_then(|id| world.channels.get_mut(id)) {
+                    c.joined |= was_joined;
+                }
+                id.and_then(|id| world.channels.get(&id).cloned())
+            };
+            if let Some(c) = channel.filter(|c| c.joined) {
+                redraw_guild(state, handle, c.guild.clone().as_deref(), Some(&c));
+            }
+        }
+        "THREAD_DELETE" | "CHANNEL_DELETE" => {
             if let Some(id) = data["id"].as_str() {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).remove_channel(id);
                 if let Some(buffer) = messages::buffer_of(state, account_id, id) {

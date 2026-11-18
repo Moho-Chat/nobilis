@@ -267,7 +267,8 @@ async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, r
 }
 
 fn identify(token: &str) -> Value {
-    json!({ "op": 2, "d": { "token": token, "properties": properties() } })
+    // Flag 1 << 2, CHANNEL_THREADS: this client reads threads, forums and media channels (`gateway/threads.md`).
+    json!({ "op": 2, "d": { "token": token, "properties": properties(), "flags": 1 << 2 } })
 }
 
 /// Makes the guild a channel is in active for the session, so its messages and typing are heard (see the module's

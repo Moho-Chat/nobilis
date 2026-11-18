@@ -48,6 +48,7 @@ pub mod profile;
 pub mod search;
 pub mod send;
 pub mod settings;
+pub mod threads;
 pub mod voice;
 pub mod world;
 

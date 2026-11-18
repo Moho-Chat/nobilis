@@ -213,6 +213,8 @@ impl Api {
 
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         // The session goes in `Authorization`, bare, as a user's does (`authentication.md`).
+        // A user session sees threads and forums only when it says it can read them (`http-api/threads.mdx`).
+        let request = request.header("X-Fluxer-Features", "channel_threads");
         match &self.token {
             Some(token) => request.header("Authorization", token),
             None => request,
