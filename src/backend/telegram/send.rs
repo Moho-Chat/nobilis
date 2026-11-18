@@ -141,7 +141,7 @@ async fn send_in_topic(state: &AppState, buffer: &Buffer, body: &str, reply_to: 
 }
 
 /// The id Telegram gave a message that was sent with `random_id`, from what it answered.
-fn sent_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
+pub(crate) fn sent_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
     use tl::enums::Updates as U;
     let list: &[tl::enums::Update] = match updates {
         U::Updates(u) => &u.updates,

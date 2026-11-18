@@ -33,6 +33,7 @@
 //! - `folders` - the account's chat folders, kept in step with moho's categories
 //! - `gifs` - saved GIFs and the GIF search
 //! - `stickers` - the account's sticker packs, and sending one
+//! - `people` - a person met in a group: a conversation with them, blocking, who reacted; forwarding and reporting
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -67,6 +68,7 @@ pub mod members;
 pub mod membership;
 pub mod messages;
 pub mod notify;
+pub mod people;
 pub mod peers;
 pub mod pins;
 pub mod polls;
