@@ -118,7 +118,7 @@ async fn buffer_for(state: &AppState, account_id: &str, handle: &Handle, chat: &
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_buffer_remote_id(state, &buffer.id, &remote);
     state.runtime.set_buffer_category(state, &buffer.id, Some(super::peers::DIRECT_MESSAGES), 0);
-    state.runtime.set_buffer_name_icon(state, &buffer.id, Some("lock"));
+    // The lock is in the name already, which also keeps it apart from the ordinary conversation with them.
     if let Some(avatar) = who.as_ref().and_then(|p| super::media::avatar_url(handle.own.user_id, p)) {
         state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
     }
