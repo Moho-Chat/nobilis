@@ -67,6 +67,11 @@ pub fn card(buffer_id: &str, msg_id: i32, poll: &tl::types::Poll, results: &tl::
         "votedOptionId": voted,
         // Only whoever started a poll may close it, and Telegram says when that is this account.
         "noEnd": !poll.creator,
+        // A poll that keeps its results until it closes: Telegram sends no tally (its creator still sees one), so the
+        // card says the results come at the end rather than drawing every answer at nothing.
+        "resultsHidden": poll.hide_results_until_close && !poll.closed && results.results.is_none(),
+        // How many have voted, which Telegram says even while it keeps the split.
+        "voters": results.total_voters,
     })
 }
 
@@ -325,6 +330,21 @@ mod tests {
         let shut = closed(&mine);
         assert!(shut.closed);
         assert_eq!((shut.id, shut.answers.len()), (77, 2));
+    }
+
+    #[test]
+    fn a_poll_that_keeps_its_results_until_it_closes_says_so_until_then() {
+        let none = tl::types::PollResults { min: false, has_unread_votes: false, can_view_stats: false, results: None, total_voters: Some(12), recent_voters: None, solution: None, solution_entities: None, solution_media: None };
+        let mut hidden = poll(false);
+        hidden.hide_results_until_close = true;
+        assert_eq!(card("b", 1, &hidden, &none)["resultsHidden"], true);
+        assert_eq!(card("b", 1, &hidden, &none)["voters"], 12);
+        assert_eq!(card("b", 1, &poll(false), &none)["resultsHidden"], false, "an ordinary poll with no votes yet is not hidden");
+        let mut shut = hidden.clone();
+        shut.closed = true;
+        assert_eq!(card("b", 1, &shut, &none)["resultsHidden"], false, "closed, the results are out");
+        let tally = tl::types::PollResults { results: Some(vec![voters(b"0", 3, false)]), ..none };
+        assert_eq!(card("b", 1, &hidden, &tally)["resultsHidden"], false, "its creator is sent the tally");
     }
 
     #[test]

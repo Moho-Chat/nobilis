@@ -247,14 +247,33 @@ fn trim_the_heap_periodically() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_the_heap_periodically() {}
 
+/// How much stack each runtime thread gets.
+///
+/// tokio's default is 2 MiB, and an unoptimized build does not fit in it.
+/// `rpc::methods::dispatch` is one async fn with an arm per method, and without
+/// optimization every arm keeps stack slots of its own: its poll frame measured
+/// 2.4 MiB (`sub $0x261000,%r11` in the prologue) against 20 KiB for the same
+/// function in a release build. The prologue probes the whole frame, so a debug
+/// daemon died of a stack overflow on its first request of any kind - the
+/// first one anybody noticed was `addAccount`.
+///
+/// 16 MiB leaves the debug frame room to grow with the methods still to come.
+/// It is address space, not memory: a thread only touches the pages it uses,
+/// which in a release build is what it always was.
+const RUNTIME_THREAD_STACK: usize = 16 * 1024 * 1024;
+
+/// The runtime as the daemon builds it, so a test can run on the same one.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(RUNTIME_THREAD_STACK)
+        .build()
+}
+
 /// The runtime, built by hand so the allocator can be spoken to first.
 fn main() -> Result<()> {
     cap_malloc_arenas();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building the async runtime")?
-        .block_on(run())
+    runtime().context("building the async runtime")?.block_on(run())
 }
 
 async fn run() -> Result<()> {
@@ -476,5 +495,30 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    /// A request answered on a worker thread of the daemon's own runtime.
+    ///
+    /// Tests are built unoptimized, which is the build whose dispatch frame
+    /// outgrew tokio's default stack: run there, this is the overflow the
+    /// daemon had, and it fails the moment the frame outgrows the stack again.
+    /// Spawned rather than run with `block_on`, which would poll on the test's
+    /// own thread instead of a worker.
+    #[test]
+    fn a_request_fits_on_a_runtime_thread() {
+        let rt = super::runtime().expect("runtime");
+        let answer = rt.block_on(async {
+            tokio::spawn(async {
+                let state = crate::backend::kick::testkit::simulated_daemon("runtime-stack");
+                let subscriptions: crate::rpc::Subscriptions = Default::default();
+                crate::rpc::methods::dispatch(&state, "listAccounts", &serde_json::json!({}), &subscriptions).await
+            })
+            .await
+            .expect("the request's task")
+        });
+        assert!(answer.1.is_none(), "listAccounts failed: {:?}", answer.1);
     }
 }

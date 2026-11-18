@@ -14,6 +14,7 @@
 //! - `presence` - who is here, via MONITOR, ISON, or a netsplit
 //! - `who` - asking the server who is in a room, and their hostmasks
 //! - `typing` - the one notification IRC learned late
+//! - `reactions` - `+draft/react`, where the network carries client tags
 //! - `history` - CHATHISTORY, where a network has it
 //! - `drafts` - the IRCv3 drafts that clients ship anyway
 //!
@@ -32,6 +33,7 @@ pub mod presence;
 pub mod who;
 pub mod send;
 pub mod typing;
+pub mod reactions;
 pub mod dcc;
 pub mod nickserv;
 pub mod metadata;

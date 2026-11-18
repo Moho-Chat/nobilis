@@ -2720,6 +2720,9 @@ pub async fn dispatch(
                 backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if state.accounts.get_irc(&buffer.account_id).is_some() {
+                // Only those seen this run: IRC replays no reactions.
+                Ok(backend::irc::reactions::list_reactors(buffer_id, message_id, emoji))
             } else {
                 // Nothing else says who: the count is all there is.
                 Ok(serde_json::json!({ "users": [] }))
@@ -4215,6 +4218,11 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("steam:") => match backend::steam::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                // IRC, where the network relays `+draft/react`.
+                Some(buffer) if state.accounts.get_irc(&buffer.account_id).is_some() => match backend::irc::reactions::toggle(state, &buffer, msg_id, emoji, add) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
