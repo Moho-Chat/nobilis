@@ -7629,6 +7629,34 @@ pub async fn dispatch(
             }
         }
 
+        // Making a Telegram group or channel, with the people named in it.
+        "createTelegramChat" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some("createTelegramChat requires a Telegram \"accountId\"".to_string()));
+            };
+            let broadcast = p_str(params, "kind", "group") == "channel";
+            match backend::telegram::chats::create(state, account_id, p_str(params, "title", ""), broadcast, p_str(params, "about", ""), p_str(params, "members", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // A Telegram group or channel's own settings, the people banned from it, and changing one setting.
+        "telegramChatInfo" | "telegramBanned" | "telegramChatChange" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = match method {
+                "telegramChatInfo" => backend::telegram::chats::info(state, &buffer).await,
+                "telegramBanned" => backend::telegram::chats::banned(state, &buffer).await,
+                _ => backend::telegram::chats::change(state, &buffer, p_str(params, "action", ""), params).await.map(|note| serde_json::json!({ "ok": true, "note": note })),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Reporting a message to Telegram's moderators, a step at a time: the reasons, then perhaps a comment.
         "reportTelegramMessage" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {

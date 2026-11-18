@@ -24,6 +24,7 @@
 //! - `polls` - a poll as the conversation's card, voted in from it
 //! - `threads` - replies in a thread, and a channel post's comments
 //! - `membership` - joining by @name or link, leaving
+//! - `chats` - a group or channel's own settings, and making a new one
 //! - `admin` - what an administrator may do to a member
 //! - `account` - the account itself: its profile, its sessions, whether it shows as online
 //! - `notify` - muting a chat on the account
@@ -54,6 +55,7 @@
 pub mod account;
 pub mod admin;
 pub mod bots;
+pub mod chats;
 pub mod connect;
 pub mod dialogs;
 pub mod folders;
