@@ -2288,6 +2288,24 @@ pub async fn dispatch(
         }
 
         // The account's own profile on Stoat, and changing it. What is not given is left as it is.
+        // Fluxer's own profile answers to the same calls, for the same account tools.
+        "stoatOwnProfile" | "setStoatProfile" | "setStoatProfileAvatar" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let done = match method {
+                "stoatOwnProfile" => backend::fluxer::own::get(&handle).await,
+                "setStoatProfile" => backend::fluxer::own::set(&handle, p_str_opt(params, "displayName"), p_str_opt(params, "pronouns"), p_str_opt(params, "bio"), p_str_opt(params, "statusText")).await.map(|_| serde_json::json!({ "ok": true })),
+                _ => match p_str_opt(params, "path").filter(|p| !p.is_empty()) {
+                    Some(path) => backend::fluxer::own::set_avatar(&handle, path).await.map(|url| serde_json::json!({ "avatarUrl": url })),
+                    None => backend::fluxer::own::clear_avatar(&handle).await.map(|_| serde_json::json!({ "avatarUrl": null })),
+                },
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
         "stoatOwnProfile" | "setStoatProfile" | "setStoatProfileAvatar" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
                 return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
