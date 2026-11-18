@@ -238,6 +238,9 @@ pub struct World {
     /// People this account has blocked, or who are friends (relationship type 2 and 1).
     pub blocked: HashSet<String>,
     pub friends: HashSet<String>,
+    /// Friend requests: asked of this account, and asked by it (relationship types 3 and 4).
+    pub incoming: HashSet<String>,
+    pub outgoing: HashSet<String>,
     /// Read positions by channel, and unread mentions.
     pub read: HashMap<String, (Option<String>, u64)>,
     /// What Fluxer last said of each person's presence: the status word and the custom status.
@@ -245,6 +248,21 @@ pub struct World {
 }
 
 impl World {
+    /// Files a relationship by its type (`http-api/users/relationships.mdx`); none, or 0, takes it away.
+    pub fn set_relationship(&mut self, user: &str, kind: Option<i64>) {
+        for set in [&mut self.friends, &mut self.blocked, &mut self.incoming, &mut self.outgoing] {
+            set.remove(user);
+        }
+        let set = match kind {
+            Some(1) => &mut self.friends,
+            Some(2) => &mut self.blocked,
+            Some(3) => &mut self.incoming,
+            Some(4) => &mut self.outgoing,
+            _ => return,
+        };
+        set.insert(user.to_string());
+    }
+
     /// A guild as `READY`, `GUILD_CREATE` or `GUILD_SYNC` gives it: everything known of it replaced.
     pub fn put_guild(&mut self, g: &Value) -> Option<String> {
         let id = g["id"].as_str()?.to_string();

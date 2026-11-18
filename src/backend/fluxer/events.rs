@@ -196,11 +196,10 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
         }
         for r in data["relationships"].as_array().into_iter().flatten() {
             let Some(id) = r["id"].as_str().or_else(|| r["user"]["id"].as_str()) else { continue };
-            match r["type"].as_i64() {
-                Some(1) => world.friends.insert(id.to_string()),
-                Some(2) => world.blocked.insert(id.to_string()),
-                _ => false,
-            };
+            world.set_relationship(id, r["type"].as_i64());
+        }
+        for s in data["user_guild_settings"].as_array().into_iter().flatten() {
+            super::settings::keep(handle, s);
         }
         for p in data["presences"].as_array().into_iter().flatten() {
             if let Some(id) = p["user"]["id"].as_str() {
@@ -261,6 +260,8 @@ fn register_all(state: &AppState, handle: &Handle) {
         register_channel(state, handle, channel, 0, None);
     }
     register_emoji(state, handle);
+    super::settings::apply(state, handle);
+    super::people::tell_requests(state, handle);
     // Gone since the last time: a guild left, a channel deleted or hidden.
     let present: HashSet<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.keys().cloned().collect();
     for buffer in state.runtime.list_buffers() {
@@ -531,19 +532,15 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
         }
         "RELATIONSHIP_ADD" | "RELATIONSHIP_UPDATE" | "RELATIONSHIP_REMOVE" => {
             let Some(id) = data["id"].as_str() else { return };
-            let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
-            world.friends.remove(id);
-            world.blocked.remove(id);
-            if kind != "RELATIONSHIP_REMOVE" {
-                match data["type"].as_i64() {
-                    Some(1) => world.friends.insert(id.to_string()),
-                    Some(2) => world.blocked.insert(id.to_string()),
-                    _ => false,
-                };
+            {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                world.set_relationship(id, if kind == "RELATIONSHIP_REMOVE" { None } else { data["type"].as_i64() });
+                if let Some((uid, user)) = world::parse_user(&data["user"]) {
+                    world.users.insert(uid, user);
+                }
             }
-            if let Some((uid, user)) = world::parse_user(&data["user"]) {
-                world.users.insert(uid, user);
-            }
+            super::people::tell_requests(state, handle);
+            super::people::redraw_direct(state, handle, id);
         }
         "PASSIVE_UPDATES" => {
             // A passive guild's channels that have new messages, as a map of channel to newest message: marked unread,
@@ -567,6 +564,10 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             }
         }
+        "USER_GUILD_SETTINGS_UPDATE" => {
+            super::settings::keep(handle, data);
+            super::settings::apply(state, handle);
+        }
         "GUILD_MEMBER_LIST_UPDATE" => super::members::list_update(state, handle, data),
         "PRESENCE_UPDATE" => super::members::presence(state, handle, data),
         "PRESENCE_UPDATE_BULK" => {
@@ -574,7 +575,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 super::members::presence(state, handle, p);
             }
         }
-        "SESSIONS_REPLACE" | "VOICE_STATE_UPDATE" | "CHANNEL_PINS_UPDATE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "USER_GUILD_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
+        "SESSIONS_REPLACE" | "VOICE_STATE_UPDATE" | "CHANNEL_PINS_UPDATE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
         other => tracing::debug!("fluxer[{account_id}]: {other} not handled"),
     }
 }

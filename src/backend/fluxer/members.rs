@@ -41,6 +41,17 @@ pub fn entry(world: &World, handle: &Handle, guild: Option<&str>, user_id: &str,
         _ => Vec::new(),
     };
     let word = status_word(status);
+    let relationship = if world.friends.contains(user_id) {
+        "Friend"
+    } else if world.blocked.contains(user_id) {
+        "Blocked"
+    } else if world.incoming.contains(user_id) {
+        "Incoming"
+    } else if world.outgoing.contains(user_id) {
+        "Outgoing"
+    } else {
+        "None"
+    };
     json!({
         "nick": nick,
         "userId": user_id,
@@ -49,6 +60,7 @@ pub fn entry(world: &World, handle: &Handle, guild: Option<&str>, user_id: &str,
         "status": word,
         "activity": custom.filter(|t| !t.is_empty()).map(|t| json!({ "kind": "custom", "text": t })).unwrap_or(Value::Null),
         "bot": user.bot,
+        "relationship": relationship,
         "avatarUrl": avatar,
         "roles": roles,
     })

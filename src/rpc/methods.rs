@@ -68,6 +68,12 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        "fluxer" if target.parse::<u64>().is_ok() => {
+            let handle = state.runtime.fluxer_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Fluxer account is not connected"))?;
+            backend::fluxer::people::block(state, &handle, target, ignored).await?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         // Telegram's block list is the account's, so it holds on the phone too; recorded here as well, because what a
         // blocked person says in a group still arrives. Only a person's number can be blocked: a name is only hidden.
         "telegram" if target.parse::<i64>().is_ok_and(|n| n > 0) => {
@@ -1171,6 +1177,16 @@ pub async fn dispatch(
                     return (None, Some("that Stoat account is not connected".to_string()));
                 };
                 return match backend::stoat::people::join_invite(state, &handle, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
+            // A Fluxer guild too.
+            if id.starts_with("fluxer:") {
+                let Some(handle) = state.runtime.fluxer_handle(id) else {
+                    return (None, Some("that Fluxer account is not connected".to_string()));
+                };
+                return match backend::fluxer::people::join_invite(state, &handle, name).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
@@ -3798,6 +3814,11 @@ pub async fn dispatch(
             };
             let result = if let Some(group) = backend::steam::chatgroups::group_of_rail_id(group_id) {
                 backend::steam::chatgroups::act(state, group.0, backend::steam::chatgroups::Action::Leave { group: group.1 }).await.map(|_| ()).map_err(anyhow::Error::msg)
+            } else if let Some(guild_id) = rest.strip_prefix("guild:").filter(|_| account_id.starts_with("fluxer:")) {
+                match state.runtime.fluxer_handle(account_id) {
+                    Some(handle) => backend::fluxer::people::leave_guild(state, &handle, guild_id).await,
+                    None => Err(anyhow::anyhow!("that Fluxer account is not connected")),
+                }
             } else if let Some(guild_id) = rest.strip_prefix("guild:") {
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
@@ -5188,6 +5209,23 @@ pub async fn dispatch(
         }
 
         // Stoat's friends: who has asked, answering, asking, and blocking.
+        // Fluxer's are the same shape, and answer to the same names.
+        "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "stoatFriendRequests" => return (Some(backend::fluxer::people::page(&handle)), None),
+                "answerStoatFriendRequest" => backend::fluxer::people::answer_friend(state, &handle, user, p_bool(params, "accept", true)).await,
+                "addStoatFriend" => backend::fluxer::people::add_friend(&handle, p_str(params, "username", "")).await,
+                _ => backend::fluxer::people::block(state, &handle, user, p_bool(params, "block", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
         "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
                 return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
@@ -8046,6 +8084,11 @@ pub async fn dispatch(
                 "signal" => match state.runtime.signal_handle(account_id) {
                     None => Err(anyhow::anyhow!("that Signal account is not connected")),
                     Some(handle) => backend::signal::inbox::open_dm(state, &handle, user_id).await,
+                },
+                "fluxer" => match (state.runtime.fluxer_handle(account_id), user_id.parse::<u64>().is_ok()) {
+                    (None, _) => Err(anyhow::anyhow!("that Fluxer account is not connected")),
+                    (_, false) => Err(anyhow::anyhow!("Fluxer needs the person's id, not their name")),
+                    (Some(handle), true) => backend::fluxer::people::open_dm(state, &handle, user_id).await,
                 },
                 "telegram" => backend::telegram::people::open_dm(state, account_id, user_id).await.map_err(|e| anyhow::anyhow!(e)),
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),

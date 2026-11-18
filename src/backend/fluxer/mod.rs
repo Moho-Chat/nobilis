@@ -40,8 +40,10 @@ pub mod media;
 pub mod members;
 pub mod messages;
 pub mod own;
+pub mod people;
 pub mod profile;
 pub mod send;
+pub mod settings;
 pub mod world;
 
 pub use connect::spawn;
@@ -70,6 +72,8 @@ pub struct Handle {
     pub limits: Arc<discovery::Limits>,
     /// When each channel's slowmode lets the account send again, in Unix seconds.
     pub slow: Arc<Mutex<HashMap<String, i64>>>,
+    /// The account's notification settings by guild (`@me` for direct messages), as Fluxer last sent them.
+    pub notify: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 impl Handle {
