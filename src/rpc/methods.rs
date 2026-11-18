@@ -1953,6 +1953,9 @@ pub async fn dispatch(
                 true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
+            } else if account_id.starts_with("telegram:") {
+                // Online or not, which is all Telegram shows; recorded above for the next connection either way.
+                backend::telegram::account::presence_changed(state, account_id)
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
@@ -2007,6 +2010,8 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if id.starts_with("telegram:") {
+                    backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
                     let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
                     sender.send(irc::proto::Command::AWAY(away)).is_ok()
@@ -7599,6 +7604,26 @@ pub async fn dispatch(
                 return (None, Some("pressTelegramButton requires a Telegram \"bufferId\"".to_string()));
             };
             match backend::telegram::keyboards::press(state, &buffer, p_str(params, "messageId", ""), p_str(params, "customId", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The Telegram account itself: its profile, its @username, its picture, and the sessions signed in to it.
+        "telegramOwnProfile" | "telegramSessions" | "setTelegramProfile" | "setTelegramUsername" | "setTelegramProfilePhoto" | "endTelegramSession" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            use backend::telegram::account as tg;
+            let done: Result<serde_json::Value, String> = match method {
+                "telegramOwnProfile" => tg::own_profile(state, account_id).await,
+                "telegramSessions" => tg::sessions(state, account_id).await,
+                "setTelegramProfile" => tg::set_profile(state, account_id, p_str_opt(params, "firstName"), p_str_opt(params, "lastName"), p_str_opt(params, "bio")).await.map(|()| ok_node()),
+                "setTelegramUsername" => tg::set_username(state, account_id, p_str(params, "username", "")).await.map(|()| ok_node()),
+                "setTelegramProfilePhoto" => tg::set_photo(state, account_id, p_str(params, "path", "")).await.map(|()| ok_node()),
+                _ => tg::end_session(state, account_id, p_str(params, "sessionId", "")).await.map(|()| ok_node()),
+            };
+            match done {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(e)),
             }

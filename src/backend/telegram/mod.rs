@@ -25,6 +25,7 @@
 //! - `threads` - replies in a thread, and a channel post's comments
 //! - `membership` - joining by @name or link, leaving
 //! - `admin` - what an administrator may do to a member
+//! - `account` - the account itself: its profile, its sessions, whether it shows as online
 //! - `notify` - muting a chat on the account
 //! - `instant` - an Instant View article as a page of its own
 //! - `keyboards` - a bot's inline buttons
@@ -50,6 +51,7 @@
 //! and says what this is: the device is "moho" on this operating system, the version is moho's own. A session is
 //! saved and reused; nothing here signs in afresh to get over a hiccup.
 
+pub mod account;
 pub mod admin;
 pub mod bots;
 pub mod connect;
