@@ -61,6 +61,12 @@ pub fn user_agent() -> String {
     concat!("moho/", env!("CARGO_PKG_VERSION")).to_string()
 }
 
+/// Whoever is waiting for a call's grant: given it, or a refusal in words.
+pub type GrantWaiter = tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>;
+
+/// Where this account is in a call from here: the guild (none for a private call), the channel, the voice connection.
+pub type VoicePlace = (Option<String>, String, String);
+
 /// What the rest of the daemon needs to act on a connected account.
 #[derive(Clone)]
 pub struct Handle {
@@ -82,9 +88,9 @@ pub struct Handle {
     /// Who is in each channel's call, by channel.
     pub voice: Arc<Mutex<HashMap<String, Vec<voice::VoiceMember>>>>,
     /// A join waiting for its grant (or a refusal in words).
-    pub voice_wait: Arc<Mutex<Option<tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>>,
+    pub voice_wait: Arc<Mutex<Option<GrantWaiter>>>,
     /// The call this account is in from here: its guild, channel and voice connection.
-    pub voice_here: Arc<Mutex<Option<(Option<String>, String, String)>>>,
+    pub voice_here: Arc<Mutex<Option<VoicePlace>>>,
     /// The private conversations whose call is ringing this account.
     pub ringing: Arc<Mutex<HashSet<String>>>,
 }
