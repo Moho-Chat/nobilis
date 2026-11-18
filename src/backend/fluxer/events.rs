@@ -44,9 +44,9 @@ fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &st
 /// and its category, and told whether the account may write in it.
 pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, place: i64, heading: Option<(&str, i64)>) {
     let account_id = &handle.account_id;
-    // Categories are headings, voice channels are joined (a later round), a link channel is only a link, and threads
-    // and forums are a later round too.
-    if matches!(channel.kind, Kind::Category | Kind::Voice | Kind::Link | Kind::Thread | Kind::Forum | Kind::Other(_)) {
+    // Categories are headings, a link channel is only a link, and threads and forums are a later round. A voice channel
+    // is a conversation too: it has a call, and messages beside it.
+    if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Thread | Kind::Forum | Kind::Other(_)) {
         return;
     }
     let (title, read_only, avatar, unread) = {
@@ -101,7 +101,12 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
     if let Some(topic) = &channel.topic {
         state.runtime.set_buffer_topic(state, &buffer.id, topic);
     }
-    state.runtime.set_buffer_name_icon(state, &buffer.id, (channel.kind == Kind::Announcement).then_some("campaign"));
+    let icon = match channel.kind {
+        Kind::Announcement => Some("campaign"),
+        Kind::Voice => Some("volume_up"),
+        _ => None,
+    };
+    state.runtime.set_buffer_name_icon(state, &buffer.id, icon);
     if let Some(url) = avatar {
         state.runtime.set_buffer_avatar(state, &buffer.id, &media::cached(account_id, media::AVATARS, &url, None, Some("image/webp")));
     }
@@ -190,6 +195,9 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
         }
         for g in data["guilds"].as_array().into_iter().flatten() {
             world.put_guild(g);
+            for s in g["voice_states"].as_array().into_iter().flatten() {
+                super::voice::keep_state(handle, s);
+            }
         }
         for c in data["private_channels"].as_array().into_iter().flatten() {
             world.put_channel(c);
@@ -262,6 +270,10 @@ fn register_all(state: &AppState, handle: &Handle) {
     register_emoji(state, handle);
     super::settings::apply(state, handle);
     super::people::tell_requests(state, handle);
+    let in_calls: Vec<String> = handle.voice.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+    for channel in in_calls {
+        super::voice::tell(state, handle, &channel);
+    }
     // Gone since the last time: a guild left, a channel deleted or hidden.
     let present: HashSet<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.keys().cloned().collect();
     for buffer in state.runtime.list_buffers() {
@@ -334,6 +346,9 @@ fn redraw_guild(state: &AppState, handle: &Handle, guild: Option<&str>, channel:
 
 /// A refused voice join, said in words (op 12).
 pub fn gateway_error(state: &AppState, handle: &Handle, data: &Value) {
+    if super::voice::refused(handle, data) {
+        return;
+    }
     let words = match data["code"].as_str().unwrap_or("") {
         "VOICE_CHANNEL_FULL" => "That voice channel is full".to_string(),
         "VOICE_P2P_CONSENT_REQUIRED" => "That call is peer-to-peer, which moho does not join".to_string(),
@@ -545,6 +560,9 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
         "PASSIVE_UPDATES" => {
             // A passive guild's channels that have new messages, as a map of channel to newest message: marked unread,
             // the messages fetched when the conversation is opened.
+            for s in data["voice_states"].as_array().into_iter().flatten() {
+                super::voice::state_changed(state, handle, s);
+            }
             for (id, last) in data["channels"].as_object().into_iter().flatten() {
                 let Some(last) = last.as_str() else { continue };
                 let seen = {
@@ -580,7 +598,10 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 super::members::presence(state, handle, p);
             }
         }
-        "SESSIONS_REPLACE" | "VOICE_STATE_UPDATE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
+        "VOICE_STATE_UPDATE" => super::voice::state_changed(state, handle, data),
+        "VOICE_SERVER_UPDATE" => super::voice::grant(handle, data),
+        "CALL_CREATE" | "CALL_UPDATE" | "CALL_DELETE" => super::voice::call_changed(state, handle, kind, data),
+        "SESSIONS_REPLACE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
         other => tracing::debug!("fluxer[{account_id}]: {other} not handled"),
     }
 }

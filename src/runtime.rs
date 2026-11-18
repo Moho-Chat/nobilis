@@ -4662,6 +4662,11 @@ impl Runtime {
         self.fluxer_handles.lock().unwrap().remove(account_id);
     }
 
+    /// Every connected Fluxer account.
+    pub fn all_fluxer_handles(&self) -> Vec<crate::backend::fluxer::Handle> {
+        self.fluxer_handles.lock().unwrap().values().cloned().collect()
+    }
+
     /// A connected Fluxer account's client.
     pub fn fluxer_handle(&self, account_id: &str) -> Option<crate::backend::fluxer::Handle> {
         self.fluxer_handles.lock().unwrap().get(account_id).cloned()

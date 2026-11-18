@@ -3018,6 +3018,7 @@ pub async fn dispatch(
                     })
                 })
                 .chain(state.runtime.all_stoat_handles().into_iter().flat_map(|h| backend::stoat::events::ringing(state, &h)))
+                .chain(state.runtime.all_fluxer_handles().into_iter().flat_map(|h| backend::fluxer::voice::ringing(state, &h)))
                 .collect();
             (Some(Value::Array(calls)), None)
         }
@@ -5218,6 +5219,51 @@ pub async fn dispatch(
 
         // A Stoat call: the token and address of the media server to join (what is done with them is the window's, as for
         // a Matrix call on a media server), and who is in each channel's call.
+        // Fluxer's calls answer to Stoat's calls (the window joins both on LiveKit the same way), and two of their own:
+        // leaving, which Fluxer wants said on the gateway, and saying the microphone, camera and screen.
+        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match method {
+                "declineStoatCall" => match backend::fluxer::voice::decline(state, &handle, &buffer).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                },
+                "joinStoatCall" => {
+                    if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                        return (None, Some(why));
+                    }
+                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false)).await {
+                        Ok(joined) => (Some(joined), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "leaveFluxerCall" => {
+                    backend::fluxer::voice::leave(&handle);
+                    (Some(ok_node()), None)
+                }
+                _ => {
+                    backend::fluxer::voice::set_state(&handle, p_bool(params, "muted", false), p_bool(params, "camera", false), p_bool(params, "screen", false));
+                    (Some(ok_node()), None)
+                }
+            }
+        }
+        "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let channels: Vec<String> = handle.voice.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+            let out: serde_json::Map<String, serde_json::Value> = channels
+                .into_iter()
+                .filter_map(|c| backend::fluxer::messages::buffer_of(state, &handle.account_id, &c).map(|b| (b.id, serde_json::Value::Array(backend::fluxer::voice::voice_members(&handle, &c)))))
+                .collect();
+            (Some(serde_json::Value::Object(out)), None)
+        }
+
         "declineStoatCall" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
                 return (None, Some("declineStoatCall requires a Stoat \"bufferId\"".to_string()));

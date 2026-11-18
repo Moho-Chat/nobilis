@@ -48,6 +48,7 @@ pub mod profile;
 pub mod search;
 pub mod send;
 pub mod settings;
+pub mod voice;
 pub mod world;
 
 pub use connect::spawn;
@@ -78,6 +79,14 @@ pub struct Handle {
     pub slow: Arc<Mutex<HashMap<String, i64>>>,
     /// The account's notification settings by guild (`@me` for direct messages), as Fluxer last sent them.
     pub notify: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Who is in each channel's call, by channel.
+    pub voice: Arc<Mutex<HashMap<String, Vec<voice::VoiceMember>>>>,
+    /// A join waiting for its grant (or a refusal in words).
+    pub voice_wait: Arc<Mutex<Option<tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>>,
+    /// The call this account is in from here: its guild, channel and voice connection.
+    pub voice_here: Arc<Mutex<Option<(Option<String>, String, String)>>>,
+    /// The private conversations whose call is ringing this account.
+    pub ringing: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Handle {
