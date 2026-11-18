@@ -66,6 +66,8 @@ pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enu
     use tl::enums::Update as U;
     // Secret chats' own: handled in order by their worker.
     super::secret_flow::update(state, account_id, handle, update);
+    // Voice chats': passed up to the window, which holds the call.
+    super::voicechat::update(state, account_id, update);
     match update {
         U::UserTyping(u) if is_typing(&u.action) => {
             if let (Some(buffer), Some(name)) = (buffer_of(state, account_id, &u.user_id.to_string()), who(handle, u.user_id)) {

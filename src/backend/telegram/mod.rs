@@ -86,6 +86,7 @@ pub mod stickers;
 pub mod threads;
 pub mod topics;
 pub mod updates;
+pub mod voicechat;
 pub mod session;
 
 use grammers_mtsender::ConnectionParams;

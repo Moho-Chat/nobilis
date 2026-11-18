@@ -7689,6 +7689,31 @@ pub async fn dispatch(
             }
         }
 
+        // A group's or channel's voice chat: what it is like, starting it, joining with the window's offer, leaving,
+        // muting, ending, and who is in it. See backend/telegram/voicechat.rs.
+        "telegramVoice" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("telegramVoice requires a Telegram \"bufferId\"".to_string()));
+            };
+            use backend::telegram::voicechat as voice;
+            let call = p_str(params, "call", "");
+            let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let done = match p_str(params, "op", "") {
+                "info" => voice::info(state, &buffer).await,
+                "start" => voice::start(state, &buffer).await.map(|()| ok_node()),
+                "join" => voice::join(state, &buffer, call, p_str(params, "params", ""), flag("muted")).await,
+                "leave" => voice::leave(state, &buffer, call, params.get("source").and_then(|v| v.as_i64()).unwrap_or(0) as i32).await.map(|()| ok_node()),
+                "mute" => voice::mute(state, &buffer, call, flag("muted"), p_str_opt(params, "userId")).await.map(|()| ok_node()),
+                "end" => voice::end(state, &buffer, call).await.map(|()| ok_node()),
+                "participants" => voice::participants(state, &buffer, call).await,
+                other => Err(format!("telegramVoice has no \"{other}\"")),
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Reporting a message to Telegram's moderators, a step at a time: the reasons, then perhaps a comment.
         "reportTelegramMessage" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
