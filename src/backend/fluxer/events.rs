@@ -219,6 +219,12 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
         for c in data["private_channels"].as_array().into_iter().flatten() {
             world.put_channel(c);
         }
+        // The account's personal notes are a channel whose id is the account's own (type 999), which `READY` does not
+        // list among the private channels (seen on fluxer.com, 2026-11-18): it is there all the same.
+        let own = world.own_id.clone();
+        if !own.is_empty() && !world.channels.contains_key(&own) {
+            world.put_channel(&json!({ "id": own, "type": 999 }));
+        }
         for r in data["relationships"].as_array().into_iter().flatten() {
             let Some(id) = r["id"].as_str().or_else(|| r["user"]["id"].as_str()) else { continue };
             world.set_relationship(id, r["type"].as_i64());
@@ -238,6 +244,7 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
         }
     }
     register_all(state, handle);
+    super::own::settings_changed(state, handle, &data["user_settings"]);
 }
 
 /// After a resume, which has no `READY`: what the account can see is asked for again over REST.
@@ -618,6 +625,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 super::search::announce(state, handle, &buffer);
             }
         }
+        "USER_SETTINGS_UPDATE" => super::own::settings_changed(state, handle, data),
         "USER_GUILD_SETTINGS_UPDATE" => {
             super::settings::keep(handle, data);
             super::settings::apply(state, handle);
@@ -632,7 +640,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
         "VOICE_STATE_UPDATE" => super::voice::state_changed(state, handle, data),
         "VOICE_SERVER_UPDATE" => super::voice::grant(handle, data),
         "CALL_CREATE" | "CALL_UPDATE" | "CALL_DELETE" => super::voice::call_changed(state, handle, kind, data),
-        "SESSIONS_REPLACE" | "CHANNEL_PINS_ACK" | "USER_SETTINGS_UPDATE" | "GUILD_MEMBERS_CHUNK" => {}
+        "SESSIONS_REPLACE" | "CHANNEL_PINS_ACK" | "GUILD_MEMBERS_CHUNK" => {}
         other => tracing::debug!("fluxer[{account_id}]: {other} not handled"),
     }
 }

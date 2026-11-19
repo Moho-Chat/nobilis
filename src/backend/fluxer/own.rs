@@ -1,6 +1,9 @@
-//! The account's own presence: the status chosen in moho, published on the gateway (op 3, `gateway/commands.md`) with
-//! the line beside it as the custom status. Fluxer keeps five of these per twenty seconds per connection and drops the
-//! rest, so a change is sent once, not repeated.
+//! The account's own presence and profile.
+//!
+//! The status chosen in moho is the account's, set in its settings (`PATCH /users/@me/settings`, which "applies to
+//! every session of the account"), so Fluxer's own apps show it too, and one chosen there is read back here. Setting it
+//! only on the gateway (op 3) changed this one session's presence, which the official app went on showing as Online
+//! (seen on fluxer.com, 2026-11-18).
 
 use super::{media, Handle};
 use anyhow::{anyhow, Result};
@@ -27,8 +30,45 @@ pub fn command(status: &str, text: Option<&str>) -> Value {
     json!({ "op": 3, "d": d })
 }
 
+/// The settings change for a status and, where given, the line beside it (an empty line clears it).
+pub fn settings_change(status: &str, text: Option<&str>) -> Value {
+    let mut body = json!({ "status": status_of(status) });
+    if let Some(text) = text {
+        let text = text.trim();
+        body["custom_status"] = if text.is_empty() { Value::Null } else { json!({ "text": text.chars().take(128).collect::<String>() }) };
+    }
+    body
+}
+
 pub async fn apply_status(handle: &Handle, status: &str, text: Option<&str>) -> bool {
-    handle.gateway.send(command(status, text).to_string()).is_ok()
+    match handle.api.patch("/users/@me/settings", &settings_change(status, text)).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::info!("fluxer[{}]: status not set: {e}", handle.account_id);
+            false
+        }
+    }
+}
+
+/// What moho calls a status Fluxer's settings name.
+pub fn status_from(fluxer: &str) -> Option<&'static str> {
+    match fluxer {
+        "online" => Some("online"),
+        "idle" => Some("idle"),
+        "dnd" => Some("dnd"),
+        "invisible" => Some("invisible"),
+        _ => None,
+    }
+}
+
+/// The account's status as its settings say (in `READY`, or changed in another app), shown as the account's own.
+pub fn settings_changed(state: &crate::state::AppState, handle: &Handle, settings: &Value) {
+    if let Some(status) = settings["status"].as_str().and_then(status_from) {
+        state.runtime.set_account_status(&handle.account_id, status);
+    }
+    if settings.get("custom_status").is_some() {
+        state.runtime.set_account_status_text(&handle.account_id, settings["custom_status"]["text"].as_str().unwrap_or(""));
+    }
 }
 
 /// The account's own profile, as the account tools in the window show it (the same shape as Stoat's).
@@ -99,6 +139,10 @@ mod tests {
         assert_eq!(command("invisible", Some(""))["d"]["custom_status"], Value::Null);
         assert_eq!(command("online", Some(" lunch "))["d"]["custom_status"]["text"], "lunch");
         assert_eq!(status_of("whatever"), "online");
+        assert_eq!(settings_change("dnd", None), json!({ "status": "dnd" }));
+        assert_eq!(settings_change("away", Some(" lunch ")), json!({ "status": "idle", "custom_status": { "text": "lunch" } }));
+        assert_eq!(settings_change("online", Some("")), json!({ "status": "online", "custom_status": null }));
+        assert_eq!(status_from("offline"), None);
     }
 
     #[test]
