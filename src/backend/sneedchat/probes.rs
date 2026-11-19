@@ -44,47 +44,6 @@ pub(super) mod live_probe {
         assert!((200..400).contains(&final_resp.status), "expected a normal page response, got HTTP {}", final_resp.status);
     }
 
-    /// What the chat page says about which rooms exist. Not run by default:
-    ///   cargo test --release -- --ignored --nocapture sneedchat_rooms_probe
-    ///
-    /// The room catalogue has been a literal in the frontend since the start,
-    /// with a comment saying no endpoint lists them. This is how that gets
-    /// settled: fetch the page a browser would and print every fragment that
-    /// mentions a room, so the answer comes from the site rather than from
-    /// assumption.
-    #[tokio::test]
-    #[ignore]
-    async fn sneedchat_rooms_probe() {
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-        let dir = std::env::temp_dir().join("nobilis-tor-spike");
-        let manager = TorManager::new(&dir);
-        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
-
-        let http = HttpClient::new(Transport::Tor(client), CookieJar::new(), crate::backend::sneedchat::DEFAULT_USER_AGENT.to_string());
-        let url = format!("https://{}/test-chat", crate::backend::sneedchat::DEFAULT_ONION);
-
-        let mut resp = http.get(&url).await.expect("GET /chat failed");
-        if resp.status == pow::GATE_STATUS {
-            pow::clear(&http, &url, 8).await.expect("failed to clear the gate");
-            resp = http.get(&url).await.expect("GET after clearing gate failed");
-        }
-        println!("HTTP {} body {} bytes", resp.status, resp.body.len());
-
-        let body = resp.body.clone();
-        for (i, line) in body.lines().enumerate() {
-            let lower = line.to_lowercase();
-            if lower.contains("room") || lower.contains("chat.ws") || lower.contains("channel") {
-                println!("{i}: {}", line.trim().chars().take(400).collect::<String>());
-            }
-        }
-
-        // And the part that can fail: the reader this client really uses must
-        // still find the rooms on the page the site really serves.
-        let rooms = crate::backend::sneedchat::rooms::parse_rooms(&body);
-        println!("{} room(s) read: {:?}", rooms.len(), rooms.iter().map(|r| r.name.as_str()).collect::<Vec<_>>());
-        assert!(!rooms.is_empty(), "the room switcher is no longer where parse_rooms looks for it");
-    }
-
     /// Whether the session this account already holds is still good.
     ///
     /// The login form is a fallback: cookies captured earlier are restored

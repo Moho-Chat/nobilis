@@ -128,17 +128,28 @@ impl DiscordAccountConfig {
     }
 }
 
-/// One configured room to maintain a permanent connection to - see
-/// backend/sneedchat/mod.rs, which opens one websocket per room rather than
-/// switching a single connection between them (the earlier v1 approach).
-/// `name` is the room's real, human-chosen name (e.g. "general") - the
-/// server has no endpoint this backend uses to look names up on its own,
-/// so it's supplied at account-creation time, same spirit as an IRC
-/// account's autojoin list being user-provided rather than discovered.
+/// One room an account stays in.
+///
+/// `id` is the room's uuid on Ephyra Chat (`chat_room_uuid`) and `name` its
+/// slug ("fishtank"), which is what the room's buffer is called. Accounts made
+/// for the old chat saved a small number as the id; it still reads, as text,
+/// and is swapped for the uuid of the room with the same name the first time
+/// the account connects (see backend/sneedchat/rooms.rs `adopt_uuids`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SneedChatRoom {
-    pub id: u32,
+    #[serde(deserialize_with = "room_id_from_either")]
+    pub id: String,
     pub name: String,
+}
+
+/// A room id as text, whether it was saved as text (a uuid) or as a number
+/// (the old chat's room numbers).
+fn room_id_from_either<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => Err(serde::de::Error::custom(format!("a room id is text or a number, not {other}"))),
+    }
 }
 
 /// Sneedchat (SneedChat) account shape. Unlike Discord's token, the daemon
@@ -1509,6 +1520,22 @@ impl AccountStore {
         }
     }
 
+    /// The name the chat shows this account under, as its `welcome` says -
+    /// kept so the account reads right before it next connects. Written only
+    /// when it changed.
+    pub fn set_sneedchat_display_name(&self, account_id: &str, name: &str) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) if a.display_name.as_deref() == Some(name) => Ok(false),
+            Some(a) => {
+                a.display_name = Some(name.to_string());
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Records the session a browser sign-in produced, or the fresher one a
     /// connection has been handed since - the forum rotates `xf_session`, and
     /// a saved copy that is never updated is a saved copy that expires.
@@ -2019,7 +2046,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
-        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
+        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id.clone(), name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
         use_tor: a.use_tor,

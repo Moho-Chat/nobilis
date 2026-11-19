@@ -15,7 +15,7 @@ path = "src/main.rs"
 # A larger receive buffer for the Discord voice and stream sockets, on every
 # platform - see backend/discord/streamconn.rs `widen_receive_buffer`.
 socket2 = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }

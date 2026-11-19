@@ -213,7 +213,7 @@ pub struct Account {
 /// persisted config shape this mirrors).
 #[derive(Serialize, Clone, Debug)]
 pub struct SneedChatRoomInfo {
-    pub id: u32,
+    pub id: String,
     pub name: String,
 }
 

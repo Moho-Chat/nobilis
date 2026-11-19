@@ -4065,9 +4065,9 @@ pub async fn dispatch(
                     // being replied to. A reply to something no longer in
                     // scrollback still sends, just without the mention -
                     // losing the message would be the worse trade.
-                    let reply_to_nick = reply_to_id
+                    let reply_to = reply_to_id
                         .and_then(|id| state.store.get_message(buffer_id, id).ok().flatten())
-                        .map(|m| m.from);
+                        .map(|m| backend::sneedchat::ReplyTo { from: m.from, id: m.id, body: m.body });
                     // Unlike Discord, Sneedchat's own chat protocol has no
                     // upload endpoint at all - see backend::sneedchat::
                     // send_attachment's own doc comment for how this
@@ -4081,7 +4081,7 @@ pub async fn dispatch(
                             backend::sneedchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host, progress)
                                 .await
                         }
-                        None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
+                        None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to).await,
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
@@ -4157,7 +4157,7 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
-                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
@@ -4280,7 +4280,7 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
-                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
@@ -4522,6 +4522,23 @@ pub async fn dispatch(
                 }
             }
         },
+
+        // How to start the web helper - moho's own binary, which carries
+        // requests on Chromium's network stack for sites that admit only a
+        // browser (see net/webhelper.rs). Sent by the client on every connect.
+        "setWebHelper" => {
+            let command: Vec<String> = params
+                .get("command")
+                .and_then(|c| c.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if command.is_empty() {
+                (None, Some("command must be a non-empty list".to_string()))
+            } else {
+                crate::net::webhelper::set_command(command);
+                (Some(ok_node()), None)
+            }
+        }
 
         // The daemon-wide network settings: what routed means (moho's own Tor
         // or a SOCKS5 proxy of one's own), and whether everything is routed.
@@ -9201,7 +9218,11 @@ fn parse_sneedchat_rooms(params: &Value) -> Option<Vec<crate::accounts::SneedCha
     Some(
         arr.iter()
             .filter_map(|r| {
-                let id = r.get("id")?.as_u64()? as u32;
+                let id = match r.get("id")? {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => return None,
+                };
                 let name = r.get("name")?.as_str()?.to_string();
                 Some(crate::accounts::SneedChatRoom { id, name })
             })
