@@ -444,6 +444,31 @@ pub async fn dispatch(
             _ => (None, Some("not a Sneedchat conversation".to_string())),
         },
 
+        // The account's side rooms, for choosing where to invite somebody.
+        "sneedchatSideRooms" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => (Some(serde_json::json!(backend::sneedchat::side_rooms(a))), None),
+            _ => (None, Some("sneedchatSideRooms requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // People to invite, by name, from everyone the chat has shown the account.
+        "searchSneedchatPeople" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => (Some(serde_json::json!(backend::sneedchat::search_people(state, a, p_str(params, "query", "")))), None),
+            _ => (None, Some("searchSneedchatPeople requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // Inviting somebody to a side room: the one `bufferId` shows, or a new
+        // one. Answers the conversation they were invited into.
+        "sneedchatInvite" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => {
+                let to = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id == a).map(|b| b.name);
+                match backend::sneedchat::invite(a, p_str(params, "who", ""), to.as_deref()).await {
+                    Ok(name) => (Some(serde_json::json!({ "bufferId": crate::model::buffer_id(a, &name) })), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            }
+            _ => (None, Some("sneedchatInvite requires a Sneedchat \"accountId\"".to_string())),
+        },
+
         // Bringing back a message that was taken down.
         "sneedchatRestore" => match (p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)), p_str_opt(params, "messageId")) {
             (Some(buffer), Some(msg)) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::restore(&buffer.account_id, msg).await {

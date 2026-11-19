@@ -317,6 +317,25 @@ impl Chat {
         true
     }
 
+    /// This account's side rooms: (uuid, conversation name, whether a group).
+    pub(super) fn side_rooms(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<(String, String, bool)> = self
+            .rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.kind == RoomKind::Side && !r.buffer.is_empty())
+            .map(|(u, r)| (u.clone(), r.buffer.clone(), r.group))
+            .collect();
+        out.sort_by_key(|r| r.1.to_lowercase());
+        out
+    }
+
+    /// Whether somebody is already in a side room.
+    pub(super) fn in_room(&self, room: &str, principal: &str) -> bool {
+        self.rooms.lock().unwrap().get(room).is_some_and(|r| r.members.iter().any(|m| m.uuid == principal))
+    }
+
     /// The side room that is a conversation with exactly this person, if any.
     pub(super) fn side_room_with(&self, principal: &str) -> Option<(String, String)> {
         let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
@@ -644,7 +663,8 @@ impl Ctx<'_> {
                 let code = frame["code"].as_str().unwrap_or("refused").to_string();
                 let answered = chat.answer(&key, Err(code.clone()))
                     || chat.answer(frame["ref"].as_str().unwrap_or_default(), Err(code.clone()))
-                    || chat.answer(&format!("react:{key}"), Err(code.clone()));
+                    || chat.answer(&format!("react:{key}"), Err(code.clone()))
+                    || chat.answer(&format!("invite:{key}"), Err(code.clone()));
                 if !answered {
                     if let Some((name, kind)) = chat.buffer_of(&key) {
                         let said = format!("Couldn't join this room: {}.", protocol::describe_error(&code));
@@ -825,6 +845,9 @@ impl Ctx<'_> {
                         }
                         room.group = RoomState::is_group(&room.members, &me);
                     }
+                }
+                if added {
+                    chat.answer(&format!("invite:{}", entry.room), Ok(()));
                 }
                 system(format!("{name} {} the conversation.", if added { "joined" } else { "left" }));
                 if !replaying {

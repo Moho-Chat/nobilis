@@ -109,6 +109,75 @@ pub async fn send_whisper(_state: &AppState, account_id: &str, target: &str, bod
     post(account_id, &buffer, body.trim()).await
 }
 
+/// This account's side rooms, for choosing where to invite somebody.
+pub fn side_rooms(account_id: &str) -> Vec<serde_json::Value> {
+    super::chat::chat(account_id)
+        .side_rooms()
+        .into_iter()
+        .map(|(_, name, group)| json!({ "bufferId": crate::model::buffer_id(account_id, &name), "name": name, "group": group }))
+        .collect()
+}
+
+/// Somebody to invite, by name: everyone the chat has shown this account -
+/// in its rooms' member lists, its conversations, and their stored history.
+/// The chat has no directory of its own to search; this is all anybody can
+/// be found by, here or on the site.
+pub fn search_people(state: &AppState, account_id: &str, query: &str) -> Vec<serde_json::Value> {
+    let chat = super::chat::chat(account_id);
+    let q = query.trim().trim_start_matches('@').to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+    let mut found: Vec<(String, String)> = chat
+        .people
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|p| p.name.to_lowercase().contains(&q))
+        .map(|p| (p.uuid.clone(), p.name.clone()))
+        .collect();
+    for (uuid, name) in state.store.senders_matching(account_id, &q, 50).unwrap_or_default() {
+        if protocol::is_uuid(&uuid) && !found.iter().any(|(u, _)| u == &uuid) {
+            found.push((uuid, name));
+        }
+    }
+    found.retain(|(u, _)| u != &me);
+    // Those whose name starts with what was typed first, then by name.
+    found.sort_by(|(_, a), (_, b)| {
+        let (a_starts, b_starts) = (a.to_lowercase().starts_with(&q), b.to_lowercase().starts_with(&q));
+        b_starts.cmp(&a_starts).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
+    found.truncate(30);
+    found.into_iter().map(|(uuid, name)| json!({ "id": uuid, "name": name })).collect()
+}
+
+/// Invites somebody (by principal uuid, or a name the chat has shown) to a
+/// side room: to the one a conversation shows, or to a new one. Answers the
+/// conversation they were invited into.
+pub async fn invite(account_id: &str, who: &str, to_buffer: Option<&str>) -> Result<String> {
+    let chat = super::chat::chat(account_id);
+    let principal = if protocol::is_uuid(who) {
+        who.to_lowercase()
+    } else {
+        chat.person_named(who).map(|p| p.uuid).ok_or_else(|| anyhow!("nobody called {who} has been seen in this chat"))?
+    };
+    match to_buffer {
+        Some(buffer) => {
+            let room = chat.room_of_buffer(buffer).ok_or_else(|| anyhow!("\"{buffer}\" isn't one of this account's side rooms"))?;
+            if chat.in_room(&room, &principal) {
+                return Ok(buffer.to_string());
+            }
+            chat.command(&format!("invite:{room}"), json!({ "t": "invite", "chat_room_uuid": room, "principal_uuid": principal })).await?;
+            Ok(buffer.to_string())
+        }
+        None => {
+            chat.command(&format!("side:{principal}"), json!({ "t": "open_side_room", "principal_uuids": [principal] })).await.context("opening a side room")?;
+            chat.side_room_with(&principal).map(|(_, b)| b).ok_or_else(|| anyhow!("the chat opened no side room"))
+        }
+    }
+}
+
 /// Sets the room's subtitle - what the site shows under its name.
 pub async fn set_subtitle(account_id: &str, buffer_name: &str, text: &str) -> Result<()> {
     let chat = super::chat::chat(account_id);

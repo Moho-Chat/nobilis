@@ -806,6 +806,24 @@ impl Store {
         Ok(id)
     }
 
+    /// Who has written in an account's conversations under a name containing
+    /// `query` (any case): their sender id and the name last used, most
+    /// recently heard from first. For finding somebody to invite when the
+    /// service has no directory to search.
+    pub fn senders_matching(&self, account_id: &str, query: &str, limit: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let prefix = format!("{}|%", account_id.replace('%', "\\%").replace('_', "\\_"));
+        let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT sender_id, from_nick FROM messages
+             WHERE buffer_id LIKE ?1 ESCAPE '\\' AND sender_id IS NOT NULL AND sender_id != ''
+               AND from_nick LIKE ?2 ESCAPE '\\'
+             GROUP BY sender_id ORDER BY MAX(ts) DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![prefix, needle, limit.max(1)], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// When the oldest message this buffer holds was sent (unix seconds): where an archive that pages by time goes back from.
     pub fn oldest_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
