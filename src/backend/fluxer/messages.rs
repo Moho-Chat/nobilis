@@ -214,6 +214,12 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
             world.users.entry(uid).or_insert(user);
         }
     }
+    if let Some(c) = world.channels.get_mut(channel_id) {
+        let newer = c.last_message_id.as_deref().and_then(|l| l.parse::<u64>().ok()).is_none_or(|l| id.parse::<u64>().is_ok_and(|n| n > l));
+        if newer {
+            c.last_message_id = Some(id.to_string());
+        }
+    }
     let guild = world.channels.get(channel_id).and_then(|c| c.guild.clone()).or_else(|| message["guild_id"].as_str().map(str::to_string));
     if let (Some(g), true) = (guild.as_deref(), message["member"].is_object()) {
         let mut member = message["member"].clone();

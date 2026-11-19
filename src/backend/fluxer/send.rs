@@ -176,7 +176,12 @@ pub async fn typing(state: &AppState, buffer: &Buffer) -> Result<(), String> {
 /// Says everything in the conversation up to its newest message was read, so it is read on the account's other apps.
 pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
-    let newest = state.store.newest_message_id(&buffer.id).ok().flatten().filter(|id| id.parse::<u64>().is_ok());
+    // The newest message held here, or the newest Fluxer says the channel has where that is later: a channel marked read
+    // without being opened holds nothing, and acknowledging nothing left it unread in Fluxer's own app (seen on
+    // fluxer.com, 2026-11-18).
+    let held = state.store.newest_message_id(&buffer.id).ok().flatten().and_then(|id| id.parse::<u64>().ok());
+    let told = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get(&channel).and_then(|c| c.last_message_id.clone()).and_then(|id| id.parse::<u64>().ok());
+    let newest = held.max(told).map(|n| n.to_string());
     state.runtime.set_buffer_unread(state, &buffer.id, 0, 0);
     let Some(newest) = newest else { return Ok(()) };
     let already = handle.world.lock().unwrap_or_else(|e| e.into_inner()).read.get(&channel).and_then(|r| r.0.clone());
