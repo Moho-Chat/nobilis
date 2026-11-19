@@ -505,8 +505,23 @@ pub(super) fn settle_send(account_id: &str, msg: &Message) -> bool {
         .and_then(|t| t.1.clone());
     if let Some(label) = label {
         if all.get(&label).is_some_and(|p| p.account_id == account_id) {
-            all.remove(&label);
-            return matches!(msg.command, Command::PRIVMSG(..));
+            match &msg.command {
+                // The echo itself, carrying our label.
+                Command::PRIVMSG(..) => {
+                    all.remove(&label);
+                    return true;
+                }
+                // A refusal (a numeric or a FAIL): nothing is coming back.
+                Command::Response(..) | Command::NOTICE(..) => {
+                    all.remove(&label);
+                    return false;
+                }
+                // Anything else is the server saying it took the command - an
+                // `ACK` - which is not the echo. kiwifarms sends one first
+                // and the echo after it, without a label; dropping the send
+                // here left that echo with nothing to match.
+                _ => return false,
+            }
         }
     }
     let Command::PRIVMSG(target, body) = &msg.command else { return false };
@@ -544,6 +559,17 @@ mod echo_tests {
         let echo: Message = ":uk0f7bgvv!u@principal/k0f7bgvv PRIVMSG #fishtank :no its double sending".parse().unwrap();
         assert!(settle_send("echo-test@kf", &echo));
         assert!(!pending_sends().lock().unwrap().contains_key(&label));
+    }
+
+    /// A labelled ACK is the server taking the send, not the echo of it: the
+    /// echo that follows, from another name and with no label, still settles it.
+    #[test]
+    fn a_label_ack_does_not_settle_the_send_before_the_echo() {
+        let label = pending("echo-test3@kf", "#a", "hi");
+        let ack: Message = format!("@label={label} :irc ACK").parse().unwrap();
+        assert!(!settle_send("echo-test3@kf", &ack));
+        assert!(pending_sends().lock().unwrap().contains_key(&label));
+        assert!(settle_send("echo-test3@kf", &":u!u@h PRIVMSG #a :hi".parse().unwrap()));
     }
 
     /// Somebody else saying the same thing elsewhere is not our echo.
