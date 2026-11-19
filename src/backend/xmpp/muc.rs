@@ -436,6 +436,15 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         let before = r.occupants.get(&nick).map(|o| (o.role.clone(), o.affiliation.clone()));
         let new = before.is_none();
         if is_self {
+            // The nick the room says we hold, which is not always the one we
+            // asked for: XEP-0045 lets a service change it, and kiwifarms
+            // does - we ask for our handle and are `u` plus an id. The
+            // room's own copy of our messages comes from that name, so
+            // keeping the requested one made every message we sent look like
+            // somebody else's, and the pending row never settled.
+            if r.nick != nick {
+                r.nick = nick.clone();
+            }
             r.own_role = occupant.role.clone();
             r.own_affiliation = occupant.affiliation.clone();
             r.own_occupant_id = occupant.occupant_id.clone();
