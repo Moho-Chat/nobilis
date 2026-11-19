@@ -3865,7 +3865,7 @@ pub async fn dispatch(
                                     return (None, Some(format!("{e:#}")));
                                 }
                             }
-                        } else if buffer.account_id.starts_with("sneedchat:") && buffer.kind == "channel" {
+                        } else if buffer.account_id.starts_with("sneedchat:") {
                             match backend::sneedchat::leave_room(state, &buffer.account_id, &buffer.name) {
                                 // Its buffer is already gone, with its history.
                                 Ok(true) => return (Some(ok_node()), None),

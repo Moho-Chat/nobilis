@@ -18,8 +18,13 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
 /// whisper conversation - which has nothing to leave.
 pub fn leave_room(state: &AppState, account_id: &str, buffer_name: &str) -> Result<bool> {
     let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    // A side room (a whisper, or a group chat somebody pulled us into) is
+    // left on the chat itself; its conversation is then closed like any other.
+    if super::chat::chat(account_id).leave_side_room(buffer_name) {
+        return Ok(false);
+    }
     let name = room_name_of(buffer_name);
-    if !config.rooms.iter().any(|r| r.name == name) {
+    if !buffer_name.starts_with('#') || !config.rooms.iter().any(|r| r.name == name) {
         return Ok(false);
     }
     let remaining: Vec<SneedChatRoom> = config.rooms.into_iter().filter(|r| r.name != name).collect();

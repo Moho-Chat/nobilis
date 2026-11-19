@@ -301,6 +301,22 @@ impl Chat {
         self.rooms.lock().unwrap().iter().find(|(_, r)| r.buffer == buffer_name).map(|(uuid, _)| uuid.clone())
     }
 
+    /// Leaves the side room a conversation shows, if it is one: the chat is
+    /// told, and the room is no longer tracked, so nothing in it reopens the
+    /// conversation. Whether it was a side room.
+    pub(super) fn leave_side_room(&self, buffer_name: &str) -> bool {
+        let uuid = {
+            let mut rooms = self.rooms.lock().unwrap();
+            let Some(uuid) = rooms.iter().find(|(_, r)| r.kind == RoomKind::Side && r.buffer == buffer_name).map(|(u, _)| u.clone()) else {
+                return false;
+            };
+            rooms.remove(&uuid);
+            uuid
+        };
+        self.send(&json!({ "t": "leave", "chat_room_uuid": uuid }));
+        true
+    }
+
     /// The side room that is a conversation with exactly this person, if any.
     pub(super) fn side_room_with(&self, principal: &str) -> Option<(String, String)> {
         let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
@@ -1094,6 +1110,16 @@ mod tests {
         let rooms = chat.rooms.lock().unwrap();
         assert_eq!(rooms.len(), 1);
         assert!(rooms.contains_key("side-1"));
+    }
+
+    #[test]
+    fn closing_a_side_room_leaves_it() {
+        let chat = Chat::default();
+        chat.want_side_room("side-1", None);
+        chat.rooms.lock().unwrap().get_mut("side-1").unwrap().buffer = "Blackstar".into();
+        assert!(!chat.leave_side_room("#fishtank"));
+        assert!(chat.leave_side_room("Blackstar"));
+        assert!(chat.rooms.lock().unwrap().is_empty());
     }
 
     #[test]
