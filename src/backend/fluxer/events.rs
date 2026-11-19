@@ -338,7 +338,11 @@ fn edited(state: &AppState, handle: &Handle, data: &Value) {
     let (Some(id), Some(channel)) = (data["id"].as_str(), data["channel_id"].as_str()) else { return };
     let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
     if data["embeds"].is_array() {
-        state.runtime.set_message_embeds(state, &buffer.id, id, &messages::embeds_of(handle, data));
+        // Fluxer's list replaces what it made before, but not the cards moho made itself (an invite link drawn as a
+        // card), which Fluxer knows nothing of: a link preview arriving late wiped them (seen on fluxer.com, 2026-11-18).
+        let mut next: Vec<crate::model::Embed> = state.store.get_message(&buffer.id, id).ok().flatten().map(|m| m.embeds).unwrap_or_default().into_iter().filter(|e| e.kind.as_deref() == Some("invite")).collect();
+        next.extend(messages::embeds_of(handle, data));
+        state.runtime.set_message_embeds(state, &buffer.id, id, &next);
     }
     if let Some(content) = data["content"].as_str() {
         let body = {
