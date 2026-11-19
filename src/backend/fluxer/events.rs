@@ -72,7 +72,9 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
     let fresh = existing.is_none();
     let name = unique_name(state, account_id, &title, &channel.id);
     let buffer = match existing {
-        Some(found) if found.name == name => found,
+        // Through ensure_buffer even when it is there: that is what confirms a conversation put back from the last run,
+        // which is otherwise swept away half a minute after the account connects (seen on fluxer.com, 2026-11-18).
+        Some(found) if found.name == name => state.runtime.ensure_buffer(state, account_id, &name, kind),
         Some(found) => {
             state.runtime.rename_buffer(state, account_id, &found.name, &name, kind);
             state.runtime.get_buffer(&crate::model::buffer_id(account_id, &name)).unwrap_or(found)

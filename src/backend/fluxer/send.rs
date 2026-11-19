@@ -47,7 +47,12 @@ fn noted(handle: &Handle, channel: &str, e: super::api::ApiError) -> String {
     e.to_string()
 }
 
-/// What a file is called when it is sent: a spoiler is a name Fluxer reads as one, as Discord does.
+/// Fluxer's attachment flag for a spoiler (`IS_SPOILER`, `http-api/messages.mdx`). Fluxer reads this, not the
+/// `SPOILER_` name Discord uses: a file sent under that name alone was shown uncovered (seen on fluxer.com, 2026-11-18).
+pub const IS_SPOILER: u64 = 1 << 3;
+
+/// What a file is called when it is sent; with `spoiler`, Discord's `SPOILER_` name as well (kept for the spoiler flag
+/// only to be read where the name is, and harmless where the flag is).
 pub fn sent_name(path: &str, spoiler: bool) -> String {
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".to_string());
     if spoiler && !name.starts_with("SPOILER_") {
@@ -127,8 +132,8 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
             return Err(format!("{} is {} MB and Fluxer takes at most {} MB here", sent_name(path, false), size / 1_048_576, biggest / 1_048_576));
         }
         let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {path}: {e}"))?;
-        let name = sent_name(path, *spoiler);
-        listed.push(json!({ "id": n, "filename": name }));
+        let name = sent_name(path, false);
+        listed.push(json!({ "id": n, "filename": name, "flags": if *spoiler { IS_SPOILER } else { 0 } }));
         parts.push((name.clone(), crate::backend::stoat::send::content_type_of(&name).to_string(), bytes));
     }
     let mut payload = payload(&handle, &channel, caption, reply_to);

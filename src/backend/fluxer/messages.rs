@@ -244,6 +244,14 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
     drop(world);
     let avatar = avatar_of(handle, &message["author"]);
     let mut attachments = discord::extract_attachments(message);
+    // A spoiler is a flag on the attachment; the window covers a file whose name says so, as Discord's does.
+    for (a, raw) in attachments.iter_mut().zip(message["attachments"].as_array().into_iter().flatten()) {
+        if raw["flags"].as_u64().unwrap_or(0) & super::send::IS_SPOILER != 0 {
+            if let Some(name) = a.filename.as_mut().filter(|n| !n.starts_with("SPOILER_")) {
+                *name = format!("SPOILER_{name}");
+            }
+        }
+    }
     attachments.extend(discord::forwarded_attachments(message));
     attachments.extend(stickers(handle, message));
     for a in attachments.iter_mut() {
