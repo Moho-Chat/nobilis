@@ -468,7 +468,11 @@ pub async fn dispatch(
                 { "id": "irc", "name": "IRC", "available": true },
                 { "id": "matrix", "name": "Matrix", "available": true },
                 { "id": "discord", "name": "Discord", "available": true },
-                { "id": "sneedchat", "name": "Sneedchat", "available": true },
+                // Retired as a protocol: Kiwi Farms now runs an IRC/XMPP portal,
+                // so Sneedchat is offered as an IRC network instead (see the
+                // network tiles in the frontend). Accounts that already exist
+                // keep working; nothing new can be added.
+                { "id": "sneedchat", "name": "Sneedchat", "available": false },
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
                 { "id": "twitch", "name": "Twitch", "available": true },
