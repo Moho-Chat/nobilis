@@ -39,9 +39,6 @@ pub mod live;
 pub mod send;
 pub mod auth;
 
-// Not `pub use`: what a room's socket does with a frame is this folder's
-// business; the files beside it want the helpers.
-use chat::*;
 pub use connect::*;
 pub use media::*;
 pub use postimg::*;
@@ -58,15 +55,11 @@ pub mod smilies;
 pub mod totp;
 
 use crate::accounts::{SneedChatAccountConfig, SneedChatRoom};
-use crate::net::tor::{BoxStream, Transport};
+use crate::net::tor::Transport;
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use auth::{Credentials, Session, TwoFactor};
 use bytes::Bytes;
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::FutureExt;
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::WebSocketStream;

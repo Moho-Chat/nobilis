@@ -1,112 +1,52 @@
 //! Everything this client puts into a room.
+//!
+//! Over the account's one socket (chat.rs). A post waits for its own echo,
+//! which carries the nonce it was sent with; an edit or a removal waits for
+//! the chat's `command_ack`. Either way the call answers with what the chat
+//! said, so a refused message is said to be refused rather than left grey.
 
 use super::*;
+use serde_json::json;
 
-/// Sends a message, optionally as a reply to someone.
-///
-/// Sneedchat has no reply field: the site's own client answers somebody by
-/// opening the message with an `@Name,` mention, which is what its users and
-/// its own notification rules recognise as being replied to. So a reply here
-/// is that mention, added by the daemon rather than left to each frontend to
-/// know the convention - and skipped when the message already opens with it,
-/// so replying twice to the same person does not stack them up.
-pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<&str>) -> Result<()> {
-    // Typed rather than chosen from a menu, which is what somebody used to the
-    // site will do. Routed through the same path either way, so it is recorded
-    // as a whisper here too - passed straight through it would be a real
-    // whisper that this client never saw, since the site echoes none back.
-    // Told who might be meant, because a name with a space in it cannot be
-    // picked out of the text any other way - see parse_whisper_command_among.
-    //
-    // Two sources, because neither is enough alone: the room's roster is the
-    // authority on who is here, and this site does not always send one - but
-    // whoever has spoken lately is in the log either way, and is who somebody
-    // is usually answering.
-    let buffer_id = crate::model::buffer_id(account_id, buffer_name);
-    let mut roster: Vec<String> = state
-        .runtime
-        .get_presence(&buffer_id)
-        .and_then(|members| {
-            members.as_array().map(|list| {
-                list.iter().filter_map(|m| m["nick"].as_str().map(str::to_string)).collect()
-            })
-        })
-        .unwrap_or_default();
-    if let Ok(spoken) = state.store.recent_senders(&buffer_id, 200) {
-        for name in spoken {
-            if !roster.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                roster.push(name);
-            }
-        }
-    }
-    if let Some((target, text)) = protocol::parse_whisper_command_among(body, &roster) {
-        return send_whisper(state, account_id, &target, &text, Some(buffer_name));
-    }
-    let body = as_reply(body, reply_to);
-    let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
-    let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender.send(text).map_err(|_| anyhow!("chat socket closed"))?;
-    Ok(())
+/// The message a reply answers: who wrote it, its id, and what it said.
+#[derive(Clone, Debug)]
+pub struct ReplyTo {
+    pub from: String,
+    pub id: String,
+    pub body: String,
 }
 
-/// Sends a private message to one person.
-///
-/// Goes out on whichever room connection is to hand: a whisper is not part of
-/// any room's conversation, so any open socket carries it.
-///
-/// Recorded locally as well as sent. Unlike a room message, the site does not
-/// echo a whisper back to whoever sent it, so without this you would see only
-/// one side of your own conversation.
-///
-/// Recorded from *us*, with the target written into the line. There is no
-/// field on a message for "and this went to Someone", and a whisper filed
-/// under the recipient's name reads as something they said - which is what it
-/// used to do. The `@name` is what the site puts there too, so the line reads
-/// the way the same whisper reads on the site.
-pub fn send_whisper(
-    state: &AppState,
-    account_id: &str,
-    target: &str,
-    body: &str,
-    // `from_buffer`: the conversation it was sent from, so it appears there
-    // rather than in every room. None falls back to all of them, which is
-    // right for a caller that has no room in mind.
-    from_buffer: Option<&str>,
-) -> Result<()> {
-    let target = target.trim();
-    if target.is_empty() {
-        bail!("no one to whisper to");
+/// The body that goes out: the reply's quote, as the site's own client
+/// writes one, then what was typed.
+pub(super) fn compose(body: &str, reply: Option<&ReplyTo>) -> String {
+    let text = body.trim();
+    match reply {
+        Some(r) => format!("{}{text}", protocol::reply_quote(&r.from, &r.id, &r.body)),
+        None => text.to_string(),
     }
-    let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
-    let sender = any_room_sender(state, account_id)?;
-    let wire = protocol::prepare_whisper(target, &text);
-    // The addressing, not the message: enough to tell a wrong command from a
-    // wrong target without putting somebody's private message in a log.
-    tracing::debug!(
-        "sneedchat[{account_id}]: sending whisper addressed {:?}",
-        protocol::prepare_whisper(target, "")
-    );
-    sender.send(wire).map_err(|_| anyhow!("chat socket closed"))?;
-
-    let me = state
-        .accounts
-        .get_sneedchat(account_id)
-        .map(|c| c.display_name.filter(|n| !n.is_empty()).unwrap_or(c.username))
-        .unwrap_or_default();
-    let at = if target.starts_with('@') { "" } else { "@" };
-    let named = target.trim_end_matches(',');
-    record_whisper(state, account_id, &me, &format!("{at}{named}, {text}"), None, None, false, from_buffer);
-    Ok(())
 }
 
-/// Opens a message with the mention Sneedchat treats as a reply.
-pub(super) fn as_reply(body: &str, reply_to: Option<&str>) -> String {
-    match reply_to {
-        Some(nick) if !nick.is_empty() && !body.trim_start().starts_with(&format!("@{nick},")) => {
-            format!("@{nick}, {}", body.trim_start())
-        }
-        _ => body.to_string(),
+/// Sends a message to the room a buffer shows, optionally as a reply.
+pub async fn send_message(_state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<ReplyTo>) -> Result<()> {
+    let text = compose(body, reply_to.as_ref());
+    if text.is_empty() {
+        return Ok(());
     }
+    if text.len() > 15 * 1024 {
+        bail!("that's longer than the chat takes");
+    }
+    let chat = super::chat::chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+    if !chat.joined(&room) {
+        bail!("not in this room right now - it is still joining");
+    }
+    let nonce = protocol::post_nonce();
+    chat.command(&nonce, json!({ "t": "send", "chat_room_uuid": room, "body": text, "client_nonce": nonce })).await
+}
+
+/// Whispers are side rooms on the new chat - not built yet.
+pub fn send_whisper(_state: &AppState, _account_id: &str, _target: &str, _body: &str, _from_buffer: Option<&str>) -> Result<()> {
+    bail!("whispers aren't supported on the new Sneedchat yet")
 }
 
 /// The "+" attachment button's SneedChat backend. Unlike Discord (whose API
@@ -193,7 +133,7 @@ pub async fn send_attachment(
     let text = if caption.trim().is_empty() { wrapped } else { format!("{caption}\n{wrapped}") };
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.
-    send_message(state, account_id, buffer_name, &text, None)
+    send_message(state, account_id, buffer_name, &text, None).await
 }
 
 /// Posting a file that went to one of the shared upload hosts.
@@ -226,7 +166,7 @@ pub(super) async fn send_via_upload_host(
     let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("");
     let posted = posted_markup(file_name, &link);
     let text = if caption.trim().is_empty() { posted } else { format!("{caption}\n{posted}") };
-    send_message(state, account_id, buffer_name, &text, None)
+    send_message(state, account_id, buffer_name, &text, None).await
 }
 
 /// How a finished upload is written into a message.
@@ -238,23 +178,57 @@ pub(super) fn posted_markup(file_name: &str, link: &str) -> String {
     }
 }
 
-/// `editMessage`'s SneedChat branch (see rpc/methods.rs). The server has no
-/// direct "edit accepted" reply - the edited message just comes back
-/// through the normal live stream with a bumped message_edit_date, which
-/// handle_frame already detects and applies via Runtime::update_message.
-pub fn edit_message(state: &AppState, account_id: &str, buffer_name: &str, msg_id: &str, body: &str) -> Result<()> {
-    let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender.send(protocol::prepare_edit(msg_id, body)).map_err(|_| anyhow!("chat socket closed"))?;
-    Ok(())
+/// Changes what a message says (`revise`).
+pub async fn edit_message(state: &AppState, account_id: &str, _buffer_name: &str, msg_id: &str, body: &str) -> Result<()> {
+    let text = body.trim();
+    if text.is_empty() {
+        bail!("there's nothing to change it to");
+    }
+    // An edit keeps the reply it was: the quote stays at its head.
+    let stored = state.store.get_message(&crate::model::buffer_id(account_id, _buffer_name), msg_id).ok().flatten();
+    let reply = stored.and_then(|m| m.reply_to).map(|r| ReplyTo { from: r.from, id: r.id, body: r.body });
+    let text = compose(text, reply.as_ref());
+    operate(account_id, msg_id, "revise", Some(&text)).await
 }
 
-/// `deleteMessage`'s SneedChat branch - same "no direct reply" story as
-/// edit_message; the deletion gets applied locally once it's echoed back
-/// (either as a top-level `delete` batch or a `deleted`/`is_deleted` flag).
-pub fn delete_message(state: &AppState, account_id: &str, buffer_name: &str, msg_id: &str) -> Result<()> {
-    let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender.send(protocol::prepare_delete(msg_id)).map_err(|_| anyhow!("chat socket closed"))?;
-    Ok(())
+/// Takes a message down (`tombstone`).
+pub async fn delete_message(_state: &AppState, account_id: &str, _buffer_name: &str, msg_id: &str) -> Result<()> {
+    operate(account_id, msg_id, "tombstone", None).await
+}
+
+/// A change to a message: it names the state the message is in, which the
+/// chat checks so that two changes cannot cross.
+async fn operate(account_id: &str, msg_id: &str, action: &str, body: Option<&str>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let known = match chat.known(msg_id) {
+        Some(k) => k.state_seq,
+        None => message_state(&chat, msg_id).await?,
+    };
+    let op = protocol::operation_id();
+    let mut frame = json!({
+        "t": action,
+        "chat_message_uuid": msg_id.to_lowercase(),
+        "expected_message_state_seq": known,
+        "reason": null,
+        "notify_author": false,
+        "chat_operation_uuid": op,
+    });
+    if let Some(b) = body {
+        frame["body"] = json!(b);
+    }
+    chat.command(&op, frame).await
+}
+
+/// A message's current state, asked of the chat - for one this connection
+/// has not seen.
+async fn message_state(chat: &super::chat::Chat, msg_id: &str) -> Result<u64> {
+    let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let host = chat.host.lock().unwrap().clone();
+    let v = super::chat::api_get(&session, &host, &format!("messages/{}", msg_id.to_lowercase())).await?;
+    v["message_state_seq"]
+        .as_u64()
+        .or_else(|| v["message"]["message_state_seq"].as_u64())
+        .ok_or_else(|| anyhow!("the chat didn't say what state that message is in"))
 }
 
 #[cfg(test)]
@@ -275,26 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_opens_with_the_mention_sneedchat_understands() {
-        // Sneedchat has no reply field; answering somebody by name is what
-        // the site's own client does and what its notifications look for.
-        assert_eq!(super::as_reply("sure", Some("Alexcellence")), "@Alexcellence, sure");
-        // Leading space would otherwise land between the comma and the text.
-        assert_eq!(super::as_reply("   sure", Some("Bob")), "@Bob, sure");
-    }
-
-    #[test]
-    fn replying_twice_does_not_stack_mentions() {
-        // Somebody who types the mention themselves, or replies again to the
-        // same person, should not end up with "@Bob, @Bob, ...".
-        assert_eq!(super::as_reply("@Bob, already there", Some("Bob")), "@Bob, already there");
-    }
-
-    #[test]
-    fn a_message_that_is_not_a_reply_is_untouched() {
-        assert_eq!(super::as_reply("plain", None), "plain");
-        // A reply to somebody whose name is unknown - dropped from scrollback -
-        // still sends rather than being lost to a missing mention.
-        assert_eq!(super::as_reply("plain", Some("")), "plain");
+    fn a_reply_opens_with_the_quote_the_site_writes() {
+        let reply = ReplyTo { from: "Ryo Ma".into(), id: "01A1".into(), body: "what's up".into() };
+        assert_eq!(compose("not much", Some(&reply)), "[quote=\"Ryo Ma, chat_message: 01a1\"]what's up[/quote]\nnot much");
+        assert_eq!(compose("  plain  ", None), "plain");
+        // Nothing of their own to quote: sent without a quote rather than not at all.
+        let empty = ReplyTo { from: "Ryo".into(), id: "x".into(), body: "".into() };
+        assert_eq!(compose("hi", Some(&empty)), "hi");
     }
 }

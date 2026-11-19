@@ -17,6 +17,7 @@ use super::captcha;
 use super::http::{CookieJar, HttpClient, Response};
 use super::pow;
 use super::totp;
+#[cfg(test)]
 use crate::net::tor::Transport;
 
 /// Session cookie the forum issues. Clearing it forces a fresh one.
@@ -88,8 +89,15 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
     pub fn new(transport: Transport, base: String, user_agent: String) -> Self {
         Self { http: HttpClient::new(transport, CookieJar::new(), user_agent), base }
+    }
+
+    /// A session whose requests the web helper makes - the only kind the
+    /// site's gate now admits (see net/webhelper.rs).
+    pub fn via_browser(route: super::http::BrowserRoute, base: String) -> Self {
+        Self { http: HttpClient::via_browser(route, CookieJar::new(), String::new()), base }
     }
 
 
@@ -113,8 +121,19 @@ impl Session {
         if resp.status != pow::GATE_STATUS {
             return Ok(resp);
         }
-        pow::clear(&self.http, url, MAX_GATE_STEPS).await.context("solving the gate")?;
-        self.http.get(url).await
+        if self.http.browser_route().is_some() {
+            // The gate's own script, run in a page of the helper's: the
+            // clearance it leaves is good only on that network stack, which is
+            // the one this session's requests already go out on.
+            self.http.clear_gate_in_browser(url).await.context("getting past the site's gate")?;
+        } else {
+            pow::clear(&self.http, url, MAX_GATE_STEPS).await.context("solving the gate")?;
+        }
+        let resp = self.http.get(url).await?;
+        if resp.status == pow::GATE_STATUS {
+            bail!("the site's gate is still in the way after clearing it");
+        }
+        Ok(resp)
     }
 
     /// Drop the session cookie and obtain a new one, logging in again if the
@@ -162,11 +181,6 @@ impl Session {
                 Err(e)
             }
         }
-    }
-
-    /// `Cookie` header for the websocket handshake.
-    pub fn cookie_header(&self) -> Option<String> {
-        self.http.jar.header()
     }
 
     /// Our forum user ID, read from the `xf_user` cookie. XenForo formats

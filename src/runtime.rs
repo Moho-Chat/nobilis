@@ -578,12 +578,6 @@ pub struct Runtime {
     /// Read synchronously by listDiscordFriends (no network round trip
     /// needed at query time, unlike Matrix's listMatrixDevices).
     discord_friends: Mutex<HashMap<String, Vec<serde_json::Value>>>,
-    /// Sneedchat-specific: account id -> room id -> outgoing-frame sender.
-    /// Unlike a single active-room connection, every configured room gets
-    /// its own permanent websocket (see backend/sneedchat/mod.rs), so
-    /// sending has to target the specific room's own socket rather than
-    /// one shared per-account sender.
-    sneedchat_senders: Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
@@ -905,8 +899,6 @@ pub struct Runtime {
     /// A conversation with no entry here is not held on the account at all,
     /// and its level is the daemon's own: see `NotifyStore`.
     notify_held: Mutex<HashMap<String, (crate::notify::NotifyLevel, crate::notify::NotifyLevel)>>,
-    /// (account, room) -> the motd last shown there, so it is shown once.
-    sneedchat_motds: Mutex<HashMap<(String, String), String>>,
     /// (account, channel, split message) -> who has gone, so far.
     ///
     /// A netsplit takes everybody on the far side of it away at once, which
@@ -1181,7 +1173,6 @@ impl Runtime {
             kick_watching: Mutex::new(HashMap::new()),
             matrix_emoticons: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
-            sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             twitch_senders: Mutex::new(HashMap::new()),
             twitch_rights: Mutex::new(HashMap::new()),
@@ -1247,7 +1238,6 @@ impl Runtime {
             matrix_push_rules: Mutex::new(HashMap::new()),
             replaying: Mutex::new(std::collections::HashSet::new()),
             notify_held: Mutex::new(HashMap::new()),
-            sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
             kick_pins: Mutex::new(HashMap::new()),
             matrix_server_facts: Mutex::new(HashMap::new()),
@@ -3816,22 +3806,6 @@ impl Runtime {
         self.sneedchat_rooms.lock().unwrap().insert(account_id.to_string(), rooms);
     }
 
-    /// Whether this is the first time this room has said this particular
-    /// message of the day - and remembers it if so.
-    ///
-    /// Keyed by room, holding the text: the site re-sends the motd on every
-    /// reconnect, and a room that reconnects often would otherwise collect a
-    /// line of it each time. A changed motd is genuinely new and does show.
-    pub fn take_new_sneedchat_motd(&self, account_id: &str, room: &str, motd: &str) -> bool {
-        let mut seen = self.sneedchat_motds.lock().unwrap();
-        let key = (account_id.to_string(), room.to_string());
-        if seen.get(&key).map(String::as_str) == Some(motd) {
-            return false;
-        }
-        seen.insert(key, motd.to_string());
-        true
-    }
-
     /// Marks a buffer as being filled with history, so nothing in it is
     /// announced until it stops. Paired - a caller that sets this must clear
     /// it, including on the error paths, or the buffer goes quiet for good.
@@ -3981,31 +3955,6 @@ impl Runtime {
             .filter(|((acct, _), members)| acct == account_id && members.contains_key(user_id))
             .map(|((_, room_id), _)| room_id.clone())
             .collect()
-    }
-
-    pub fn insert_sneedchat_sender(&self, account_id: &str, room: u32, sender: tokio::sync::mpsc::UnboundedSender<String>) {
-        self.sneedchat_senders.lock().unwrap().entry(account_id.to_string()).or_default().insert(room, sender);
-    }
-
-    /// Only removes the entry if it's still exactly the sender being torn
-    /// down (`same_channel`), not whatever's currently there. `.abort()`ing
-    /// a room task (a respawn from settings changes, or run_with_retry's
-    /// own account-level rebuild after a room's `?` returns an error)
-    /// doesn't wait for that task to actually unwind - its own drop-guard
-    /// cleanup can fire well after a *newer* connection attempt for the
-    /// same room has already registered its own sender. An unconditional
-    /// remove-by-key here would then delete that new, live sender out from
-    /// under it: the room keeps receiving fine (its read loop doesn't
-    /// touch this map at all) while sendMessage starts failing with "not
-    /// currently connected to this room" for no visible reason - confirmed
-    /// as the actual cause of a real "can't send to #fishtank, but still
-    /// receiving" report.
-    pub fn remove_sneedchat_sender(&self, account_id: &str, room: u32, sender: &tokio::sync::mpsc::UnboundedSender<String>) {
-        if let Some(rooms) = self.sneedchat_senders.lock().unwrap().get_mut(account_id) {
-            if rooms.get(&room).is_some_and(|current| current.same_channel(sender)) {
-                rooms.remove(&room);
-            }
-        }
     }
 
     /// Drops every room's sender for this account - called when the whole
@@ -4785,14 +4734,6 @@ impl Runtime {
         if let Some(b) = updated {
             state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
-    }
-
-    pub fn clear_sneedchat_senders(&self, account_id: &str) {
-        self.sneedchat_senders.lock().unwrap().remove(account_id);
-    }
-
-    pub fn sneedchat_sender(&self, account_id: &str, room: u32) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
-        self.sneedchat_senders.lock().unwrap().get(account_id).and_then(|rooms| rooms.get(&room)).cloned()
     }
 
     /// Sends QUIT to every currently-connected account - called on
@@ -6137,7 +6078,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, fluxer_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
+            kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, fluxer_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
@@ -6157,7 +6098,7 @@ impl Runtime {
             discord_member_list_targets, discord_voice_channels, discord_voice_states,
             discord_voice_names, discord_voice_avatars, discord_forum_tags, matrix_member_avatars,
             matrix_room_avatars, matrix_room_topics, matrix_power_levels, matrix_pinned,
-            matrix_room_members, matrix_read_receipts, sneedchat_motds,
+            matrix_room_members, matrix_read_receipts,
             irc_whois, discord_mutes, matrix_presence,
             matrix_own_reactions, irc_splits, matrix_widgets,
             matrix_directs, discord_stage_topics,

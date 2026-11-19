@@ -66,17 +66,37 @@ impl CookieJar {
 
     /// Absorb `Set-Cookie` headers from a response.
     fn absorb(&self, resp: &hyper::Response<hyper::body::Incoming>) {
-        for hv in resp.headers().get_all(SET_COOKIE) {
+        self.absorb_headers(resp.headers());
+    }
+
+    /// Takes in a response's `Set-Cookie`s.
+    ///
+    /// Deletions first, then values. The jar keys by name alone, and a site
+    /// may set a cookie at one path and delete one of the same name at another
+    /// in the same answer - Ephyra's `POST /chat/v1/sessions` does exactly
+    /// that - and applied in order, the deletion would throw away the value
+    /// just set.
+    pub fn absorb_headers(&self, headers: &hyper::HeaderMap) {
+        let mut sets = Vec::new();
+        let mut removals = Vec::new();
+        for hv in headers.get_all(SET_COOKIE) {
             let Ok(s) = hv.to_str() else { continue };
             let Some(pair) = s.split(';').next() else { continue };
             if let Some((k, v)) = pair.split_once('=') {
-                let (k, v) = (k.trim(), v.trim());
+                let (k, v) = (k.trim().to_string(), v.trim().to_string());
                 if v.is_empty() {
-                    self.inner.lock().unwrap().remove(k);
+                    removals.push(k);
                 } else {
-                    self.set(k, v);
+                    sets.push((k, v));
                 }
             }
+        }
+        let mut jar = self.inner.lock().unwrap();
+        for k in removals {
+            jar.remove(&k);
+        }
+        for (k, v) in sets {
+            jar.insert(k, v);
         }
     }
 
@@ -103,11 +123,51 @@ pub struct HttpClient {
     transport: Transport,
     pub jar: CookieJar,
     user_agent: String,
+    /// Through the web helper rather than a socket of our own - for a site
+    /// whose gate admits only a browser's network stack - and by which proxy,
+    /// if any (see net/webhelper.rs). The jar stays here either way.
+    browser: Option<BrowserRoute>,
+}
+
+/// How a browser-routed client reaches the site: directly, or by a SOCKS5
+/// proxy (`socks5://host:port`), which is how Tor is reached from Chromium.
+#[derive(Clone, Debug, Default)]
+pub struct BrowserRoute {
+    pub proxy: Option<String>,
 }
 
 impl HttpClient {
     pub fn new(transport: Transport, jar: CookieJar, user_agent: String) -> Self {
-        Self { transport, jar, user_agent }
+        Self { transport, jar, user_agent, browser: None }
+    }
+
+    /// A client whose requests the web helper makes, on Chromium's stack.
+    pub fn via_browser(route: BrowserRoute, jar: CookieJar, user_agent: String) -> Self {
+        Self { transport: Transport::Direct, jar, user_agent, browser: Some(route) }
+    }
+
+    pub fn browser_route(&self) -> Option<&BrowserRoute> {
+        self.browser.as_ref()
+    }
+
+    /// Lets the site's gate run in a browser page and keeps the clearance it
+    /// hands out. Only for a browser-routed client: the clearance is honoured
+    /// from no other network stack.
+    pub async fn clear_gate_in_browser(&self, url: &str) -> Result<()> {
+        let route = self.browser.as_ref().context("only a browser-routed client can clear the gate this way")?;
+        let cookies: Vec<crate::net::webhelper::Cookie> = self
+            .jar
+            .snapshot()
+            .into_iter()
+            .map(|(name, value)| crate::net::webhelper::Cookie { name, value, path: "/".into() })
+            .collect();
+        let after = crate::net::webhelper::clear_gate(url, &cookies, route.proxy.as_deref()).await?;
+        for c in after {
+            if !c.value.is_empty() {
+                self.jar.set(&c.name, &c.value);
+            }
+        }
+        Ok(())
     }
 
     pub async fn get(&self, url: &str) -> Result<Response> {
@@ -172,6 +232,14 @@ impl HttpClient {
         bail!("too many redirects for {url}")
     }
 
+    /// One request with a body of a stated type and any extra headers - the
+    /// chat's own API, which takes JSON and is asked for JSON. Not redirected:
+    /// an API that answers with a redirect has said no.
+    pub async fn request(&self, method: Method, url: &str, body: Option<String>, content_type: Option<&str>, extra_headers: &[(&str, &str)]) -> Result<Response> {
+        let (status, headers, bytes) = self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, extra_headers).await?;
+        Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
+    }
+
     async fn send_once(&self, method: Method, url: &str, body: Option<String>) -> Result<Response> {
         let (status, headers, bytes) = self.send_once_raw(method, url, body).await?;
         Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
@@ -197,6 +265,28 @@ impl HttpClient {
         let host = parsed.host_str().context("URL has no host")?.to_string();
         let tls = parsed.scheme() == "https";
         let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+
+        if let Some(route) = &self.browser {
+            // The same request, made by the web helper: our headers, our jar,
+            // Chromium's connection.
+            let mut headers: Vec<(String, String)> = Vec::new();
+            if !extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+                headers.push(("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into()));
+            }
+            headers.push(("Accept-Language".into(), "en-US,en;q=0.5".into()));
+            if let Some(c) = self.jar.header() {
+                headers.push(("Cookie".into(), c));
+            }
+            if let Some(ct) = content_type {
+                headers.push(("Content-Type".into(), ct.into()));
+            }
+            for (k, v) in extra_headers {
+                headers.push(((*k).into(), (*v).into()));
+            }
+            let resp = crate::net::webhelper::request(method.as_str(), url, &headers, body.as_deref(), route.proxy.as_deref()).await?;
+            self.jar.absorb_headers(&resp.headers);
+            return Ok((resp.status, resp.headers, resp.body));
+        }
 
         let stream = self.transport.connect(&host, port, tls).await?;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.context("HTTP handshake")?;

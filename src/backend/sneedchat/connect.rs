@@ -58,7 +58,6 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
                 ("internal error (see nobilis logs)".to_string(), false)
             }
         };
-        state.runtime.clear_sneedchat_senders(account_id);
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
 
         // Signing in failed, so no room got as far as trying. Asked which
@@ -102,12 +101,6 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
-}
-
-pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<Transport> {
-    let account_id = account_id.to_string();
-    let state2 = state.clone();
-    transport_for(state, config, move |msg| state2.runtime.report_progress(&state2, &account_id, msg)).await
 }
 
 /// How this account reaches the forum.
@@ -189,18 +182,32 @@ pub(super) fn no_way_in(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-/// Logs in once, then opens one permanent connection per configured room.
-/// Returns (bails) only if the login itself fails, or if every room task
-/// somehow ends - under normal operation this parks forever, since each
-/// room task retries its own connection internally; the account only gets
-/// fully rebuilt from scratch (fresh transport, fresh login) if this
-/// function returns, which `run_with_retry` treats as a failure like any
-/// other.
-pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
-    let transport = build_transport(state, config, account_id).await?;
+/// How this account's requests reach the site through the web helper:
+/// directly, or by the SOCKS5 address Tor or the proxy listens on.
+///
+/// Only the helper's route: the site's gate admits Chromium's network stack
+/// and nothing else, so even a Tor account's traffic is Chromium's, sent
+/// through the same relay everything else routed uses.
+pub(super) async fn browser_route(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<http::BrowserRoute> {
+    if !crate::net::webhelper::available() {
+        bail!("Sneedchat needs the moho app open: the site admits only a browser, and moho's own browser engine carries the connection");
+    }
+    let router = crate::net::route::router();
+    if !config.use_tor && !router.tunnel_all() {
+        return Ok(http::BrowserRoute { proxy: None });
+    }
+    let progress = |msg: &str| state.runtime.report_progress(state, account_id, msg);
+    let (host, port) = router.ready(progress).await.context("starting Tor")?;
+    Ok(http::BrowserRoute { proxy: Some(format!("socks5://{host}:{port}")) })
+}
 
-    let base = format!("https://{}", config.site_host());
-    let session = Session::new(transport.clone(), base, DEFAULT_USER_AGENT.to_string());
+/// Signs in, then keeps the account's chat connection up. Returns (bails)
+/// only if signing in fails; under normal operation the connection retries on
+/// its own and this never returns.
+pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
+    let route = browser_route(state, config, account_id).await?;
+    let host = config.site_host();
+    let session = Session::via_browser(route, format!("https://{host}"));
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?),
         None => TwoFactor::None,
@@ -210,67 +217,27 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     state.runtime.report_progress(state, account_id, "logging in...");
     restore_session(&session, config);
     session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
-    // Reaching the site at all is what this records: whatever Tor was doing
-    // before, it is working now, and the count of failures behind it is no
-    // longer evidence of anything.
     if config.use_tor {
         state.tor.note_success().await;
     }
     remember_session(state, account_id, &session);
-    super::media::note_client(account_id, &session.http, &config.site_host());
+    super::media::note_client(account_id, &session.http, &host);
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
     }
 
-    state.runtime.set_own_identity(account_id, &config.username);
+    let me = config.display_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| config.username.clone());
+    state.runtime.set_own_identity(account_id, &me);
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
-    let host = config.site_host();
-    open_first_room(state, account_id, &session, &host).await;
-
-    // Every room the account is in, each on its own connection and all on
-    // this one session - started now, and started or stopped later as rooms
-    // are opened and closed, without signing in again. See live.rs.
-    let _live = super::live::install(account_id, transport, session, host, config);
-    super::live::sync_rooms(state, account_id);
-
-    // The rooms retry on their own and are changed from outside, so this
-    // never resolves on its own - only by the account's task being aborted,
-    // at which point the guard above stops every room as well.
-    std::future::pending::<()>().await;
-    Ok(())
-}
-
-/// Opens a room for an account that has never had any, as a courtesy.
-///
-/// Once per account. After that the room list is whatever the person made it,
-/// including empty: a person who closed every room meant to, and the account
-/// stays signed in with none open until one is added on the Join page.
-///
-/// The room comes from the site's own list, read here with the session that
-/// just signed in. If the list cannot be read the account is left with no
-/// room for now and this is tried again on the next connection.
-async fn open_first_room(state: &AppState, account_id: &str, session: &Session, host: &str) {
-    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
-    if config.rooms_chosen {
-        return;
-    }
-    // An account from before rooms could be closed already has its rooms;
-    // they stand, and are simply recorded as chosen.
-    if !config.rooms.is_empty() {
-        let _ = state.accounts.set_sneedchat_rooms(account_id, config.rooms);
-        return;
-    }
-    match read_catalogue(session, host).await {
-        Ok(catalogue) => {
-            publish_catalogue(state, account_id, &catalogue);
-            if let Some(room) = courtesy_room(&catalogue) {
-                tracing::info!("sneedchat[{account_id}]: opening #{} for a new account", room.name);
-                let _ = state.accounts.set_sneedchat_rooms(account_id, vec![room]);
-            }
+    struct Forget(String);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            super::chat::forget_chat(&self.0);
         }
-        Err(e) => tracing::warn!("sneedchat[{account_id}]: could not read the room list to open a first room: {e:#}"),
     }
+    let _forget = Forget(account_id.to_string());
+    super::chat::run_connection(state, account_id, &session, &host, &creds, &two_factor).await
 }
 
 /// Kicks off a fresh account's first login in the background - unlike
@@ -314,10 +281,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedCh
     // which is exactly the state Connect knows how to retry.
     state.accounts.add_sneedchat(config.clone())?;
 
-    let transport = transport_for(state, config, emit_progress).await?;
-
-    let base = format!("https://{}", config.site_host());
-    let session = Session::new(transport, base, DEFAULT_USER_AGENT.to_string());
+    emit_progress("starting...");
+    let route = browser_route(state, config, &config.account_id()).await?;
+    let session = Session::via_browser(route, format!("https://{}", config.site_host()));
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?),
         None => TwoFactor::None,
