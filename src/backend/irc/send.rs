@@ -478,15 +478,83 @@ pub(super) fn sweep_pending_sends(state: &AppState) {
     }
 }
 
-/// Drops the record of a send the server has now accounted for.
-pub(super) fn settle_send(msg: &Message) {
-    let Some(label) = msg
+/// Drops the record of a send the server has now accounted for, saying whether
+/// `msg` is the echo of one of ours.
+///
+/// Two ways to know. The label is the proper one, but a server may put it on
+/// the `BATCH` that wraps the reply rather than on the echoed line, or not
+/// echo it at all. The fallback is the thing itself: a `PRIVMSG` to the same
+/// target with the same text as a send still waiting.
+///
+/// That fallback is not only a rescue for a missing label. A network that
+/// shows everybody under a pseudonym (kiwifarms: every user, ourselves
+/// included, is `u` plus an id, while registration used our handle) echoes
+/// our own message from a name that is not our nick. Nothing about the line
+/// then says it is ours, so without this the echo is written as somebody
+/// else's, the send is never settled, and six seconds later a second copy
+/// is written locally - a message that "failed" and arrived anyway.
+pub(super) fn settle_send(account_id: &str, msg: &Message) -> bool {
+    let mut all = pending_sends().lock().unwrap();
+    if all.is_empty() {
+        return false;
+    }
+    let label = msg
         .tags
         .as_ref()
         .and_then(|tags| tags.iter().find(|t| t.0 == "label"))
-        .and_then(|t| t.1.clone())
-    else {
-        return;
-    };
-    pending_sends().lock().unwrap().remove(&label);
+        .and_then(|t| t.1.clone());
+    if let Some(label) = label {
+        if all.get(&label).is_some_and(|p| p.account_id == account_id) {
+            all.remove(&label);
+            return matches!(msg.command, Command::PRIVMSG(..));
+        }
+    }
+    let Command::PRIVMSG(target, body) = &msg.command else { return false };
+    let found = all
+        .iter()
+        .find(|(_, p)| p.account_id == account_id && p.target.eq_ignore_ascii_case(target) && p.body.trim() == body.trim())
+        .map(|(label, _)| label.clone());
+    match found {
+        Some(label) => {
+            all.remove(&label);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    fn pending(account: &str, target: &str, body: &str) -> String {
+        let label = next_label();
+        pending_sends().lock().unwrap().insert(
+            label.clone(),
+            PendingSend { account_id: account.into(), target: target.into(), body: body.into(), sent: std::time::Instant::now() },
+        );
+        label
+    }
+
+    /// The echo of a send comes from a pseudonym, not our nick, and carries
+    /// no label: it is still ours, and the send is settled by it.
+    #[test]
+    fn echo_under_another_name_without_a_label_settles_the_send() {
+        let label = pending("echo-test@kf", "#fishtank", "no its double sending");
+        let echo: Message = ":uk0f7bgvv!u@principal/k0f7bgvv PRIVMSG #fishtank :no its double sending".parse().unwrap();
+        assert!(settle_send("echo-test@kf", &echo));
+        assert!(!pending_sends().lock().unwrap().contains_key(&label));
+    }
+
+    /// Somebody else saying the same thing elsewhere is not our echo.
+    #[test]
+    fn other_targets_accounts_and_text_are_not_echoes() {
+        let label = pending("echo-test2@kf", "#a", "hello");
+        for line in [":x!x@h PRIVMSG #b :hello", ":x!x@h PRIVMSG #a :hello there"] {
+            assert!(!settle_send("echo-test2@kf", &line.parse().unwrap()));
+        }
+        assert!(!settle_send("other@kf", &":x!x@h PRIVMSG #a :hello".parse().unwrap()));
+        assert!(pending_sends().lock().unwrap().contains_key(&label));
+        pending_sends().lock().unwrap().remove(&label);
+    }
 }
