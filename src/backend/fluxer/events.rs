@@ -338,7 +338,7 @@ fn edited(state: &AppState, handle: &Handle, data: &Value) {
     let (Some(id), Some(channel)) = (data["id"].as_str(), data["channel_id"].as_str()) else { return };
     let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
     if data["embeds"].is_array() {
-        state.runtime.set_message_embeds(state, &buffer.id, id, &crate::backend::discord::messages::extract_embeds(data));
+        state.runtime.set_message_embeds(state, &buffer.id, id, &messages::embeds_of(handle, data));
     }
     if let Some(content) = data["content"].as_str() {
         let body = {

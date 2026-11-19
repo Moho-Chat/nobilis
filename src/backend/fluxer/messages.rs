@@ -194,6 +194,22 @@ pub fn discord_shaped(message: &Value) -> Value {
     out
 }
 
+/// A message's embeds as Discord's reader makes them, with each one's picture put on: Discord's draws its thumbnails
+/// another way, and a Fluxer link preview came with none (seen on fluxer.com, 2026-11-18). The instance's own proxied
+/// copy is used, so the linked site does not learn who looked.
+pub fn embeds_of(handle: &Handle, message: &Value) -> Vec<crate::model::Embed> {
+    let mut out = discord::extract_embeds(message);
+    let raw: Vec<&Value> = message["embeds"].as_array().into_iter().flatten().collect();
+    for e in out.iter_mut().filter(|e| e.image_url.is_none()) {
+        let Some(r) = raw.iter().find(|r| r["url"].as_str() == e.url.as_deref() && r["title"].as_str() == e.title.as_deref()) else { continue };
+        let picture = [&r["image"], &r["thumbnail"]].into_iter().find_map(|p| p["proxy_url"].as_str().or_else(|| p["url"].as_str()).filter(|u| u.starts_with("https://") || u.starts_with("http://")).map(|u| (u.to_string(), p["content_type"].as_str().map(str::to_string))));
+        if let Some((url, kind)) = picture {
+            e.image_url = Some(media::cached(&handle.account_id, media::MEDIA, &url, None, kind.as_deref()));
+        }
+    }
+    out
+}
+
 /// Records a message, as heard live or read from history. Answers whether it was new.
 pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
     let shaped = discord_shaped(message);
@@ -267,7 +283,7 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
             }
         }
     }
-    let embeds = discord::extract_embeds(message);
+    let embeds = embeds_of(handle, message);
     let reactions = reactions_of(handle, message);
     let mut reply = discord::extract_reply(message);
     if let Some(r) = reply.as_mut() {
