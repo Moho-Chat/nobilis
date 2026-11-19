@@ -42,6 +42,8 @@ pub const CACHES: &[Cache] = &[
     Cache { dir: "telegram-avatars", group: "avatars", max_bytes: 64 * MB },
     Cache { dir: "stoat-media", group: "media", max_bytes: 500 * MB },
     Cache { dir: "stoat-avatars", group: "avatars", max_bytes: 64 * MB },
+    Cache { dir: "fluxer-media", group: "media", max_bytes: 500 * MB },
+    Cache { dir: "fluxer-avatars", group: "avatars", max_bytes: 64 * MB },
     Cache { dir: "signal-media", group: "media", max_bytes: 500 * MB },
     Cache { dir: "signal-avatars", group: "avatars", max_bytes: 64 * MB },
     Cache { dir: "xmpp-media", group: "media", max_bytes: 500 * MB },
@@ -225,6 +227,7 @@ pub async fn restore(state: &AppState, path: &str, buffer_id: Option<&str>, mess
             }
         },
         "stoat-media" | "stoat-avatars" => crate::backend::stoat::media::restore_cached(&path).await?,
+        "fluxer-media" | "fluxer-avatars" => crate::backend::fluxer::media::restore_cached(&path).await?,
         "signal-media" | "signal-avatars" => crate::backend::signal::media::restore_cached(state, &path).await?,
         "xmpp-media" | "xmpp-avatars" => crate::backend::xmpp::media::restore_cached(state, &path).await?,
         _ => bail!("{} is fetched again by what uses it, not by name", cache.dir),

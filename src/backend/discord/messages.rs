@@ -149,7 +149,7 @@ pub fn message_link(channel_id: &str, guild_id: Option<&str>, message_id: &str) 
 /// Attachments beyond the first are also now included (previously only
 /// `attachments[0]` was ever read, silently dropping additional files).
 /// Returns None only when there is truly nothing renderable at all.
-pub(super) fn extract_body(d: &Value) -> Option<String> {
+pub(crate) fn extract_body(d: &Value) -> Option<String> {
     // An AutoMod verdict, which is its own kind of line rather than the
     // person's words: see automod_alert.
     if let Some(alert) = automod_alert(d) {
@@ -647,7 +647,7 @@ pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, m
 /// A forwarded picture is a picture: it belongs in the message the way any
 /// other attachment does, rather than being described in words while the
 /// image itself is dropped.
-pub(super) fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
+pub(crate) fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
     d["message_snapshots"]
         .as_array()
         .into_iter()
@@ -671,7 +671,7 @@ pub(super) fn all_attachments(d: &Value) -> Vec<Attachment> {
     attachments
 }
 
-pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
+pub(crate) fn extract_attachments(d: &Value) -> Vec<Attachment> {
     let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
     // Whether somebody spoke this message rather than attaching a sound file.
     // The flag is on the message, the recording is on the attachment, so it is
@@ -717,7 +717,7 @@ pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
 /// these; a pure image/video/gifv embed has neither and is already fully
 /// represented by extract_body's own media-URL handling above, so
 /// including it here too would just render an empty box under the media.
-pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
+pub(crate) fn extract_embeds(d: &Value) -> Vec<Embed> {
     let mut out = ordinary_embeds(d);
     out.extend(layout_cards(d));
     out
@@ -913,7 +913,7 @@ pub(super) fn mentions_own_user(d: &Value, own_user_id: &str) -> bool {
 /// something even if the original later scrolls out of local history or
 /// gets deleted. `id` is what the frontend's "jump to" click targets if
 /// the original happens to already be loaded.
-pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
+pub(crate) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
     let reply_id = d["message_reference"]["message_id"].as_str()?;
     // A forward carries a reference too - to the message it brought here -
     // and it is not a reply to it. Same row on screen, different word in it:
@@ -1040,7 +1040,7 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
 
 /// What Discord marks an author as, beside their name: "BOT" for a bot or an application, with a check when Discord has
 /// verified it. Read off the author the message carries, so it is there for history and for live messages alike.
-pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
+pub(crate) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
     // Bit 16 of the public flags: a verified bot.
     const VERIFIED_BOT: u64 = 1 << 16;
     // Discord's own account: what it sends is the platform speaking, and says so with the OFFICIAL mark.

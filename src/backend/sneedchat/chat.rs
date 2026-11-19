@@ -1,478 +1,1177 @@
-//! One websocket per room, which is what this protocol allows.
+//! The account's chat connection.
 //!
-//! A connection here joins exactly one room, so an account in three rooms
-//! holds three sockets, each with its own reconnect. The frames they carry
-//! are the same shape whichever room they came from.
+//! Ephyra carries every room on one socket: the account is admitted once
+//! (forum session -> ticket -> chat session), opens one socket, and joins each
+//! of its rooms on it. Opening a room is a `join` on the socket that is
+//! already there, closing one a `leave`.
+//!
+//! Two kinds of room share it. *Listed* rooms are the site's own (#fishtank),
+//! chosen on the Join page and kept in the account's settings. *Side* rooms
+//! are private conversations - what the site calls a whisper - which the chat
+//! itself remembers and names in every `welcome`; each is a conversation of
+//! its own here, named after the people in it.
+//!
+//! The socket and every request go through the web helper (net/webhelper.rs),
+//! because the site's gate admits only a browser's network stack.
 
 use super::*;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-pub(super) const MAX_WS_REDIRECTS: usize = 3;
+use crate::net::webhelper::{self, WsEvent, WsSender};
+use protocol::{Entry, Principal};
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
 
-/// Opens the chat websocket, following redirects manually (tungstenite
-/// doesn't) and presenting the same identity headers a browser on the chat
-/// page would - in particular `Origin`, without which the site's anti-bot
-/// proxy silently drops the upgrade instead of completing or rejecting it
-/// (confirmed live: omitting it just hangs forever with no error at all).
-/// Ported from sneedchat-rs's `chat/socket.rs::connect`.
-pub(super) async fn open_chat_websocket(transport: &Transport, host: &str, cookie_header: &str) -> Result<WebSocketStream<BoxStream>> {
-    let mut url = format!("wss://{host}/chat.ws");
-    let origin = format!("https://{host}");
+/// How long without any frame before the connection is taken for dead. The
+/// client pings every 30 seconds and the server answers, so a live socket is
+/// never this quiet.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const PING_EVERY: Duration = Duration::from_secs(30);
 
-    for _ in 0..=MAX_WS_REDIRECTS {
-        let parsed = url::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
-        let host = parsed.host_str().with_context(|| format!("{url} has no host"))?.to_string();
-        let tls = matches!(parsed.scheme(), "wss" | "https");
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+pub(super) const RECONNECT_INITIAL: Duration = Duration::from_secs(3);
+pub(super) const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
-        let stream = transport.connect(&host, port, tls).await.context("opening chat websocket transport")?;
-        let mut request = url.as_str().into_client_request()?;
-        let headers = request.headers_mut();
-        headers.insert("User-Agent", HeaderValue::from_str(DEFAULT_USER_AGENT)?);
-        // Same-origin request, as a browser on the chat page would send -
-        // without this the anti-bot proxy in front of the site never
-        // completes (or rejects) the upgrade at all.
-        headers.insert("Origin", HeaderValue::from_str(&origin)?);
-        if !cookie_header.is_empty() {
-            headers.insert("Cookie", HeaderValue::from_str(cookie_header).context("cookie header")?);
+/// Refusals that mean "not now" rather than "no" - worth one more try.
+pub(super) const TRANSIENT: [&str; 3] = ["rate_limited", "unavailable", "internal_error"];
+
+/// What one account's connection knows, shared with what sends on it.
+#[derive(Default)]
+pub(super) struct Chat {
+    pub(super) me: Mutex<Option<Principal>>,
+    rooms: Mutex<HashMap<String, RoomState>>,
+    messages: Mutex<HashMap<String, Known>>,
+    waiters: Mutex<HashMap<String, oneshot::Sender<std::result::Result<(), String>>>>,
+    pub(super) people: Mutex<HashMap<String, Principal>>,
+    /// This account's own reaction on each message it has been told about:
+    /// a message the chat covered and named nothing for maps to None.
+    own_reactions: Mutex<HashMap<String, Option<String>>>,
+    /// Who is sanctioned, by principal: the sanction's id, which lifting it
+    /// has to name.
+    sanctions: Mutex<HashMap<String, String>>,
+    frozen: AtomicBool,
+    socket: Mutex<Option<WsSender>>,
+    pub(super) session: Mutex<Option<Session>>,
+    pub(super) host: Mutex<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum RoomKind {
+    #[default]
+    Listed,
+    Side,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RoomState {
+    /// The conversation it is shown as: `#slug` for a listed room, the other
+    /// people's names for a side room.
+    buffer: String,
+    kind: RoomKind,
+    /// A side room's members, ourselves included.
+    members: Vec<Principal>,
+    /// A side room with more than one other person in it: a group chat,
+    /// shown with its member list, rather than a direct message.
+    group: bool,
+    last: Option<u64>,
+    /// The oldest entry held, where history paging continues from.
+    first: Option<u64>,
+    replay_to: Option<u64>,
+    joined: bool,
+}
+
+impl RoomState {
+    fn buffer_kind(&self) -> &'static str {
+        match self.kind {
+            RoomKind::Listed => "channel",
+            RoomKind::Side if self.group => "channel",
+            RoomKind::Side => "dm",
         }
+    }
 
-        match tokio_tungstenite::client_async(request, stream).await {
-            Ok((ws, _resp)) => return Ok(ws),
-            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
-                let status = resp.status();
-                if status.as_u16() == pow::GATE_STATUS {
-                    bail!("blocked by the anti-bot gate during the chat handshake");
-                }
-                let location = resp.headers().get(hyper::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
-                match (status.is_redirection(), location) {
-                    (true, Some(loc)) => {
-                        url = resolve_ws_redirect(&url, &loc)?;
-                        tracing::info!("sneedchat: websocket redirected to {url}");
+    /// Whether a side room has more than one other person in it.
+    fn is_group(members: &[Principal], me: &str) -> bool {
+        members.iter().filter(|m| m.uuid != me).count() > 1
+    }
+}
+
+/// What an edit or a removal has to name: the state the message is in,
+/// which the chat refuses to change from under somebody else.
+#[derive(Clone, Debug)]
+pub(super) struct Known {
+    pub state_seq: u64,
+    pub room: String,
+}
+
+fn chats() -> &'static Mutex<HashMap<String, Arc<Chat>>> {
+    static CHATS: OnceLock<Mutex<HashMap<String, Arc<Chat>>>> = OnceLock::new();
+    CHATS.get_or_init(Default::default)
+}
+
+/// The account's connection state, made if there is none.
+pub(super) fn chat(account_id: &str) -> Arc<Chat> {
+    chats().lock().unwrap().entry(account_id.to_string()).or_default().clone()
+}
+
+/// Forgets an account's connection state (it was removed or disconnected).
+pub(super) fn forget_chat(account_id: &str) {
+    chats().lock().unwrap().remove(account_id);
+}
+
+impl Chat {
+    /// The live socket, if there is one and it is welcomed.
+    pub(super) fn socket(&self) -> Option<WsSender> {
+        self.socket.lock().unwrap().clone()
+    }
+
+    pub(super) fn send(&self, frame: &Value) -> bool {
+        match self.socket() {
+            Some(s) => s.send(&frame.to_string()).is_ok(),
+            None => false,
+        }
+    }
+
+    pub(super) fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn joined(&self, room: &str) -> bool {
+        self.rooms.lock().unwrap().get(room).is_some_and(|r| r.joined)
+    }
+
+    pub(super) fn known(&self, message: &str) -> Option<Known> {
+        self.messages.lock().unwrap().get(&message.to_lowercase()).cloned()
+    }
+
+    fn remember(&self, message: &str, room: &str, state_seq: u64) {
+        let mut all = self.messages.lock().unwrap();
+        // Bounded: a long-lived connection in busy rooms would otherwise keep
+        // every message it ever saw. What falls out is old enough that an
+        // edit to it looks the state up afresh.
+        if all.len() > 50_000 {
+            all.clear();
+        }
+        all.insert(message.to_string(), Known { state_seq, room: room.to_string() });
+    }
+
+    pub(super) fn own_reaction(&self, message: &str) -> Option<String> {
+        self.own_reactions.lock().unwrap().get(message).cloned().flatten()
+    }
+
+    pub(super) fn sanction_of(&self, principal: &str) -> Option<String> {
+        self.sanctions.lock().unwrap().get(principal).cloned()
+    }
+
+    /// Waits for the answer to something sent under `key` - a post's nonce, a
+    /// command's operation id, or a message's uuid for a reaction.
+    pub(super) fn expect(&self, key: &str) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().unwrap().insert(key.to_string(), tx);
+        rx
+    }
+
+    pub(super) fn give_up(&self, key: &str) {
+        self.waiters.lock().unwrap().remove(key);
+    }
+
+    fn answer(&self, key: &str, result: std::result::Result<(), String>) -> bool {
+        match self.waiters.lock().unwrap().remove(key) {
+            Some(tx) => {
+                let _ = tx.send(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sends a frame that expects an answer under `key`, and waits for it.
+    ///
+    /// A refusal that means "not now" is tried once more after a moment. A
+    /// durable command (one with an operation id) whose answer never comes is
+    /// asked after with `query_operation`, which answers with what became of
+    /// it - so a lost answer is not reported as a failure that went through.
+    pub(super) async fn command(&self, key: &str, frame: Value) -> Result<()> {
+        if self.frozen() && frame["t"] != "query_operation" {
+            bail!("{}", protocol::describe_error("frozen"));
+        }
+        let durable = frame.get("chat_operation_uuid").is_some();
+        let mut retried = false;
+        loop {
+            let rx = self.expect(key);
+            if !self.send(&frame) {
+                self.give_up(key);
+                bail!("not connected to the chat right now");
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => bail!("the chat connection dropped before it answered"),
+                Err(_) => {
+                    self.give_up(key);
+                    if !durable {
+                        bail!("the chat hasn't answered - it may still go through");
                     }
-                    _ => bail!("chat handshake rejected with HTTP {status}"),
+                    let rx = self.expect(key);
+                    if !self.send(&json!({ "t": "query_operation", "chat_operation_uuid": key })) {
+                        self.give_up(key);
+                        bail!("the chat hasn't answered - it may still go through");
+                    }
+                    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                        Ok(Ok(result)) => result,
+                        _ => {
+                            self.give_up(key);
+                            bail!("the chat hasn't answered - it may still go through");
+                        }
+                    }
+                }
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                // Asked after and never heard of: it was lost on the way, so
+                // it goes again (same id, so it cannot be done twice).
+                Err(code) if code == "operation_not_found" && !retried => retried = true,
+                Err(code) if TRANSIENT.contains(&code.as_str()) && !retried => {
+                    retried = true;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                Err(code) => bail!("{}", protocol::describe_error(&code)),
+            }
+        }
+    }
+
+    /// The listed rooms the account wants, as the connection tracks them: new
+    /// ones added (and joined, when the socket is up), dropped ones left. Side
+    /// rooms are the chat's to list and are left alone.
+    pub(super) fn want_rooms(&self, rooms: &[SneedChatRoom]) {
+        let mut joins = Vec::new();
+        let mut leaves = Vec::new();
+        {
+            let mut tracked = self.rooms.lock().unwrap();
+            tracked.retain(|uuid, state| {
+                let keep = state.kind == RoomKind::Side || rooms.iter().any(|r| &r.id == uuid);
+                if !keep && state.joined {
+                    leaves.push(uuid.clone());
+                }
+                keep
+            });
+            for room in rooms.iter().filter(|r| protocol::is_uuid(&r.id)) {
+                let state = tracked.entry(room.id.clone()).or_default();
+                state.buffer = room_buffer_name(&room.name);
+                if !state.joined {
+                    joins.push((room.id.clone(), state.last));
                 }
             }
-            Err(e) => return Err(anyhow::Error::new(e).context("chat websocket handshake")),
+        }
+        for uuid in leaves {
+            self.send(&json!({ "t": "leave", "chat_room_uuid": uuid }));
+        }
+        for (uuid, last) in joins {
+            self.join(&uuid, last);
         }
     }
-    bail!("chat handshake redirected more than {MAX_WS_REDIRECTS} times (last: {url})")
-}
 
-/// Resolves a redirect target against the current URL, normalising an
-/// `http(s)` location back to `ws(s)` so the handshake stays a websocket one.
-pub(super) fn resolve_ws_redirect(base: &str, location: &str) -> Result<String> {
-    let joined = url::Url::parse(base)?.join(location)?;
-    let mut out = joined.clone();
-    let scheme = match joined.scheme() {
-        "http" => Some("ws"),
-        "https" => Some("wss"),
-        _ => None,
-    };
-    if let Some(s) = scheme {
-        out.set_scheme(s).map_err(|_| anyhow!("could not rewrite scheme of {joined}"))?;
+    /// A side room the chat has told us of, tracked and joined.
+    fn want_side_room(&self, uuid: &str, after: Option<u64>) {
+        let join = {
+            let mut tracked = self.rooms.lock().unwrap();
+            let state = tracked.entry(uuid.to_string()).or_insert_with(|| RoomState { kind: RoomKind::Side, ..Default::default() });
+            state.kind = RoomKind::Side;
+            !state.joined
+        };
+        if join {
+            self.join(uuid, after);
+        }
     }
-    Ok(out.to_string())
+
+    fn join(&self, uuid: &str, after: Option<u64>) {
+        let mut frame = json!({ "t": "join", "chat_room_uuid": uuid });
+        if let Some(seq) = after {
+            frame["after_seq"] = json!(seq);
+        }
+        self.send(&frame);
+    }
+
+    /// The conversation a room is shown as, and its kind.
+    fn buffer_of(&self, uuid: &str) -> Option<(String, &'static str)> {
+        self.rooms.lock().unwrap().get(uuid).filter(|r| !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind()))
+    }
+
+    /// The room a conversation shows, by uuid.
+    pub(super) fn room_of_buffer(&self, buffer_name: &str) -> Option<String> {
+        self.rooms.lock().unwrap().iter().find(|(_, r)| r.buffer == buffer_name).map(|(uuid, _)| uuid.clone())
+    }
+
+    /// Leaves the side room a conversation shows, if it is one: the chat is
+    /// told, and the room is no longer tracked, so nothing in it reopens the
+    /// conversation. Whether it was a side room.
+    pub(super) fn leave_side_room(&self, buffer_name: &str) -> bool {
+        let uuid = {
+            let mut rooms = self.rooms.lock().unwrap();
+            let Some(uuid) = rooms.iter().find(|(_, r)| r.kind == RoomKind::Side && r.buffer == buffer_name).map(|(u, _)| u.clone()) else {
+                return false;
+            };
+            rooms.remove(&uuid);
+            uuid
+        };
+        self.send(&json!({ "t": "leave", "chat_room_uuid": uuid }));
+        true
+    }
+
+    /// This account's side rooms: (uuid, conversation name, whether a group).
+    pub(super) fn side_rooms(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<(String, String, bool)> = self
+            .rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.kind == RoomKind::Side && !r.buffer.is_empty())
+            .map(|(u, r)| (u.clone(), r.buffer.clone(), r.group))
+            .collect();
+        out.sort_by_key(|r| r.1.to_lowercase());
+        out
+    }
+
+    /// Whether somebody is already in a side room.
+    pub(super) fn in_room(&self, room: &str, principal: &str) -> bool {
+        self.rooms.lock().unwrap().get(room).is_some_and(|r| r.members.iter().any(|m| m.uuid == principal))
+    }
+
+    /// The side room that is a conversation with exactly this person, if any.
+    pub(super) fn side_room_with(&self, principal: &str) -> Option<(String, String)> {
+        let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        self.rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, r)| {
+                r.kind == RoomKind::Side && {
+                    let others: Vec<&str> = r.members.iter().map(|m| m.uuid.as_str()).filter(|u| *u != me).collect();
+                    others == [principal]
+                }
+            })
+            .map(|(uuid, r)| (uuid.clone(), r.buffer.clone()))
+    }
+
+    /// Somebody, by the name shown for them.
+    pub(super) fn person_named(&self, name: &str) -> Option<Principal> {
+        let name = name.trim().trim_start_matches('@');
+        self.people.lock().unwrap().values().find(|p| p.name.eq_ignore_ascii_case(name)).cloned()
+    }
+
+    /// Everyone known, as (uuid, name) for writing mentions.
+    pub(super) fn known_names(&self) -> Vec<(String, String)> {
+        self.people.lock().unwrap().values().map(|p| (p.uuid.clone(), p.name.clone())).collect()
+    }
+
+    /// The oldest entry held in a room and whether more is before it.
+    pub(super) fn history_cursor(&self, room: &str) -> Option<u64> {
+        self.rooms.lock().unwrap().get(room).and_then(|r| r.first).filter(|f| *f > 1)
+    }
+
+    fn note_first(&self, room: &str, seq: u64) {
+        if let Some(r) = self.rooms.lock().unwrap().get_mut(room) {
+            if r.first.is_none_or(|f| seq < f) {
+                r.first = Some(seq);
+            }
+        }
+    }
 }
 
-pub(super) const ROOM_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
+/// Gets this session admitted to the chat: a ticket from the forum, traded
+/// for the chat's own session cookie. The chat's own page is the one asked
+/// for the ticket's form token, because it also carries what each room lets
+/// this account do and the reactions the site offers.
+pub(super) async fn admit(session: &Session, host: &str) -> Result<()> {
+    let base = format!("https://{host}");
+    let page = session.fetch(&format!("{base}/ephyra-chat/")).await.context("loading the chat page")?;
+    let page = if page.body.contains("data-csrf=\"") { page } else { session.fetch(&format!("{base}/")).await.context("loading the forum")? };
+    let token = protocol::attr(&page.body, "data-csrf").context("the forum page carries no form token - its markup may have changed")?;
+    super::catalogue::take_page(&session.http, host, &page.body).await;
+    let form = http::encode_form(&[("_xfToken", &token)]);
+    let resp = session
+        .http
+        .request(hyper::Method::POST, &format!("{base}/ephyra-chat/ticket"), Some(form), Some("application/x-www-form-urlencoded"), &[("Accept", "application/json")])
+        .await
+        .context("asking the forum for a chat ticket")?;
+    let ticket = serde_json::from_str::<Value>(&resp.body)
+        .ok()
+        .and_then(|v| v["ticket"].as_str().map(str::to_string))
+        .filter(|t| !t.is_empty())
+        .with_context(|| format!("the forum gave no chat ticket (HTTP {})", resp.status))?;
+    let resp = session
+        .http
+        .request(
+            hyper::Method::POST,
+            &format!("{base}/chat/v1/sessions"),
+            Some(json!({ "ticket": ticket }).to_string()),
+            Some("application/json"),
+            &[("Accept", "application/json"), ("Origin", &base)],
+        )
+        .await
+        .context("starting a chat session")?;
+    if !(200..300).contains(&resp.status) {
+        bail!("the chat refused the ticket (HTTP {}): {}", resp.status, resp.body.chars().take(200).collect::<String>());
+    }
+    Ok(())
+}
 
-pub(super) const ROOM_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// A JSON read from the chat's own API, admitted.
+pub(super) async fn api_get(session: &Session, host: &str, path: &str) -> Result<Value> {
+    let base = format!("https://{host}");
+    let resp = session.http.request(hyper::Method::GET, &format!("{base}/chat/v1/{path}"), None, None, &[("Accept", "application/json"), ("Origin", &base)]).await?;
+    if !(200..300).contains(&resp.status) {
+        bail!("the chat answered HTTP {} for {path}", resp.status);
+    }
+    serde_json::from_str(&resp.body).with_context(|| format!("reading the chat's answer for {path}"))
+}
 
-/// One room's own indefinite reconnect loop, reusing the account-wide
-/// shared `session` (cloning it is cheap - its cookie jar is Arc-shared,
-/// so a refresh done here is immediately visible to every other room's
-/// next attempt too).
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_room(
-    state: &AppState,
-    transport: &Transport,
-    session: &Session,
-    creds: &Credentials,
-    two_factor: &TwoFactor,
-    account_id: &str,
-    host: &str,
-    room: &SneedChatRoom,
-    whisper_room: std::sync::Arc<std::sync::atomic::AtomicU32>,
-) {
-    let mut delay = ROOM_RECONNECT_INITIAL_DELAY;
-    // The room is on screen before it is joined, saying so, rather than
-    // appearing only once its socket is up - a room that cannot connect at
-    // all was otherwise simply absent, with nothing to say why.
-    let buffer_id = state.runtime.ensure_buffer(state, account_id, &room_buffer_name(&room.name), "channel").id;
-    state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
-    let mut failures = 0u32;
+/// Keeps the account's chat connection up, for as long as this task lives:
+/// admitted, connected, its rooms joined - again after every interruption,
+/// refreshing the forum session when the chat stops recognising it.
+pub(super) async fn run_connection(state: &AppState, account_id: &str, session: &Session, host: &str, creds: &Credentials, two_factor: &TwoFactor) -> Result<()> {
+    let chat = chat(account_id);
+    *chat.session.lock().unwrap() = Some(session.clone());
+    *chat.host.lock().unwrap() = host.to_string();
+    let mut delay = RECONNECT_INITIAL;
+    let mut first = true;
     loop {
         let started = std::time::Instant::now();
-        let result = std::panic::AssertUnwindSafe(run_room_once(state, transport, session, account_id, host, room, &whisper_room)).catch_unwind().await;
-        // A connection that lasted a while and then dropped is a new run of
-        // trouble, not the next failure in one.
-        if started.elapsed() > ROOM_RECONNECT_MAX_DELAY {
-            failures = 0;
+        let result = connect_once(state, account_id, &chat, session, host, first).await;
+        first = false;
+        *chat.socket.lock().unwrap() = None;
+        for state in chat.rooms.lock().unwrap().values_mut() {
+            state.joined = false;
         }
-        failures += 1;
-        if failures == 1 {
-            // Once is a blip - a socket dropped after hours, the next attempt
-            // a few seconds away. Saying "the chat is down" over that would
-            // be wrong far more often than right.
-            state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
-        } else {
-            // Twice running: ask which part is down - Tor, the forum, or only
-            // the chat - so the room can say so while it waits. See health.rs.
-            let outage = super::health::diagnose(account_id, transport, host).await;
-            state.runtime.set_buffer_link(state, &buffer_id, Some(outage.link(host)));
+        // Whatever was waiting on this socket will not hear from it now.
+        chat.waiters.lock().unwrap().clear();
+        if started.elapsed() > RECONNECT_MAX {
+            delay = RECONNECT_INITIAL;
         }
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("sneedchat[{account_id}] room {} ({}): {e:#}", room.id, room.name);
-                // A stale session is the most likely reason one specific
-                // room starts failing while the others keep working -
-                // refresh before retrying rather than hammering the same
-                // rejected cookies every backoff cycle.
-                if let Err(re) = session.refresh(creds, two_factor).await {
-                    tracing::warn!("sneedchat[{account_id}] room {}: session refresh failed: {re:#}", room.id);
+            Ok(()) => tracing::info!("sneedchat[{account_id}]: chat connection closed"),
+            Err(e) => {
+                tracing::warn!("sneedchat[{account_id}]: chat connection: {e:#}");
+                if format!("{e:#}").contains("as a guest") {
+                    if let Err(re) = session.refresh(creds, two_factor).await {
+                        tracing::warn!("sneedchat[{account_id}]: refreshing the forum session: {re:#}");
+                    }
                 }
             }
-            Err(_) => tracing::error!("sneedchat[{account_id}] room {} ({}): task panicked", room.id, room.name),
         }
-        // No cleanup call here - run_room_once's own RemoveSenderOnDrop
-        // guard already ran (on every return path, including a panic) by
-        // the time this line is reached, and it's the one that actually
-        // knows which specific sender to remove (see its own doc comment
-        // on why an unconditional remove-by-key here would be unsafe).
+        let buffers: Vec<String> = chat.rooms.lock().unwrap().values().map(|r| r.buffer.clone()).filter(|b| !b.is_empty()).collect();
+        for name in buffers {
+            let buffer_id = crate::model::buffer_id(account_id, &name);
+            state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
+        }
         tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(ROOM_RECONNECT_MAX_DELAY);
+        delay = (delay * 2).min(RECONNECT_MAX);
     }
 }
 
-pub(super) async fn run_room_once(
-    state: &AppState,
-    transport: &Transport,
-    session: &Session,
-    account_id: &str,
-    host: &str,
-    room: &SneedChatRoom,
-    whisper_room: &std::sync::atomic::AtomicU32,
-) -> Result<()> {
-    let cookie_header = session.cookie_header().unwrap_or_default();
-    let ws = open_chat_websocket(transport, host, &cookie_header).await?;
-    let (sink, mut incoming) = ws.split();
+async fn connect_once(state: &AppState, account_id: &str, chat: &Arc<Chat>, session: &Session, host: &str, first: bool) -> Result<()> {
+    admit(session, host).await?;
+    // The reaction set is read with the chat page; a window that asked
+    // before then got none, and is told to ask again.
+    state.events.emit("sneedchatReactions", json!({}));
+    if first {
+        super::rooms::settle_rooms(state, account_id, session, host).await;
+    }
+    let route = session.http.browser_route().cloned().unwrap_or_default();
+    let cookies: Vec<webhelper::Cookie> = session
+        .http
+        .jar
+        .snapshot()
+        .into_iter()
+        .map(|(name, value)| {
+            let path = if name == "ephyra_chat_session" { "/chat/v1" } else { "/" }.to_string();
+            webhelper::Cookie { name, value, path }
+        })
+        .collect();
+    let mut ws = webhelper::ws_open(
+        &format!("wss://{host}/chat/v1/connect"),
+        &[protocol::SUBPROTOCOL],
+        &format!("https://{host}/robots.txt"),
+        &cookies,
+        route.proxy.as_deref(),
+    )
+    .await
+    .context("opening the chat socket")?;
+    let sender = ws.sender();
+    tracing::info!("sneedchat[{account_id}]: chat socket open");
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let forwarder = tokio::spawn(async move {
-        let mut sink = sink;
-        while let Some(text) = out_rx.recv().await {
-            if sink.send(WsMessage::Text(text)).await.is_err() {
-                break;
+    let pinger = tokio::spawn({
+        let sender = sender.clone();
+        async move {
+            loop {
+                tokio::time::sleep(PING_EVERY).await;
+                if sender.send(r#"{"t":"ping"}"#).is_err() {
+                    return;
+                }
             }
         }
     });
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-    impl Drop for AbortOnDrop {
+    struct Abort(tokio::task::JoinHandle<()>);
+    impl Drop for Abort {
         fn drop(&mut self) {
             self.0.abort();
         }
     }
-    let _forwarder_guard = AbortOnDrop(forwarder);
+    let _pinger = Abort(pinger);
 
-    state.runtime.insert_sneedchat_sender(account_id, room.id, out_tx.clone());
-    struct RemoveSenderOnDrop<'a> {
-        state: &'a AppState,
-        account_id: &'a str,
-        room: u32,
-        sender: tokio::sync::mpsc::UnboundedSender<String>,
-    }
-    impl Drop for RemoveSenderOnDrop<'_> {
-        fn drop(&mut self) {
-            self.state.runtime.remove_sneedchat_sender(self.account_id, self.room, &self.sender);
-        }
-    }
-    let _sender_guard = RemoveSenderOnDrop { state, account_id, room: room.id, sender: out_tx.clone() };
-
-    out_tx.send(format!("/join {}", room.id)).map_err(|_| anyhow!("chat socket closed before joining"))?;
-    let buffer_name = room_buffer_name(&room.name);
-    // Created eagerly rather than waiting for the first live message - a
-    // quiet room would otherwise show no buffer/tab at all despite being
-    // connected and joined.
-    let joined = state.runtime.ensure_buffer(state, account_id, &buffer_name, "channel");
-    state.runtime.set_buffer_link(state, &joined.id, None);
-    super::health::recovered(account_id);
-    // The server follows a join with the room's whole roster, so anything left
-    // from a previous connection would only be stale.
-    state.runtime.set_presence(&crate::model::buffer_id(account_id, &buffer_name), serde_json::json!([]));
-    tracing::info!("sneedchat[{account_id}]: joined room {} ({})", room.id, room.name);
-
+    let ctx = Ctx { state, account_id, chat, session, http: &session.http, host, sender: &sender };
     loop {
-        // Bounded, not a bare `.await` - a Tor circuit that's gone quietly
-        // bad (no clean Close frame, no error, just nothing ever arriving
-        // again) would otherwise leave this loop parked forever with no way
-        // to notice the outage at all, let alone reconnect from it. Any
-        // inbound traffic at all (a real message, or even a Ping/Pong the
-        // `Some(Ok(_)) => continue` arm below swallows) resets this, so a
-        // genuinely quiet-but-alive room doesn't get penalized - this only
-        // fires when literally nothing has come through the socket.
-        let frame = match tokio::time::timeout(IDLE_TIMEOUT, incoming.next()).await {
-            Ok(Some(Ok(WsMessage::Text(text)))) => text.to_string(),
-            Ok(Some(Ok(WsMessage::Close(frame)))) => bail!("connection closed: {frame:?}"),
-            Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => bail!("websocket error: {e}"),
-            Ok(None) => bail!("connection ended unexpectedly"),
-            Err(_) => bail!("no activity for {}s, assuming the connection is dead", IDLE_TIMEOUT.as_secs()),
+        let event = match tokio::time::timeout(IDLE_TIMEOUT, ws.next()).await {
+            Ok(Some(e)) => e,
+            Ok(None) => bail!("the web helper went away"),
+            Err(_) => bail!("nothing from the chat for {}s", IDLE_TIMEOUT.as_secs()),
         };
-        // Asked per frame rather than fixed at the start: the room that
-        // records whispers changes when another room is opened or closed.
-        let records_whispers = whisper_room.load(std::sync::atomic::Ordering::Relaxed) == room.id;
-        handle_frame(state, &session.http, host, account_id, &buffer_name, records_whispers, &frame).await?;
+        match event {
+            WsEvent::Message(text) => {
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+                ctx.frame(&frame).await?;
+            }
+            WsEvent::Closed(code, reason) => bail!("the chat closed the socket ({code}{}{reason})", if reason.is_empty() { "" } else { " " }),
+            WsEvent::Open => {}
+        }
     }
 }
 
-/// How long to go without any inbound websocket activity (a message, or
-/// even just a Ping/Pong) before giving up on this connection and forcing a
-/// reconnect - see the read loop above. Comfortably above any plausible
-/// server-side heartbeat interval, so this only ever fires for a genuinely
-/// stalled connection, not a quiet room.
-pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) struct Ctx<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) account_id: &'a str,
+    pub(super) chat: &'a Arc<Chat>,
+    pub(super) session: &'a Session,
+    pub(super) http: &'a http::HttpClient,
+    pub(super) host: &'a str,
+    sender: &'a WsSender,
+}
 
-pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, account_id: &str, buffer_name: &str, is_primary: bool, frame: &str) -> Result<()> {
-    let resp = protocol::ServerResponse::parse(frame);
-
-    if !resp.users_joined.is_empty() || !resp.users_left.is_empty() {
-        update_roster(state, http, host, account_id, buffer_name, &resp.users_joined, &resp.users_left);
-    }
-
-    if let Some(text) = &resp.plaintext {
-        tracing::debug!("sneedchat[{account_id}]: {text}");
-        let lower = text.to_lowercase();
-        if lower.contains("cannot join") || lower.contains("session") {
-            bail!("server rejected the connection: {text}");
-        }
-        return Ok(());
-    }
-
-    // The site pushes our live permission set for the room on join (and,
-    // it seems, whenever it changes) - this is the one on-wire signal that
-    // distinguishes "authenticated" from "silently downgraded to a guest",
-    // which a reconnect using a since-expired session cookie produces:
-    // the websocket handshake itself succeeds either way (the anti-bot
-    // proxy in front of it doesn't check the cookie, only the chat
-    // application layer does), so there's no error to bail out on there.
-    // Bailing here instead - this account always has real credentials, so
-    // can_send=false can only mean the session needs a fresh login, and
-    // routes through the exact same reconnect-with-refresh path a real
-    // connection error already takes (see run_room's catch, which calls
-    // session.refresh() before the next attempt).
-    if let Some(perms) = &resp.perms {
-        if !perms.can_send {
-            bail!("server reports we can only view, not send (likely viewing as a guest) - session needs to be refreshed");
-        }
-    }
-
-    let buffer_id = crate::model::buffer_id(account_id, buffer_name);
-
-    // A batch delete: uuids removed elsewhere (e.g. by a moderator),
-    // arriving separately from any message object.
-    for uuid in &resp.deleted_uuids {
-        state.runtime.delete_message(state, &buffer_id, uuid);
-    }
-
-    // A replayed batch is stored and shown like anything else, but it is not
-    // news: the site sends the room's recent history on every join, so without
-    // this a reconnect turns an hours-old mention into a fresh alert. The
-    // already-seen check catches the second reconnect onwards; this catches
-    // the first, which is the one that actually fires.
-    if resp.history {
-        state.runtime.set_replaying(&buffer_id, true);
-    }
-
-    for m in &resp.messages {
-        if m.is_deleted() {
-            state.runtime.delete_message(state, &buffer_id, &m.message_uuid);
-            continue;
-        }
-        // The short `/attachments/...` form, written out in full so it embeds.
-        let body = expand_attachment_paths(&protocol::unescape_html(&m.message_raw), host).into_owned();
-        if body.is_empty() {
-            continue;
-        }
-        let avatar_url = match &m.author.avatar_url {
-            Some(raw) => cached_avatar_path(http, host, &m.author.id, raw).await,
-            None => None,
-        };
-
-        // There's no separate "edit" event on this wire - the server just
-        // re-sends the same message_uuid with a bumped edit date. Try to
-        // update an already-stored row first; only if that uuid was never
-        // actually stored (e.g. this is the first time we've ever seen it,
-        // and it just happens to already carry prior edit history) does
-        // it fall through to being recorded as an ordinary new message.
-        if m.message_edit_date > 0 && !m.message_uuid.is_empty() && state.runtime.update_message(state, &buffer_id, &m.message_uuid, &body, &[], &[]) {
-            continue;
-        }
-        // Always attributed to the room this specific connection is
-        // joined to, rather than trusting the wire's own room_id - this
-        // connection should only ever see traffic for its own room anyway.
-        let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
-        let is_new = state.runtime.record_message(state, account_id, buffer_name, "channel", &m.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), Vec::new(), None);
-        // Only for messages with a real, stable id - nothing to re-target
-        // a later body-patch at otherwise (see spawn_attachment_resolve) -
-        // and only for ones not seen before. A reconnect replays the room's
-        // recent history, and looking every attachment in it up again is a
-        // request per message, over Tor, for answers already on disk.
-        if is_new && !m.message_uuid.is_empty() {
-            spawn_attachment_resolve(state.clone(), http.clone(), host, buffer_id.clone(), m.message_uuid.clone(), body);
-        }
-    }
-    // Cleared unconditionally rather than only when it was set: nothing above
-    // returns early, and leaving it set would silence the room permanently.
-    state.runtime.set_replaying(&buffer_id, false);
-
-    // What the site says on entering the room. Recorded as a line in the room
-    // rather than shown as a banner, because it is the same kind of thing as
-    // an IRC topic arriving and this client already has somewhere to put that
-    // - and because a banner nobody dismissed would still be there tomorrow.
-    //
-    // Once per text rather than once per connect: every reconnect carries it
-    // again, and a room whose connection drops twice an hour would otherwise
-    // fill with copies of the same announcement.
-    if let Some(motd) = &resp.motd {
-        if state.runtime.take_new_sneedchat_motd(account_id, buffer_name, motd) {
-            state.runtime.record_message(
-                // "system" rather than "topic": a topic line is filtered by the
-                // setting that hides IRC topic changes, and a room's own
-                // announcement is not an IRC topic change.
-                state, account_id, buffer_name, "channel", "", motd, false, "system", None, None, false, None,
-                Vec::new(), Vec::new(), None,
-            );
-        }
-    }
-
-    if is_primary {
-        if let Some(w) = &resp.whisper {
-            let body = expand_attachment_paths(&protocol::unescape_html(&w.message_raw), host).into_owned();
-            // The site echoes our own whisper back to us, which is worth
-            // knowing rather than working around: it means a whisper we sent
-            // arrives twice, once from `send_whisper` recording it locally and
-            // once from here.
-            //
-            // The local one is kept and this one dropped, because the echo has
-            // lost the only thing that made the line useful - who it went to.
-            // Its author is us, so it reads as us saying something to nobody
-            // in particular, while the one we wrote says "@name, ...".
-            //
-            // Not deduplicated by id, because they have none in common: ours
-            // is recorded as it is sent, before the site has given it one.
-            if !body.is_empty() && !is_own_name(state, account_id, &w.author.username) {
-                let avatar_url = match &w.author.avatar_url {
-                    Some(raw) => cached_avatar_path(http, host, &w.author.id, raw).await,
-                    None => None,
+impl Ctx<'_> {
+    async fn frame(&self, frame: &Value) -> Result<()> {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        match frame["t"].as_str().unwrap_or_default() {
+            "welcome" => {
+                let Some(uuid) = frame["principal_uuid"].as_str() else {
+                    bail!("the chat sees this account as a guest - the forum session has lapsed");
                 };
-                let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true, None) {
-                    if !w.message_uuid.is_empty() {
-                        spawn_attachment_resolve(state.clone(), http.clone(), host, buffer, w.message_uuid.clone(), body.clone());
+                let name = frame["display_name"].as_str().unwrap_or_default().to_string();
+                *chat.me.lock().unwrap() = Some(Principal { uuid: uuid.to_string(), name: name.clone(), ..Default::default() });
+                if !name.is_empty() {
+                    state.runtime.set_own_identity(account_id, &name);
+                    let _ = state.accounts.set_sneedchat_display_name(account_id, &name);
+                }
+                *chat.socket.lock().unwrap() = Some(self.sender.clone());
+                self.set_frozen(frame["link_state"].as_str() == Some("frozen"));
+                super::health::recovered(account_id);
+                let rooms = state.accounts.get_sneedchat(account_id).map(|c| c.rooms).unwrap_or_default();
+                chat.want_rooms(&rooms);
+                for room in frame["side_rooms"].as_array().into_iter().flatten() {
+                    if let Some(uuid) = room["chat_room_uuid"].as_str() {
+                        let after = chat.rooms.lock().unwrap().get(uuid).and_then(|r| r.last);
+                        chat.want_side_room(uuid, after);
+                    }
+                }
+                let revision = frame["emoticon_revision"].as_str().map(str::to_string);
+                self.refresh_emoticons(revision);
+            }
+            "emoticons_changed" => self.refresh_emoticons(frame["emoticon_revision"].as_str().map(str::to_string)),
+            "link_state" => self.set_frozen(frame["state"].as_str() == Some("frozen")),
+            "joined" => self.joined(frame),
+            "left" => {
+                let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
+                let reason = frame["reason"].as_str().unwrap_or("no reason given").to_string();
+                let buffer = {
+                    let mut rooms = chat.rooms.lock().unwrap();
+                    rooms.get_mut(uuid).map(|room| {
+                        room.joined = false;
+                        (room.buffer.clone(), room.buffer_kind())
+                    })
+                };
+                tracing::info!("sneedchat[{account_id}]: left {uuid} ({reason})");
+                // Put out of a room by the chat rather than leaving it: said in it.
+                if let Some((name, kind)) = buffer.filter(|(b, _)| !b.is_empty()) {
+                    if reason.contains("sanction") || reason.contains("ban") || reason.contains("kick") {
+                        let said = format!("You were removed from this room ({}).", reason.replace('_', " "));
+                        state.runtime.record_message(state, account_id, &name, kind, "", &said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                     }
                 }
             }
+            "resync" => {
+                let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default().to_string();
+                if let Some(room) = chat.rooms.lock().unwrap().get_mut(&uuid) {
+                    room.last = None;
+                    room.joined = false;
+                }
+                chat.join(&uuid, None);
+            }
+            "entry" | "elided" => self.entry(frame, false).await,
+            "own_reactions" => {
+                // The replay is over: what it named holds this reaction of
+                // ours, and anything it covered without naming holds none.
+                let room = frame["chat_room_uuid"].as_str().unwrap_or_default();
+                let named: Vec<(String, String)> = frame["reactions"]
+                    .as_object()
+                    .map(|m| m.iter().filter_map(|(k, v)| Some((k.to_lowercase(), v.as_str()?.to_string()))).collect())
+                    .unwrap_or_default();
+                let buffer = chat.buffer_of(room);
+                {
+                    let mut own = chat.own_reactions.lock().unwrap();
+                    for (message, code) in &named {
+                        own.insert(message.clone(), Some(code.clone()));
+                    }
+                }
+                if let Some((name, _)) = buffer {
+                    let buffer_id = crate::model::buffer_id(account_id, &name);
+                    for (message, _) in named {
+                        self.mark_own(&buffer_id, &message);
+                    }
+                }
+            }
+            "rendered" => {
+                // A row drawn again - its reactions are what can have changed.
+                if let (Some(message), Some(html)) = (frame["chat_message_uuid"].as_str(), frame["html"].as_str()) {
+                    let room = frame["chat_room_uuid"].as_str().map(str::to_string).or_else(|| chat.known(message).map(|k| k.room));
+                    if let Some((name, _)) = room.and_then(|r| chat.buffer_of(&r)) {
+                        let buffer_id = crate::model::buffer_id(account_id, &name);
+                        self.set_reactions(&buffer_id, &message.to_lowercase(), html);
+                    }
+                }
+            }
+            "presence" => {
+                let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
+                let principals: Vec<Principal> = frame["principals"].as_array().into_iter().flatten().filter_map(Principal::from_value).collect();
+                {
+                    let mut people = chat.people.lock().unwrap();
+                    for p in &principals {
+                        people.insert(p.uuid.clone(), p.clone());
+                    }
+                }
+                if let Some((name, _)) = chat.buffer_of(uuid) {
+                    super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &principals);
+                }
+            }
+            "command_ack" => {
+                let key = frame["chat_operation_uuid"].as_str().unwrap_or_default();
+                let result = match frame["status"].as_str() {
+                    Some("applied" | "pending") => Ok(()),
+                    other => Err(frame["code"].as_str().or(other).unwrap_or("refused").to_string()),
+                };
+                chat.answer(key, result);
+            }
+            "error" => {
+                let key = frame["ref"].as_str().unwrap_or_default().to_lowercase();
+                let code = frame["code"].as_str().unwrap_or("refused").to_string();
+                let answered = chat.answer(&key, Err(code.clone()))
+                    || chat.answer(frame["ref"].as_str().unwrap_or_default(), Err(code.clone()))
+                    || chat.answer(&format!("react:{key}"), Err(code.clone()))
+                    || chat.answer(&format!("invite:{key}"), Err(code.clone()));
+                if !answered {
+                    if let Some((name, kind)) = chat.buffer_of(&key) {
+                        let said = format!("Couldn't join this room: {}.", protocol::describe_error(&code));
+                        state.runtime.record_message(state, account_id, &name, kind, "", &said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                    } else {
+                        tracing::warn!("sneedchat[{account_id}]: chat error {code} (ref {key})");
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A side room shown as what it is: a direct message with one other
+    /// person, or - with more - a group chat under its own heading, with its
+    /// member list. Called when it is joined and whenever its members change.
+    fn settle_side_room(&self, uuid: &str) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some((name, kind, members)) = chat.rooms.lock().unwrap().get(uuid).filter(|r| r.kind == RoomKind::Side && !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind(), r.members.clone())) else {
+            return;
+        };
+        let buffer_id = crate::model::buffer_id(account_id, &name);
+        state.runtime.set_buffer_kind(state, &buffer_id, kind);
+        state.runtime.set_buffer_category(state, &buffer_id, (kind == "channel").then_some("Group chats"), 0);
+        super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &members);
+    }
+
+    fn refresh_emoticons(&self, revision: Option<String>) {
+        let (state, session, host) = (self.state.clone(), self.session.clone(), self.host.to_string());
+        tokio::spawn(async move { super::catalogue::take_emoticons(&state, &session, &host, revision.as_deref()).await });
+    }
+
+    /// The chat stopped (or started again) taking anything but reads. Said in
+    /// each room once, when it changes.
+    fn set_frozen(&self, frozen: bool) {
+        let was = self.chat.frozen.swap(frozen, Ordering::Relaxed);
+        if was == frozen {
+            return;
+        }
+        let said = if frozen { "The chat is frozen: nothing can be sent until it is back." } else { "The chat is back: messages can be sent again." };
+        let buffers: Vec<(String, &'static str)> = self.chat.rooms.lock().unwrap().values().filter(|r| r.joined && !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind())).collect();
+        for (name, kind) in buffers {
+            self.state.runtime.record_message(self.state, self.account_id, &name, kind, "", said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
         }
     }
 
+    fn joined(&self, frame: &Value) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
+        let head = frame["head_seq"].as_u64();
+        let side = frame["chat_room_kind"].as_str() == Some("side");
+        let members: Vec<Principal> = frame["members"].as_array().into_iter().flatten().filter_map(Principal::from_value).collect();
+        if !members.is_empty() {
+            let mut people = chat.people.lock().unwrap();
+            for p in &members {
+                people.insert(p.uuid.clone(), p.clone());
+            }
+        }
+        let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let (name, kind) = {
+            let mut rooms = chat.rooms.lock().unwrap();
+            let room = match rooms.get_mut(uuid) {
+                Some(r) => r,
+                // A side room nobody here asked for: somebody opened one with us.
+                None if side => rooms.entry(uuid.to_string()).or_insert_with(|| RoomState { kind: RoomKind::Side, ..Default::default() }),
+                None => return,
+            };
+            room.joined = true;
+            room.replay_to = head;
+            if room.last.is_none() && head == Some(0) {
+                room.last = Some(0);
+            }
+            if side {
+                room.kind = RoomKind::Side;
+                if !members.is_empty() {
+                    room.members = members.clone();
+                }
+                room.group = RoomState::is_group(&room.members, &me);
+                if room.buffer.is_empty() {
+                    room.buffer = side_room_name(&room.members, &me, uuid);
+                }
+            }
+            (room.buffer.clone(), room.buffer_kind())
+        };
+        if name.is_empty() {
+            return;
+        }
+        let buffer = state.runtime.ensure_buffer(state, account_id, &name, kind);
+        state.runtime.set_buffer_link(state, &buffer.id, None);
+        if side {
+            self.settle_side_room(uuid);
+        } else if let Some(subtitle) = super::catalogue::subtitle(uuid) {
+            state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
+        }
+        // Whoever opened a side room with us is waiting on this.
+        for m in chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default() {
+            chat.answer(&format!("side:{}", m.uuid), Ok(()));
+        }
+        tracing::info!("sneedchat[{account_id}]: joined {name}");
+    }
+
+    /// One log entry, live or from a history page (`paged`): history is never
+    /// news, and is not held to the live sequence.
+    pub(super) async fn entry(&self, frame: &Value, paged: bool) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some(mut entry) = Entry::from_value(frame) else { return };
+        if paged && entry.room.is_empty() {
+            entry.room = frame["_room"].as_str().unwrap_or_default().to_string();
+        }
+        let replaying = if paged {
+            chat.note_first(&entry.room, entry.room_seq);
+            true
+        } else {
+            // In order, once each: a gap means something was missed, and the
+            // chat replays it on a fresh join from the last seen.
+            let mut rooms = chat.rooms.lock().unwrap();
+            let Some(room) = rooms.get_mut(&entry.room) else { return };
+            if room.last.is_some_and(|last| entry.room_seq <= last) {
+                return;
+            }
+            if let Some(last) = room.last {
+                if entry.room_seq != last + 1 {
+                    room.joined = false;
+                    drop(rooms);
+                    chat.join(&entry.room, Some(last));
+                    return;
+                }
+            }
+            room.last = Some(entry.room_seq);
+            if room.first.is_none_or(|f| entry.room_seq < f) {
+                room.first = Some(entry.room_seq);
+            }
+            room.replay_to.is_some_and(|head| entry.room_seq <= head)
+        };
+        // A post's own echo answers whoever sent it, whatever else it is.
+        if let Some(nonce) = &entry.client_nonce {
+            chat.answer(nonce, Ok(()));
+        }
+        if frame["t"] == "elided" || frame["elided"].as_bool() == Some(true) {
+            return;
+        }
+        let Some((buffer_name, buffer_kind)) = chat.buffer_of(&entry.room) else { return };
+        let buffer_id = crate::model::buffer_id(account_id, &buffer_name);
+        if let (Some(message), Some(seq)) = (&entry.message, entry.state_seq) {
+            chat.remember(message, &entry.room, seq);
+        }
+        let system = |text: String| {
+            state.runtime.set_replaying(&buffer_id, replaying);
+            let id = frame["entry_uuid"].as_str().map(|e| format!("entry:{e}"));
+            state.runtime.record_message_at(state, account_id, &buffer_name, buffer_kind, "", &text, false, "system", None, id, false, None, Vec::new(), Vec::new(), None, entry.at, None, None);
+            state.runtime.set_replaying(&buffer_id, false);
+        };
+        let who = |key: &str| -> String {
+            frame[key]
+                .as_str()
+                .and_then(|u| chat.people.lock().unwrap().get(u).map(|p| p.name.clone()))
+                .or_else(|| frame["display_name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "someone".to_string())
+        };
+        match entry.kind.as_str() {
+            "chat_room_subtitle_set" => {
+                state.runtime.set_buffer_topic(state, &buffer_id, entry.subtitle.as_deref().unwrap_or_default());
+                return;
+            }
+            "chat_side_room_member_added" | "chat_side_room_member_left" => {
+                let added = entry.kind.ends_with("added");
+                let name = who("principal_uuid");
+                if let Some(p) = frame["principal_uuid"].as_str().map(str::to_string) {
+                    let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+                    let mut rooms = chat.rooms.lock().unwrap();
+                    if let Some(room) = rooms.get_mut(&entry.room) {
+                        if added && !room.members.iter().any(|m| m.uuid == p) {
+                            let known = chat.people.lock().unwrap().get(&p).cloned();
+                            room.members.push(known.unwrap_or(Principal { uuid: p, name: name.clone(), ..Default::default() }));
+                        } else if !added {
+                            room.members.retain(|m| m.uuid != p);
+                        }
+                        room.group = RoomState::is_group(&room.members, &me);
+                    }
+                }
+                if added {
+                    chat.answer(&format!("invite:{}", entry.room), Ok(()));
+                }
+                system(format!("{name} {} the conversation.", if added { "joined" } else { "left" }));
+                if !replaying {
+                    self.settle_side_room(&entry.room);
+                }
+                return;
+            }
+            "chat_sanction_applied" | "chat_sanction_lifted" => {
+                let applied = entry.kind.ends_with("applied");
+                let target = frame["principal_uuid"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = frame["chat_sanction_uuid"].as_str() {
+                    let mut sanctions = chat.sanctions.lock().unwrap();
+                    if applied {
+                        sanctions.insert(target.clone(), id.to_string());
+                    } else {
+                        sanctions.remove(&target);
+                    }
+                }
+                let kind = frame["sanction_kind"].as_str().unwrap_or("mute");
+                let name = who("principal_uuid");
+                let text = if applied {
+                    let until = frame["expires_at"].as_i64().map(|t| format!(" until {}", chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default())).unwrap_or_default();
+                    format!("{name} was {}{until}.", if kind == "ban" { "banned" } else { "muted" })
+                } else {
+                    format!("{name} is no longer {}.", if kind == "ban" { "banned" } else { "muted" })
+                };
+                system(text);
+                return;
+            }
+            "chat_frozen" => {
+                self.set_frozen(true);
+                return;
+            }
+            _ => {}
+        }
+        let Some(message) = entry.message.clone() else { return };
+        match entry.kind.as_str() {
+            "chat_message_posted" | "chat_message_restored" => {
+                if entry.row_tombstoned() {
+                    state.runtime.delete_message(state, &buffer_id, &message);
+                    return;
+                }
+                let author = entry
+                    .row_author()
+                    .or_else(|| entry.author.as_ref().and_then(|a| chat.people.lock().unwrap().get(a).cloned()))
+                    .unwrap_or_else(|| Principal { uuid: entry.author.clone().unwrap_or_default(), name: "someone".into(), ..Default::default() });
+                chat.people.lock().unwrap().entry(author.uuid.clone()).or_insert_with(|| author.clone());
+                let raw = protocol::mentions_to_names(&entry.body.clone().unwrap_or_default());
+                let (quoted, rest) = protocol::split_reply(&raw);
+                let reply = quoted.map(|q| crate::model::ReplyPreview { id: q.message, from: q.name, body: q.text, ..Default::default() });
+                let body = expand_attachment_paths(rest, self.host).into_owned();
+                if body.trim().is_empty() && reply.is_none() {
+                    return;
+                }
+                let me = chat.me.lock().unwrap().clone().unwrap_or_default();
+                let mine = !me.uuid.is_empty() && me.uuid == author.uuid;
+                let highlight = !mine && (entry.mentions.iter().any(|m| m == &me.uuid) || buffer_kind == "dm");
+                if entry.kind == "chat_message_restored" && state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]) {
+                    return;
+                }
+                let avatar = match &author.avatar {
+                    Some(raw) => cached_avatar_path(self.http, self.host, &author.uuid, &mirrored(raw, self.host)).await,
+                    None => None,
+                };
+                state.runtime.set_replaying(&buffer_id, replaying);
+                let is_new = state.runtime.record_message_at(
+                    state,
+                    account_id,
+                    &buffer_name,
+                    buffer_kind,
+                    &author.name,
+                    &body,
+                    false,
+                    "chat",
+                    reply,
+                    Some(message.clone()),
+                    highlight,
+                    avatar,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(author.uuid.clone()),
+                    entry.at,
+                    None,
+                    None,
+                );
+                state.runtime.set_replaying(&buffer_id, false);
+                if let Some(html) = &entry.html {
+                    self.set_reactions(&buffer_id, &message, html);
+                }
+                if is_new {
+                    spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
+                }
+            }
+            "chat_message_revised" => {
+                if let Some(raw) = &entry.body {
+                    let raw = protocol::mentions_to_names(raw);
+                    let (_, rest) = protocol::split_reply(&raw);
+                    let body = expand_attachment_paths(rest, self.host).into_owned();
+                    state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]);
+                }
+            }
+            "chat_message_reaction_set" => {
+                let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+                if frame["principal_uuid"].as_str().is_some_and(|p| p == me) {
+                    let code = frame["reaction_code"].as_str().map(str::to_string);
+                    chat.own_reactions.lock().unwrap().insert(message.clone(), code);
+                    chat.answer(&format!("react:{message}"), Ok(()));
+                }
+                match &entry.html {
+                    Some(html) => self.set_reactions(&buffer_id, &message, html),
+                    None => self.adjust_reaction(&buffer_id, &message, frame),
+                }
+            }
+            "chat_message_tombstoned" | "chat_message_purged" => state.runtime.delete_message(state, &buffer_id, &message),
+            _ => {}
+        }
+    }
+
+    /// A message's reactions as its rendered row tallies them, with ours marked.
+    fn set_reactions(&self, buffer_id: &str, message: &str, html: &str) {
+        let chips = protocol::chips(html);
+        let own = self.chat.own_reaction(message);
+        let held = self.state.store.get_message(buffer_id, message).ok().flatten().map(|m| m.reactions).unwrap_or_default();
+        if chips.is_empty() && held.is_empty() {
+            return;
+        }
+        let reactions: Vec<crate::model::Reaction> = chips
+            .into_iter()
+            .map(|(code, count)| crate::model::Reaction { emoji: super::catalogue::reaction_token(&code), count, me: own.as_deref() == Some(code.as_str()), animated: false })
+            .collect();
+        if self.state.store.set_reactions(buffer_id, message, &reactions).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": reactions }));
+        }
+    }
+
+    /// A reaction change with no row to read: one person's reaction moved, so
+    /// one tally goes down and another up.
+    fn adjust_reaction(&self, buffer_id: &str, message: &str, frame: &Value) {
+        let Some(stored) = self.state.store.get_message(buffer_id, message).ok().flatten() else { return };
+        let mut held = stored.reactions;
+        let me = self.chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let mine = frame["principal_uuid"].as_str() == Some(me.as_str());
+        if let Some(previous) = frame["previous_reaction_code"].as_str() {
+            let token = super::catalogue::reaction_token(previous);
+            if let Some(r) = held.iter_mut().find(|r| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(previous)) {
+                r.count -= 1;
+                r.emoji = token;
+                if mine {
+                    r.me = false;
+                }
+            }
+        }
+        if let Some(code) = frame["reaction_code"].as_str() {
+            match held.iter_mut().find(|r| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(code)) {
+                Some(r) => {
+                    r.count += 1;
+                    r.me |= mine;
+                }
+                None => held.push(crate::model::Reaction { emoji: super::catalogue::reaction_token(code), count: 1, me: mine, animated: false }),
+            }
+        }
+        held.retain(|r| r.count > 0);
+        if self.state.store.set_reactions(buffer_id, message, &held).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": held }));
+        }
+    }
+
+    /// Marks our own reaction on a message whose tallies are already held.
+    fn mark_own(&self, buffer_id: &str, message: &str) {
+        let Some(stored) = self.state.store.get_message(buffer_id, message).ok().flatten() else { return };
+        let own = self.chat.own_reaction(message);
+        let mut held = stored.reactions;
+        let mut changed = false;
+        for r in held.iter_mut() {
+            let me = own.as_deref().is_some_and(|c| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(c));
+            if r.me != me {
+                r.me = me;
+                changed = true;
+            }
+        }
+        if changed && self.state.store.set_reactions(buffer_id, message, &held).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": held }));
+        }
+    }
+}
+
+/// What a side room is called: the other people in it, by name.
+fn side_room_name(members: &[Principal], me: &str, uuid: &str) -> String {
+    let others: Vec<&str> = members.iter().filter(|m| m.uuid != me).map(|m| m.name.as_str()).filter(|n| !n.is_empty()).collect();
+    if others.is_empty() {
+        format!("whisper-{}", &uuid[uuid.len().saturating_sub(6)..])
+    } else {
+        others.join(", ")
+    }
+}
+
+/// Reads the page of a room's log before the oldest entry held, as history:
+/// no alerts, the same messages as ever.
+pub(super) async fn older(state: &AppState, account_id: &str, buffer_name: &str) -> Result<()> {
+    let chat = chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("not one of this account's rooms"))?;
+    let Some(before) = chat.history_cursor(&room) else { return Ok(()) };
+    let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let host = chat.host.lock().unwrap().clone();
+    let page = api_get(&session, &host, &format!("rooms/{room}/log?before={before}&limit=100&unit=messages")).await?;
+    let sender = chat.socket().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let ctx = Ctx { state, account_id, chat: &chat, session: &session, http: &session.http, host: &host, sender: &sender };
+    let entries = page["entries"].as_array().cloned().unwrap_or_default();
+    if let Some(own) = page["own_reactions"].as_object() {
+        let mut held = chat.own_reactions.lock().unwrap();
+        for (k, v) in own {
+            held.insert(k.to_lowercase(), v.as_str().map(str::to_string));
+        }
+    }
+    for mut e in entries {
+        e["_room"] = json!(room);
+        ctx.entry(&e, true).await;
+    }
+    // Nothing older than this page: paging stops here.
+    if page["page"]["prev_before"].is_null() {
+        if let Some(r) = chat.rooms.lock().unwrap().get_mut(&room) {
+            r.first = Some(1);
+        }
+    }
     Ok(())
 }
 
-/// Whether a name on the wire is this account's own.
+/// A picture's address on the host this account uses.
 ///
-/// Both the display name and the login name, because a whisper's author is
-/// whichever the site is showing and an account can have set either. Compared
-/// loosely - trimmed and case-insensitive - since the cost of being wrong is
-/// asymmetric: missing a match shows a duplicate line, and a false match
-/// would silently drop a real whisper from somebody whose name happened to
-/// differ only in case, which cannot happen because the site's names are
-/// unique without it.
-pub(super) fn is_own_name(state: &AppState, account_id: &str, name: &str) -> bool {
-    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return false };
-    name_matches(cfg.display_name.as_deref().unwrap_or_default(), &cfg.username, name)
-}
-
-pub(super) fn name_matches(display_name: &str, username: &str, candidate: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return false;
-    }
-    [display_name, username]
-        .iter()
-        .any(|mine| !mine.trim().is_empty() && mine.trim().eq_ignore_ascii_case(candidate))
-}
-
-/// Puts a whisper in front of whoever is reading, whichever room that is.
-///
-/// A whisper belongs to no room, and the site shows it wherever you happen to
-/// be looking. Nothing here can know which room a frontend has open, so it is
-/// recorded in every room this account is in rather than one being picked and
-/// hoped for.
-///
-/// That replaces a buffer of its own, which is what the report called "a DM
-/// window". The separate buffer was the same mistake in a worse form: a
-/// private message you only see by going somewhere else to look, and a
-/// conversation that pulled you out of the room you were in to have it.
-///
-/// Storing the same message under several buffers is fine and not a
-/// duplicate - the store keys on (buffer, id), so each room holds it once and
-/// none of them holds it twice however many sockets saw it.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn record_whisper(
-    state: &AppState,
-    account_id: &str,
-    from: &str,
-    body: &str,
-    msg_id: Option<String>,
-    avatar_url: Option<String>,
-    // `notify`: whether this one should raise an alert. True for a whisper
-    // somebody sent us; false for one we sent, which needs no telling.
-    notify: bool,
-    // `only`: the one buffer this belongs in, for a whisper we sent - it
-    // belongs in the conversation it was sent from, not in every room at
-    // once. Absent for an inbound one, which arrives from nowhere in
-    // particular and has to be visible wherever the reader is.
-    only: Option<&str>,
-) -> Vec<String> {
-    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return Vec::new() };
-    let mut fresh = Vec::new();
-    let rooms: Vec<SneedChatRoom> = match only {
-        Some(buffer_name) => {
-            let wanted = room_name_of(buffer_name);
-            cfg.rooms.into_iter().filter(|r| r.name == wanted).collect()
+/// The chat writes its pictures on kiwifarms.net; the site serves the same
+/// files on each of its hosts, and a cookie that gets past the gate on one
+/// host is no use on another. The page itself does the same swap
+/// (`data-chat-image-origins`).
+pub(super) fn mirrored(url: &str, host: &str) -> String {
+    // Through Tor the account is on the onion, which serves the forum's own
+    // files (pictures included) under its own name.
+    if host.ends_with(".onion") {
+        for clear in ["https://kiwifarms.net/", "https://kiwifarms.st/"] {
+            if let Some(rest) = url.strip_prefix(clear) {
+                return format!("https://{host}/{rest}");
+            }
         }
-        None => cfg.rooms,
-    };
-    for (index, room) in rooms.into_iter().enumerate() {
-        // Highlighted in the first room only, and highlighting is what raises
-        // an alert - so one whisper is one notification however many rooms it
-        // is written into. The copies are still whispers and are still drawn
-        // as whispers, because the client colours them by kind rather than by
-        // highlight; what they are not is a second time somebody's desktop
-        // says the same thing.
-        let alert = notify && index == 0;
-        let name = room_buffer_name(&room.name);
-        let is_new = state.runtime.record_message(
-            state,
-            account_id,
-            &name,
-            "channel",
-            from,
-            body,
-            false,
-            "whisper",
-            None,
-            msg_id.clone(),
-            alert,
-            avatar_url.clone(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-        if is_new {
-            fresh.push(crate::model::buffer_id(account_id, &name));
+        return url.to_string();
+    }
+    if host == "kiwifarms.net" || !host.starts_with("kiwifarms.") {
+        return url.to_string();
+    }
+    let suffix = host.trim_start_matches("kiwifarms.");
+    for sub in ["https://kiwifarms.net/", "https://uploads.kiwifarms.net/", "https://no-cookie.kiwifarms.net/"] {
+        if let Some(rest) = url.strip_prefix(sub) {
+            let swapped = sub.replace("kiwifarms.net", &format!("kiwifarms.{suffix}"));
+            return format!("{swapped}{rest}");
         }
     }
-    fresh
+    url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pictures_move_to_the_accounts_host() {
+        assert_eq!(mirrored("https://kiwifarms.net/data/avatars/m/7/7421.jpg?1", "kiwifarms.st"), "https://kiwifarms.st/data/avatars/m/7/7421.jpg?1");
+        assert_eq!(mirrored("https://uploads.kiwifarms.net/a.png", "kiwifarms.st"), "https://uploads.kiwifarms.st/a.png");
+        assert_eq!(mirrored("https://example.com/a.png", "kiwifarms.st"), "https://example.com/a.png");
+        // Through Tor, the forum's own files come from the onion.
+        assert_eq!(mirrored("https://kiwifarms.net/data/a.png", "abc.onion"), "https://abc.onion/data/a.png");
+        assert_eq!(mirrored("https://uploads.kiwifarms.net/a.png", "abc.onion"), "https://uploads.kiwifarms.net/a.png");
+    }
+
+    #[test]
+    fn wanting_rooms_tracks_listed_rooms_by_uuid_and_keeps_side_rooms() {
+        let chat = Chat::default();
+        let room = |id: &str, name: &str| SneedChatRoom { id: id.into(), name: name.into() };
+        chat.want_rooms(&[room("01a1f0f8-2d29-7ac3-b779-b3b0904d6dd6", "fishtank"), room("16", "old")]);
+        // A room still under an old number is not tracked until it has a uuid.
+        assert_eq!(chat.rooms.lock().unwrap().len(), 1);
+        assert_eq!(chat.room_of_buffer("#fishtank").as_deref(), Some("01a1f0f8-2d29-7ac3-b779-b3b0904d6dd6"));
+        chat.want_side_room("side-1", None);
+        chat.want_rooms(&[]);
+        // The listed room goes; the side room is the chat's, and stays.
+        let rooms = chat.rooms.lock().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.contains_key("side-1"));
+    }
+
+    #[test]
+    fn closing_a_side_room_leaves_it() {
+        let chat = Chat::default();
+        chat.want_side_room("side-1", None);
+        chat.rooms.lock().unwrap().get_mut("side-1").unwrap().buffer = "Blackstar".into();
+        assert!(!chat.leave_side_room("#fishtank"));
+        assert!(chat.leave_side_room("Blackstar"));
+        assert!(chat.rooms.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_side_room_with_several_others_is_a_group_chat() {
+        let p = |u: &str| Principal { uuid: u.into(), name: u.into(), ..Default::default() };
+        let mut room = RoomState { kind: RoomKind::Side, ..Default::default() };
+        room.group = RoomState::is_group(&[p("me"), p("a")], "me");
+        assert_eq!(room.buffer_kind(), "dm");
+        room.group = RoomState::is_group(&[p("me"), p("a"), p("b")], "me");
+        assert_eq!(room.buffer_kind(), "channel");
+        assert_eq!(RoomState::default().buffer_kind(), "channel");
+    }
+
+    #[test]
+    fn a_side_room_is_named_for_the_others_in_it() {
+        let p = |u: &str, n: &str| Principal { uuid: u.into(), name: n.into(), ..Default::default() };
+        assert_eq!(side_room_name(&[p("me", "Ancient Pioneer"), p("u2", "Ryo Ma")], "me", "abcdef-123456"), "Ryo Ma");
+        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B"), p("u3", "C")], "me", "x"), "B, C");
+        assert_eq!(side_room_name(&[p("me", "A")], "me", "abcdef-123456"), "whisper-123456");
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_for_good_says_why() {
+        let chat = Chat::default();
+        // Without a socket nothing can go out: said, not hung on.
+        let err = chat.command("op-1", json!({ "t": "revise", "chat_operation_uuid": "op-1" })).await.unwrap_err();
+        assert!(format!("{err:#}").contains("not connected"));
+        chat.frozen.store(true, Ordering::Relaxed);
+        let err = chat.command("op-2", json!({ "t": "revise", "chat_operation_uuid": "op-2" })).await.unwrap_err();
+        assert!(format!("{err:#}").contains("frozen"));
+    }
 }

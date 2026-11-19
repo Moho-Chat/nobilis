@@ -1,287 +1,370 @@
-//! Wire format of server frames.
+//! Ephyra Chat's frames - the shapes the chat's socket and API speak.
 //!
-//! Ported from sneedchat-rs's `chat/json.rs` + `chat/msg.rs`
-//! (<https://gitgud.io/jcmoon/sneedchat-rs>). Frames are usually a JSON
-//! object, but the server also sends bare plaintext - typically errors such
-//! as "You cannot join this room." Anything that doesn't start with `{` is
-//! treated as plaintext rather than being dropped.
+//! Read from the site's own client (`js/USIPS/EphyraChat/ephyra-chat.js`)
+//! and from a socket watched as a guest. Frames are JSON objects keyed by
+//! `t`; everything here is read leniently, because a frame this does not
+//! understand is one to skip, never one to stop the connection over - which
+//! is what the site's own client does too.
 
-use serde::Deserialize;
+use serde_json::Value;
 
-/// The full permission set the server sends. Only `can_view` matters today;
-/// the rest is modelled so the shape stays faithful to the wire.
-#[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)]
-pub struct Perms {
-    #[serde(default)]
-    pub can_view: bool,
-    #[serde(default)]
-    pub can_send: bool,
+/// The subprotocol the socket is opened with.
+pub const SUBPROTOCOL: &str = "ephyra-chat.v1";
+
+/// What the chat calls somebody: a principal, by uuid, with the name and
+/// picture shown for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Principal {
+    pub uuid: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub badges: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct WireMessage {
-    pub author: WireUser,
-    #[serde(default)]
-    pub message_raw: String,
-    #[serde(default)]
-    pub message_uuid: String,
-    #[serde(default)]
-    /// On the wire and unread: the site's own timestamp. Kept because a
-    /// wire struct that drops the fields it does not use stops describing
-    /// what arrives.
-    #[allow(dead_code)]
-    pub message_date: i64,
-    /// Nonzero once this message has been edited at least once - the wire
-    /// has no separate "edit" event, the server just re-sends the same
-    /// `message_uuid` with this bumped. Whether a given re-arrival is a
-    /// *new* edit we haven't seen (vs. the message merely showing up for
-    /// the first time already carrying prior edit history) is for the
-    /// caller to decide by checking what's already stored locally.
-    #[serde(default)]
-    pub message_edit_date: i64,
-    /// Two different flags observed for the same thing on the wire -
-    /// both checked via `is_deleted()` rather than assuming only one is
-    /// ever sent.
-    #[serde(default)]
-    pub deleted: bool,
-    #[serde(default)]
-    pub is_deleted: bool,
-    /// The room the message was posted in.
-    ///
-    /// Not read for routing - a connection sees only its own room's traffic,
-    /// so the room is already known. This once carried a note saying its
-    /// absence marked a whisper, which was a guess: whispers arrive under
-    /// their own `whisper` key, and every message observed on the wire carries
-    /// a room. Acting on that guess would have painted ordinary messages as
-    /// private ones.
-    #[serde(default)]
-    /// Likewise: the caller already knows the room, having asked it.
-    #[allow(dead_code)]
-    pub room_id: Option<u32>,
-}
-
-impl WireMessage {
-    pub fn is_deleted(&self) -> bool {
-        self.deleted || self.is_deleted
+impl Principal {
+    /// A principal as a `presence` or `joined` frame lists one.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let uuid = v["principal_uuid"].as_str()?.to_string();
+        let name = v["display_name"].as_str().filter(|n| !n.is_empty())?.to_string();
+        let avatar = v["avatar_url"].as_str().filter(|a| !a.is_empty()).map(str::to_string);
+        let badges = v["badges"].as_array().map(|b| b.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        Some(Self { uuid, name, avatar, badges })
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct WireWhisper {
-    pub author: WireUser,
-    #[serde(default)]
-    pub message_raw: String,
-    #[serde(default)]
-    pub message_uuid: String,
+/// A room, as `rooms/heads` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomHead {
+    pub uuid: String,
+    pub title: String,
+    pub slug: String,
+    pub head_seq: u64,
+    pub subtitle: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct WireUser {
-    #[serde(deserialize_with = "id_as_string")]
-    pub id: String,
-    pub username: String,
-    /// A relative path (e.g. `/data/avatars/l/.../123.jpg`, needing the
-    /// account's own host prefixed) or an already-absolute URL - resolving
-    /// that, and fetching+caching the actual image, is backend/sneedchat/
-    /// mod.rs's job (this module only carries the wire shape faithfully).
-    #[serde(default)]
-    pub avatar_url: Option<String>,
-}
-
-/// The server sends user ids as either a JSON number or a numeric string
-/// depending on context (a plain user object vs. one keyed into the `users`
-/// map) - accept both rather than failing to decode one of them.
-fn id_as_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IdOrString {
-        Id(i64),
-        S(String),
-    }
-    Ok(match IdOrString::deserialize(d)? {
-        IdOrString::Id(n) => n.to_string(),
-        IdOrString::S(s) => s,
-    })
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawResponse {
-    #[serde(default)]
-    messages: Option<Vec<serde_json::Value>>,
-    /// Lowercase on the wire. This asked for `Whisper`, and serde's rename is
-    /// case-sensitive, so every whisper this account ever received fell
-    /// straight through into `extra` - decoded by nothing, reported by a log
-    /// line that was switched off. That is the whole of "whispers are not
-    /// received at all".
-    ///
-    /// The alias keeps the capitalised spelling working. It has never been
-    /// observed, but it was in here for a reason nobody wrote down, and
-    /// accepting both costs a word.
-    #[serde(rename = "whisper", alias = "Whisper", default)]
-    whisper: Option<serde_json::Value>,
-    #[serde(default)]
-    permissions: Option<Perms>,
-    /// A batch delete notification: message uuids removed elsewhere (e.g.
-    /// a moderator deleting someone else's post) rather than arriving
-    /// tagged on a message object's own `deleted`/`is_deleted` flag.
-    #[serde(default)]
-    delete: Vec<String>,
-    /// Who is in the room, keyed by user id. Sent in full on join - upwards of
-    /// five hundred entries for a busy room - and then one entry at a time as
-    /// people arrive. Both forms are the same shape, so both simply merge.
-    #[serde(default)]
-    users: std::collections::BTreeMap<String, WireUser>,
-    /// Departures, keyed by user id. The value is a presence flag rather than
-    /// a user object, which is why this is a separate key from `users`.
-    #[serde(default)]
-    user: std::collections::BTreeMap<String, bool>,
-    /// Whether this batch is the room's recent history being replayed rather
-    /// than things being said now - sent on every join, and on every
-    /// reconnect after it.
-    #[serde(default)]
-    history: bool,
-    /// The room's message of the day. Null in most frames; a string when the
-    /// site has something to say on entering a room.
-    #[serde(default)]
-    motd: Option<String>,
-    /// Whatever else the server sent. The protocol is undocumented, so this
-    /// is how a frame nobody has decoded yet becomes visible instead of being
-    /// silently dropped - `unhandled_shape` reports its outline at debug level
-    /// without printing anyone's messages.
-    #[serde(flatten)]
-    extra: std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-/// A one-line outline of a JSON value: enough to write a parser against,
-/// without reproducing chat content in the log.
-fn outline(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Object(map) => {
-            // Field *names* of a nested object are protocol, not content, so
-            // they are safe to name - unlike the outer map's keys, which here
-            // are user ids.
-            let sample = match map.values().next() {
-                Some(serde_json::Value::Object(inner)) => {
-                    format!("{{{}}}", inner.keys().cloned().collect::<Vec<_>>().join(","))
-                }
-                Some(v) => outline(v),
-                None => "?".into(),
-            };
-            format!("object({} keys, values like {})", map.len(), sample)
-        }
-        serde_json::Value::Array(items) => {
-            let sample = items.first().map(outline).unwrap_or_else(|| "?".into());
-            format!("array({}, of {})", items.len(), sample)
-        }
-        // Field *names* only - the values are the user's chat data.
-        serde_json::Value::String(_) => "string".into(),
-        serde_json::Value::Number(_) => "number".into(),
-        serde_json::Value::Bool(_) => "bool".into(),
-        serde_json::Value::Null => "null".into(),
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ServerResponse {
-    pub messages: Vec<WireMessage>,
-    pub whisper: Option<WireWhisper>,
-    pub perms: Option<Perms>,
-    pub deleted_uuids: Vec<String>,
-    /// Room members that arrived (or the whole roster, on join).
-    pub users_joined: Vec<WireUser>,
-    /// User ids that left.
-    pub users_left: Vec<String>,
-    /// Non-JSON payload, if the frame wasn't an object.
-    pub plaintext: Option<String>,
-    /// This batch is history being replayed, not conversation arriving.
-    pub history: bool,
-    /// The room's message of the day, when the frame carried one.
-    pub motd: Option<String>,
-}
-
-impl ServerResponse {
-    pub fn parse(frame: &str) -> Self {
-        let trimmed = frame.trim_start();
-        if !trimmed.starts_with('{') {
-            let text = frame.trim();
-            return ServerResponse { plaintext: (!text.is_empty()).then(|| text.to_string()), ..Default::default() };
-        }
-
-        let raw: RawResponse = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!("failed to decode server frame: {e}");
-                return ServerResponse::default();
-            }
-        };
-
-        // Decode elements individually so one malformed record doesn't
-        // discard the whole batch.
-        let messages = raw
-            .messages
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| match serde_json::from_value::<WireMessage>(v) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    tracing::debug!("skipping undecodable message: {e}");
-                    None
-                }
+/// The listed rooms out of `GET /chat/v1/rooms/heads?kind=listed`.
+pub fn parse_heads(body: &str) -> Vec<RoomHead> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else { return Vec::new() };
+    v["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["state"].as_str().is_none_or(|s| s == "active"))
+        .filter_map(|r| {
+            let uuid = r["chat_room_uuid"].as_str()?.to_string();
+            let title = r["title"].as_str().unwrap_or_default().to_string();
+            let slug = r["slug"].as_str().map(str::to_string).filter(|s| !s.is_empty()).unwrap_or_else(|| super::rooms::slug(&title));
+            Some(RoomHead {
+                uuid,
+                title,
+                slug,
+                head_seq: r["head_seq"].as_u64().unwrap_or(0),
+                subtitle: r["chat_room_subtitle"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
             })
-            .collect();
+        })
+        .collect()
+}
 
-        let whisper = raw.whisper.and_then(|v| match serde_json::from_value(v) {
-            Ok(w) => Some(w),
-            // Warn, not debug. A whisper that cannot be decoded is a private
-            // message silently dropped, which is the failure this backend has
-            // already had once and could not see.
-            Err(e) => {
-                tracing::warn!("dropping a whisper this could not decode: {e}");
-                None
+/// One entry in a room's log - a frame `t: "entry"`, or one element of a
+/// `/log` answer's `entries`, which are the same object.
+#[derive(Clone, Debug, Default)]
+pub struct Entry {
+    pub room: String,
+    pub room_seq: u64,
+    pub kind: String,
+    pub message: Option<String>,
+    pub author: Option<String>,
+    pub at: Option<i64>,
+    pub body: Option<String>,
+    pub mentions: Vec<String>,
+    pub state_seq: Option<u64>,
+    pub html: Option<String>,
+    pub client_nonce: Option<String>,
+    pub subtitle: Option<String>,
+}
+
+impl Entry {
+    pub fn from_value(v: &Value) -> Option<Self> {
+        Some(Self {
+            room: v["chat_room_uuid"].as_str().unwrap_or_default().to_string(),
+            room_seq: v["room_seq"].as_u64()?,
+            kind: v["kind"].as_str().unwrap_or_default().to_string(),
+            message: v["chat_message_uuid"].as_str().map(str::to_lowercase),
+            author: v["author_principal_uuid"].as_str().or_else(|| v["actor_principal_uuid"].as_str()).map(str::to_string),
+            at: v["at"].as_i64(),
+            body: v["body_bbcode"].as_str().map(str::to_string),
+            mentions: v["mentions"]
+                .as_array()
+                .map(|m| m.iter().filter_map(|x| x.as_str().or_else(|| x["principal_uuid"].as_str()).map(str::to_string)).collect())
+                .unwrap_or_default(),
+            // The row carries it too; the frame's own field wins when both do.
+            state_seq: v["message_state_seq"].as_u64().or_else(|| v["html"].as_str().and_then(|h| attr(h, "data-message-state-seq")?.parse().ok())),
+            html: v["html"].as_str().map(str::to_string),
+            client_nonce: v["client_nonce"].as_str().map(str::to_string),
+            subtitle: v["chat_room_subtitle"].as_str().map(str::to_string),
+        })
+    }
+
+    /// Who wrote it, as the rendered row says - the only place the author's
+    /// name and picture are carried.
+    pub fn row_author(&self) -> Option<Principal> {
+        let html = self.html.as_deref()?;
+        let uuid = attr(html, "data-author-uuid").or_else(|| self.author.clone())?;
+        let name = between(html, "class=\"chat-author\">", "</span>").map(|n| unescape_html(n).trim().to_string()).filter(|n| !n.is_empty())?;
+        let avatar = tag_with_class(html, "img", "chat-avatar").and_then(|tag| attr(tag, "src")).map(|s| unescape_html(&s));
+        let mut badges = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("data-badge=\"") {
+            rest = &rest[at + "data-badge=\"".len()..];
+            if let Some(end) = rest.find('"') {
+                badges.push(rest[..end].to_string());
             }
-        });
-
-        // Key names and value shapes only - never the values, which are the
-        // user's chat. The protocol is undocumented, so this is how its frame
-        // vocabulary becomes knowable at all.
-        //
-        // This is what finally answered "why are whispers not arriving": the
-        // key was in here, spelled `whisper`, while the field asking for it
-        // said `Whisper`. Worth keeping for the next such question.
-        if !raw.extra.is_empty() {
-            let shape: Vec<String> = raw.extra.iter().map(|(k, v)| format!("{k}: {}", outline(v))).collect();
-            tracing::debug!("sneedchat: frame carried undecoded keys - {}", shape.join(", "));
         }
+        Some(Principal { uuid, name, avatar, badges })
+    }
 
-        let users_joined: Vec<WireUser> = raw.users.into_values().collect();
-        // Only the false entries are departures; a true one carries no user
-        // object to add anyone with, and the matching `users` frame is what
-        // announces an arrival.
-        let users_left: Vec<String> = raw.user.into_iter().filter(|(_, present)| !present).map(|(id, _)| id).collect();
-
-        ServerResponse {
-            messages,
-            whisper,
-            perms: raw.permissions,
-            deleted_uuids: raw.delete,
-            users_joined,
-            users_left,
-            plaintext: None,
-            history: raw.history,
-            // An empty motd is the site having none rather than the site
-            // saying nothing, and drawing a blank line for it would be worse
-            // than drawing nothing.
-            motd: raw.motd.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
-        }
+    /// Whether the rendered row says this message has been taken down.
+    pub fn row_tombstoned(&self) -> bool {
+        self.html.as_deref().and_then(|h| attr(h, "data-tombstoned")).is_some_and(|v| v == "true")
     }
 }
 
-/// Decode the HTML entities the server escapes in `message_raw`.
+/// The reaction tallies a rendered row shows: `(code, count)` for each
+/// `[data-reaction-code][data-count]` chip in its `[data-chat-reactions]`.
+pub fn chips(html: &str) -> Vec<(String, i64)> {
+    let Some(start) = html.find("data-chat-reactions") else { return Vec::new() };
+    let list = &html[start..];
+    let list = &list[..list.find("</ul>").unwrap_or(list.len())];
+    let mut out = Vec::new();
+    let mut rest = list;
+    while let Some(at) = rest.find("data-reaction-code=\"") {
+        let tag_start = rest[..at].rfind('<').unwrap_or(0);
+        let tail = &rest[tag_start..];
+        let end = tail.find('>').unwrap_or(tail.len());
+        let tag = &tail[..end];
+        if let (Some(code), Some(count)) = (attr(tag, "data-reaction-code"), attr(tag, "data-count").and_then(|c| c.parse::<i64>().ok())) {
+            if count > 0 && !out.iter().any(|(c, _)| c == &code) {
+                out.push((code, count));
+            }
+        }
+        rest = &tail[end.max(1)..];
+    }
+    out
+}
+
+/// A mention as the chat writes it, `[user=<uuid>]Name[/user]`, read back as
+/// the `@Name` a person types and reads.
+pub fn mentions_to_names(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find("[user=") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let parsed = tail.find(']').and_then(|close| {
+            let inner = &tail[close + 1..];
+            let end = inner.find("[/user]")?;
+            Some((inner[..end].to_string(), close + 1 + end + "[/user]".len()))
+        });
+        match parsed {
+            Some((name, used)) => {
+                out.push('@');
+                out.push_str(name.trim_start_matches('@'));
+                rest = &tail[used..];
+            }
+            None => {
+                out.push_str("[user=");
+                rest = &tail["[user=".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `@Name` written the way the chat reads a mention, for every name it knows:
+/// the longest known name wins, so "@Ryo Ma" is not taken for "@Ryo".
+pub fn names_to_mentions(body: &str, people: &[(String, String)]) -> String {
+    let mut known: Vec<&(String, String)> = people.iter().filter(|(_, name)| !name.is_empty()).collect();
+    known.sort_by_key(|(_, name)| std::cmp::Reverse(name.chars().count()));
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        // Only at a word's start: an address like a@b is not a mention.
+        let starts_word = out.chars().last().is_none_or(|c| c.is_whitespace() || "([{,".contains(c));
+        let hit = starts_word
+            .then(|| {
+                known.iter().find(|(_, name)| {
+                    after.len() >= name.len()
+                        && after.is_char_boundary(name.len())
+                        && after[..name.len()].eq_ignore_ascii_case(name)
+                        && after[name.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                })
+            })
+            .flatten();
+        match hit {
+            Some((uuid, name)) => {
+                out.push_str(&format!("[user={uuid}]{name}[/user]"));
+                rest = &after[name.len()..];
+            }
+            None => {
+                out.push('@');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A message's reply, which Ephyra writes the way XenForo does: the message
+/// opens with a quote of the one it answers, attributed
+/// `[quote="Name, chat_message: <uuid>"]`. Split off here so the reply can
+/// be shown as a reply and the message as what was actually said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Quoted {
+    pub name: String,
+    pub message: String,
+    pub text: String,
+}
+
+pub fn split_reply(body: &str) -> (Option<Quoted>, &str) {
+    let trimmed = body.trim_start();
+    let Some(open_rest) = trimmed.strip_prefix("[quote=\"") else { return (None, body) };
+    let Some((attribution, after_open)) = open_rest.split_once("\"]") else { return (None, body) };
+    let Some((name, message)) = attribution.split_once(", chat_message: ") else { return (None, body) };
+    // The quote's own end, nested quotes counted.
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    let lower = after_open.to_ascii_lowercase();
+    while i < lower.len() {
+        let rest = &lower[i..];
+        if rest.starts_with("[quote") {
+            depth += 1;
+            i += 6;
+        } else if rest.starts_with("[/quote]") {
+            depth -= 1;
+            if depth == 0 {
+                let text = after_open[..i].trim().to_string();
+                let after = after_open[i + "[/quote]".len()..].trim_start_matches(['\n', '\r', ' ']);
+                return (Some(Quoted { name: name.trim().to_string(), message: message.trim().to_lowercase(), text }), after);
+            }
+            i += 8;
+        } else {
+            i += rest.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    (None, body)
+}
+
+/// The quote a reply opens with, as the site's own client writes it.
+pub fn reply_quote(name: &str, message: &str, quoted: &str) -> String {
+    let shown: String = name.replace(['"', '[', ']', ','], "").split_whitespace().collect::<Vec<_>>().join(" ");
+    let (_, own) = split_reply(quoted);
+    let own = own.trim();
+    if shown.is_empty() || own.is_empty() {
+        return String::new();
+    }
+    format!("[quote=\"{shown}, chat_message: {}\"]{own}[/quote]\n", message.to_lowercase())
+}
+
+/// A post's `client_nonce`: a version-7 uuid, which is what the site's own
+/// client sends - the server reads the time out of it, and keeps a nonce
+/// only for a window, so the time in it has to be now.
+pub fn post_nonce() -> String {
+    let mut bytes: [u8; 16] = rand::random();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    for (i, byte) in bytes.iter_mut().take(6).enumerate() {
+        *byte = (now >> ((5 - i) * 8)) as u8;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(&bytes)
+}
+
+/// A command's `chat_operation_uuid`: a random (version-4) uuid.
+pub fn operation_id() -> String {
+    let mut bytes: [u8; 16] = rand::random();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(&bytes)
+}
+
+fn format_uuid(b: &[u8; 16]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+pub fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { *c == b'-' } else { c.is_ascii_hexdigit() })
+}
+
+/// What the chat's error codes mean, said to a person.
+pub fn describe_error(code: &str) -> String {
+    match code {
+        "not_permitted" => "the chat doesn't let this account do that".into(),
+        "rate_limited" => "the chat says to slow down".into(),
+        "muted" | "principal_muted" => "this account is muted in this room".into(),
+        "banned" | "principal_banned" => "this account is banned from this room".into(),
+        "room_not_found" => "the chat has no such room".into(),
+        "message_not_found" => "that message is gone".into(),
+        "message_state_conflict" => "that message changed in the meantime - try again".into(),
+        "body_too_long" => "that's longer than the chat takes".into(),
+        "body_empty" => "there's nothing to send".into(),
+        "frozen" => "the chat is frozen for now".into(),
+        "unavailable" | "internal_error" => "the chat is having trouble - try again".into(),
+        other => format!("the chat refused it ({other})"),
+    }
+}
+
+/// The value of attribute `name` in the first place it appears in `html`.
+pub fn attr(html: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let mut from = 0;
+    while let Some(at) = html[from..].find(&needle) {
+        let start = from + at;
+        // A whole attribute name, not the tail of a longer one.
+        let ok = start == 0 || html.as_bytes()[start - 1].is_ascii_whitespace();
+        let value_start = start + needle.len();
+        if ok {
+            let end = html[value_start..].find('"')?;
+            return Some(html[value_start..value_start + end].to_string());
+        }
+        from = value_start;
+    }
+    None
+}
+
+fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = s.find(open)? + open.len();
+    let end = s[start..].find(close)?;
+    Some(&s[start..start + end])
+}
+
+/// The first `<tag ...>` whose class list includes `class`.
+fn tag_with_class<'a>(html: &'a str, tag: &str, class: &str) -> Option<&'a str> {
+    let open = format!("<{tag} ");
+    let mut rest = html;
+    while let Some(at) = rest.find(&open) {
+        let tail = &rest[at..];
+        let end = tail.find('>')?;
+        let whole = &tail[..end];
+        if attr(whole, "class").is_some_and(|c| c.split_whitespace().any(|c| c == class)) {
+            return Some(whole);
+        }
+        rest = &tail[end..];
+    }
+    None
+}
+
+/// Decode the HTML entities in text taken out of a rendered row.
 ///
 /// Numeric forms matter as much as the named ones: the site emits
 /// apostrophes as `&#x27;`, so handling only `&#039;` leaves visible
-/// mojibake in ordinary messages.
+/// mojibake in ordinary names.
 pub fn unescape_html(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -328,445 +411,108 @@ fn numeric_entity(tail: &str) -> Option<(String, &str)> {
     Some((ch.to_string(), &digits[end + 1..]))
 }
 
-/// A leading `>` (not `>>`, which is a post-quote reference) gets greentext
-/// colouring, matching the site's own rendering.
-pub fn prepare_outgoing(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    // A line break is a `[br]`, which is what the site itself writes for one
-    // and what every message arriving from it already says.
-    let text = text.replace("\r\n", "\n").replace('\n', "[br]");
-    if text.starts_with('>') && !text.starts_with(">>") {
-        return Some(format!("[color=#72ff72]{text}"));
-    }
-    Some(text)
-}
-
-/// `/edit {"uuid": "...", "message": "..."}` - the site's own client sends
-/// the new body as a JSON payload following the command, not as plain text
-/// the way an ordinary chat message or `/join` is.
-pub fn prepare_edit(uuid: &str, new_body: &str) -> String {
-    let payload = serde_json::json!({ "uuid": uuid, "message": new_body });
-    format!("/edit {payload}")
-}
-
-/// How a whisper is addressed on the wire.
-///
-/// `/w`, which is what the site's own client sends. This said `/whisper` and
-/// that is not a command the site knows - and the failure is the bad kind,
-/// exactly as the line below this one has always warned: an unrecognised
-/// command is not rejected, it is posted as ordinary text. Every whisper sent
-/// from here went to the whole room with `/whisper @name` written in front of
-/// it.
-///
-/// So this is the one constant here worth being certain of rather than
-/// plausible about, and it is confirmed against the site rather than derived.
-pub const WHISPER_COMMAND: &str = "/w";
-
-/// `/w @username, <message>`.
-///
-/// The `@` is part of the address, not decoration: the site reads the target
-/// as a mention. Added here rather than expected from the caller, since every
-/// place a name comes from - a message's author, a row in the member list -
-/// holds it without one, and a name that already has one is left alone rather
-/// than given a second.
-///
-/// The comma is what ends the name, and it is required rather than tidy.
-/// Sneedchat names contain spaces - "Fishtank Observer" is one - so without it
-/// the site has no way to tell where the name stops and the message starts,
-/// and takes only the first word as the target. This module already knew that
-/// convention and used it for replies (`as_reply` writes `@Name,`); the
-/// whisper path was written as though a name were one word, and the note here
-/// claiming a name with a space "cannot be whispered" was wrong about the
-/// protocol rather than describing it.
-pub fn prepare_whisper(target: &str, body: &str) -> String {
-    let target = target.trim().trim_end_matches(',').trim();
-    let at = if target.starts_with('@') { "" } else { "@" };
-    format!("{WHISPER_COMMAND} {at}{target}, {body}")
-}
-
-/// Reads a whisper somebody typed themselves, as `/w @name, message`.
-///
-/// Supported because it is what the site's own users type, and because
-/// handing it straight through would send a real whisper that this client
-/// then knew nothing about - the site does not echo one back, so the line
-/// would vanish as it was sent. Recognising it means the same text does the
-/// same thing whether it was typed or chosen from a menu.
-///
-/// `/whisper` is accepted here too. It is not a command the site knows, but it
-/// is the one somebody will type after reading about this feature anywhere
-/// else, and taking it means a message meant for one person cannot go to the
-/// room because of the word chosen for it.
-///
-/// The no-roster form, which only the tests want: everything live goes
-/// through `parse_whisper_command_among` with the names it knows.
-#[cfg(test)]
-pub fn parse_whisper_command(text: &str) -> Option<(String, String)> {
-    parse_whisper_command_among(text, &[])
-}
-
-/// The same, told who is in the room.
-///
-/// A name with a space in it cannot be found any other way. "/w @Ancient
-/// Pioneer hello" is the form the site takes and the one people type, and
-/// read without knowing the names it splits at the first space - so the
-/// whisper went to "Ancient" about "Pioneer hello", which is nobody, and the
-/// line came back written into the room instead. The comma form was the only
-/// one that worked, and nothing said so.
-///
-/// So the names are matched against, longest first: the longest one the text
-/// actually begins with is the one meant, because a shorter name that is also
-/// a prefix would leave the rest of its own name in the message.
-pub fn parse_whisper_command_among(text: &str, known: &[String]) -> Option<(String, String)> {
-    let rest = text
-        .strip_prefix("/w ")
-        .or_else(|| text.strip_prefix("/whisper "))
-        .or_else(|| text.strip_prefix("/W "))?
-        .trim_start();
-
-    // Whoever is here, longest name first.
-    let mut names: Vec<&String> = known.iter().collect();
-    names.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
-    let without_at = rest.strip_prefix('@').unwrap_or(rest);
-    for name in names {
-        let name = name.trim();
-        if name.is_empty() || without_at.len() < name.len() {
-            continue;
-        }
-        let (head, tail) = without_at.split_at(name.len());
-        if !head.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        // The name has to end where it ends: "Ann" must not match "Annabel",
-        // and the comma people type after a name is not part of it.
-        let body = tail.trim_start_matches(',').trim();
-        if !tail.is_empty() && !tail.starts_with([' ', ',']) {
-            continue;
-        }
-        if body.is_empty() {
-            return None;
-        }
-        return Some((name.to_string(), body.to_string()));
-    }
-
-    // The comma next, because that is what ends a name for anybody not in the
-    // room right now - somebody who has left, or a name typed from memory.
-    let (target, body) = match rest.split_once(',') {
-        Some((target, body)) => (target, body),
-        // No comma and no known name, so it has to be one word: a
-        // single-word name, or the numeric id the site also takes.
-        None => rest.split_once(char::is_whitespace)?,
-    };
-    let target = target.trim().trim_start_matches('@').trim();
-    let body = body.trim();
-    if target.is_empty() || body.is_empty() {
-        return None;
-    }
-    Some((target.to_string(), body.to_string()))
-}
-
-
-/// `/delete <uuid>` - unlike `/edit`, just the bare uuid, no JSON.
-pub fn prepare_delete(uuid: &str) -> String {
-    format!("/delete {uuid}")
-}
-
-impl ServerResponse {
-    /// Whether the frame carried nothing at all.
-    ///
-    /// Only the tests ask: the live path looks at the piece it wants and
-    /// ignores the rest, so a frame being wholly empty is not a case it has
-    /// to name.
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-            && self.whisper.is_none()
-            && self.perms.is_none()
-            && self.deleted_uuids.is_empty()
-            && self.users_joined.is_empty()
-            && self.users_left.is_empty()
-            && self.plaintext.is_none()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A frame as the live chat sent it to a guest on 2026-11-19.
+    const POSTED: &str = r#"{"t":"entry","chat_room_uuid":"01a1f0f8-2d32-7660-a237-1f38d4009cf2","room_seq":17,"kind":"chat_message_posted","entry_uuid":"01a1f1c2-a5bf-7596-a32e-8347ad4e4227","at":1795057427,"actor_principal_uuid":"019e6198-a12a-72d2-936c-a7c55c2993fb","imported":false,"chat_message_uuid":"01a1f1c2-a5be-7158-80b9-cca987eba9a4","revision":1,"body_bbcode":":gunt:","mentions":[],"author_principal_uuid":"019e6198-a12a-72d2-936c-a7c55c2993fb","edited_at":null,"html":"<li class=\"chat-row\" data-room-seq=\"17\" data-posted-seq=\"17\" data-message-uuid=\"01a1f1c2-a5be-7158-80b9-cca987eba9a4\" data-author-uuid=\"019e6198-a12a-72d2-936c-a7c55c2993fb\" data-message-state-seq=\"17\" data-tombstoned=\"false\"><img class=\"chat-avatar\" alt=\"\" loading=\"lazy\" src=\"https://kiwifarms.net/data/avatars/m/219/219166.jpg?1766045204\"><span class=\"chat-author\">Ryo Ma</span><span class=\"chat-badges\"><span data-badge=\"hidden\"></span><span data-badge=\"primary\"></span></span><time datetime=\"2026-11-19T03:03:47.901601Z\">2026-11-19 03:03:47 UTC</time><div class=\"chat-body\">x</div><ul data-chat-reactions></ul></li>"}"#;
+
     #[test]
-    fn a_line_break_is_sent_as_the_site_writes_one() {
-        assert_eq!(prepare_outgoing("one\ntwo\r\nthree").as_deref(), Some("one[br]two[br]three"));
-        assert_eq!(prepare_outgoing("  hi\n  ").as_deref(), Some("hi"));
-        assert_eq!(prepare_outgoing(">green\ntext").as_deref(), Some("[color=#72ff72]>green[br]text"));
+    fn reads_a_posted_message_and_its_author() {
+        let v: Value = serde_json::from_str(POSTED).unwrap();
+        let e = Entry::from_value(&v).unwrap();
+        assert_eq!(e.kind, "chat_message_posted");
+        assert_eq!(e.room_seq, 17);
+        assert_eq!(e.state_seq, Some(17));
+        assert_eq!(e.body.as_deref(), Some(":gunt:"));
+        assert_eq!(e.message.as_deref(), Some("01a1f1c2-a5be-7158-80b9-cca987eba9a4"));
+        assert!(!e.row_tombstoned());
+        let who = e.row_author().unwrap();
+        assert_eq!(who.name, "Ryo Ma");
+        assert_eq!(who.uuid, "019e6198-a12a-72d2-936c-a7c55c2993fb");
+        assert_eq!(who.avatar.as_deref(), Some("https://kiwifarms.net/data/avatars/m/219/219166.jpg?1766045204"));
+        assert_eq!(who.badges, vec!["hidden", "primary"]);
     }
 
     #[test]
-    fn parses_message_batches() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[
-                {"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1","message_date":100},
-                {"author":{"id":2,"username":"b"},"message_raw":"yo","message_uuid":"u2","message_date":101}
-            ]}"#,
-        );
-        assert_eq!(r.messages.len(), 2);
-        assert_eq!(r.messages[0].message_raw, "hi");
+    fn reads_the_room_list() {
+        let body = r#"{"rooms":[{"chat_room_uuid":"01a1f0f8-2d2c-7264-86b9-1e38d9a538a4","chat_room_kind":"listed","state":"active","head_seq":228,"floor_seq":1,"title":"Beauty Parlor","slug":"beauty-parlor","chat_room_subtitle":null},{"chat_room_uuid":"01a1f0f8-2d2f-729f-90a8-eb841d7073f1","chat_room_kind":"listed","state":"active","head_seq":16,"title":"SPORTS!!","slug":"","chat_room_subtitle":"go"}]}"#;
+        let rooms = parse_heads(body);
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].slug, "beauty-parlor");
+        assert_eq!(rooms[0].head_seq, 228);
+        // No slug from the site: made from the title the way rooms always were.
+        assert_eq!(rooms[1].slug, "sports");
+        assert_eq!(rooms[1].subtitle.as_deref(), Some("go"));
+        assert!(parse_heads("<html>gate</html>").is_empty());
     }
 
     #[test]
-    fn messages_carry_their_room() {
-        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1","room_id":20}]}"#);
-        assert_eq!(r.messages[0].room_id, Some(20));
+    fn a_reply_is_the_quote_it_opens_with() {
+        let body = "[quote=\"Ryo Ma, chat_message: 01A1F1C2-a5be-7158-80b9-cca987eba9a4\"]what [quote=\"x\"]inner[/quote] up[/quote]\nnot much";
+        let (quoted, rest) = split_reply(body);
+        let quoted = quoted.unwrap();
+        assert_eq!(quoted.name, "Ryo Ma");
+        assert_eq!(quoted.message, "01a1f1c2-a5be-7158-80b9-cca987eba9a4");
+        assert_eq!(quoted.text, "what [quote=\"x\"]inner[/quote] up");
+        assert_eq!(rest, "not much");
+        // A quote that names no chat message is part of the message.
+        let plain = "[quote=\"Someone\"]hi[/quote] yes";
+        assert_eq!(split_reply(plain), (None, plain));
+        // Unclosed: left alone.
+        assert_eq!(split_reply("[quote=\"A, chat_message: b\"]open").0, None);
     }
 
     #[test]
-    fn accepts_string_or_numeric_author_ids() {
-        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":"160024","username":"y a t s"},"message_raw":"hi","message_uuid":"u1"}]}"#);
-        assert_eq!(r.messages[0].author.id, "160024");
-        let r2 = ServerResponse::parse(r#"{"messages":[{"author":{"id":7,"username":"x"},"message_raw":"hi","message_uuid":"u2"}]}"#);
-        assert_eq!(r2.messages[0].author.id, "7");
-    }
-
-    #[test]
-    fn one_bad_message_does_not_discard_the_batch() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[
-                {"author":{"id":1,"username":"a"},"message_raw":"good","message_uuid":"u1"},
-                {"author":"not-an-object","message_raw":"bad"}
-            ]}"#,
-        );
-        assert_eq!(r.messages.len(), 1);
-        assert_eq!(r.messages[0].message_raw, "good");
-    }
-
-    #[test]
-    fn accepts_either_spelling_of_the_whisper_key() {
-        for frame in [
-            r#"{"whisper":{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u"}}"#,
-            r#"{"Whisper":{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u"}}"#,
-        ] {
-            let r = ServerResponse::parse(frame);
-            assert!(r.whisper.is_some(), "for {frame}");
-        }
-    }
-
-    #[test]
-    fn a_whisper_carrying_more_than_we_read_still_decodes() {
-        // Five keys on the wire; three are read. A whisper dropped for
-        // carrying a field nobody asked about would be a private message lost
-        // to tidiness.
-        let r = ServerResponse::parse(
-            r#"{"whisper":{"author":{"id":9,"username":"w","avatar_url":"/a.jpg"},"message_raw":"psst","message_uuid":"u9","message_date":123,"message_id":7}}"#,
-        );
-        let w = r.whisper.expect("decodes despite the extra fields");
-        assert_eq!(w.author.username, "w");
-        assert_eq!(w.message_raw, "psst");
-    }
-
-    #[test]
-    fn parses_whispers_and_perms() {
-        // Lowercase, which is what the site actually sends - the capitalised
-        // spelling this used to require is why none were ever received.
-        let r = ServerResponse::parse(r#"{"whisper":{"author":{"id":9,"username":"w"},"message_raw":"psst","message_uuid":"u9"}}"#);
-        let w = r.whisper.unwrap();
-        assert_eq!(w.author.id, "9");
-        assert_eq!(w.message_raw, "psst");
-
-        let r = ServerResponse::parse(r#"{"permissions":{"can_view":true,"can_send":false}}"#);
-        let p = r.perms.unwrap();
-        assert!(p.can_view);
-        assert!(!p.can_send);
-    }
-
-    #[test]
-    fn treats_non_json_frames_as_plaintext() {
-        let r = ServerResponse::parse("You cannot join this room.");
-        assert_eq!(r.plaintext.as_deref(), Some("You cannot join this room."));
-        assert!(r.messages.is_empty());
-        assert!(ServerResponse::parse("   ").is_empty());
-    }
-
-    #[test]
-    fn malformed_json_object_yields_empty_response() {
-        assert!(ServerResponse::parse(r#"{"messages": [ broken"#).is_empty());
-    }
-
-    #[test]
-    fn unescapes_entities() {
-        assert_eq!(unescape_html("a &amp; b"), "a & b");
-        assert_eq!(unescape_html("&lt;tag&gt;"), "<tag>");
-        assert_eq!(unescape_html("it&#039;s"), "it's");
-        assert_eq!(unescape_html("There&#x27;s so much evil"), "There's so much evil");
-        assert_eq!(unescape_html("&#8212;"), "—");
-    }
-
-    #[test]
-    fn malformed_numeric_entities_are_left_alone() {
-        assert_eq!(unescape_html("&#;"), "&#;");
-        assert_eq!(unescape_html("costs &#50 or so"), "costs &#50 or so");
-    }
-
-    #[test]
-    fn greentext_gets_colored() {
-        assert_eq!(prepare_outgoing(">implying").unwrap(), "[color=#72ff72]>implying");
-        assert_eq!(prepare_outgoing(">>123").unwrap(), ">>123");
-        assert_eq!(prepare_outgoing("normal").unwrap(), "normal");
-    }
-
-    #[test]
-    fn blank_outgoing_messages_are_dropped() {
-        assert!(prepare_outgoing("   ").is_none());
-        assert!(prepare_outgoing("").is_none());
-        assert_eq!(prepare_outgoing("  hi  ").unwrap(), "hi");
-    }
-
-    #[test]
-    fn parses_edit_dates_and_avatar_urls() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":1,"username":"a","avatar_url":"/data/avatars/l/0/1.jpg"},"message_raw":"hi","message_uuid":"u1","message_edit_date":12345}]}"#,
-        );
-        assert_eq!(r.messages[0].message_edit_date, 12345);
-        assert_eq!(r.messages[0].author.avatar_url.as_deref(), Some("/data/avatars/l/0/1.jpg"));
-        assert!(!r.messages[0].is_deleted());
-    }
-
-    #[test]
-    fn a_message_with_no_edit_date_or_avatar_defaults_sanely() {
-        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1"}]}"#);
-        assert_eq!(r.messages[0].message_edit_date, 0);
-        assert!(r.messages[0].author.avatar_url.is_none());
-    }
-
-    #[test]
-    fn parses_per_message_delete_flags() {
-        let deleted = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","deleted":true}]}"#);
-        assert!(deleted.messages[0].is_deleted());
-
-        let is_deleted = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","is_deleted":true}]}"#);
-        assert!(is_deleted.messages[0].is_deleted());
-    }
-
-    #[test]
-    fn parses_the_top_level_delete_batch() {
-        let r = ServerResponse::parse(r#"{"delete":["u1","u2"]}"#);
-        assert_eq!(r.deleted_uuids, vec!["u1".to_string(), "u2".to_string()]);
-        assert!(!r.is_empty());
-
-        assert!(ServerResponse::parse(r#"{"delete":[]}"#).is_empty());
-    }
-
-    #[test]
-    fn builds_the_edit_and_delete_commands() {
-        assert_eq!(prepare_edit("abc-123", "new text"), r#"/edit {"message":"new text","uuid":"abc-123"}"#);
-        assert_eq!(prepare_delete("abc-123"), "/delete abc-123");
-        // The site reads the target as a mention, so the @ is part of
-        // addressing it rather than something a caller has to remember.
-        assert_eq!(prepare_whisper("Someone", "hello there"), "/w @Someone, hello there");
-        // A name that already carries one does not get a second.
-        assert_eq!(prepare_whisper("@Someone", "hi"), "/w @Someone, hi");
-        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/w @Spaced, hi");
-        // The comma ends the name, so a name with a space in it works - which
-        // is most of why it is there. Sneedchat names are display names.
+    fn a_reply_quotes_only_what_the_message_said_itself() {
+        let quoted = "[quote=\"B, chat_message: x\"]old[/quote]\nnew words";
         assert_eq!(
-            prepare_whisper("Fishtank Observer", "aaa"),
-            "/w @Fishtank Observer, aaa"
+            reply_quote("Ryo, Ma \"x\"", "ABC", quoted),
+            "[quote=\"Ryo Ma x, chat_message: abc\"]new words[/quote]\n"
         );
-        // And a caller that supplied the comma does not get two.
-        assert_eq!(prepare_whisper("Fishtank Observer,", "aaa"), "/w @Fishtank Observer, aaa");
-        // The command itself, spelled out rather than built from the constant:
-        // a test that reads the constant back cannot notice it changing, and
-        // the wrong word here is not a failed send - it is the message posted
-        // to the whole room as ordinary text.
-        assert!(prepare_whisper("Someone", "hi").starts_with("/w "));
+        assert_eq!(reply_quote("", "abc", "x"), "");
     }
 
     #[test]
-    fn reads_a_whisper_somebody_typed() {
-        assert_eq!(
-            parse_whisper_command("/w @Someone, hello there"),
-            Some(("Someone".into(), "hello there".into()))
-        );
-        // Without the @, which the site accepts and people leave off.
-        assert_eq!(parse_whisper_command("/w Someone, hi"), Some(("Someone".into(), "hi".into())));
-        // The word somebody will type having read about this anywhere else.
-        assert_eq!(parse_whisper_command("/whisper @Someone, hi"), Some(("Someone".into(), "hi".into())));
-        // The case the comma exists for: splitting on whitespace would read
-        // this as a whisper to "Fishtank" beginning "Observer, aaa".
-        assert_eq!(
-            parse_whisper_command("/w @Fishtank Observer, aaa"),
-            Some(("Fishtank Observer".into(), "aaa".into()))
-        );
-        // A single-word name with no comma still works, because there is
-        // nowhere else the name could end.
-        assert_eq!(parse_whisper_command("/w @Someone hi"), Some(("Someone".into(), "hi".into())));
-        // A comma inside the message is not a second delimiter.
-        assert_eq!(
-            parse_whisper_command("/w @Someone, hi, how are you"),
-            Some(("Someone".into(), "hi, how are you".into()))
-        );
+    fn ids_are_the_versions_the_chat_expects() {
+        let n = post_nonce();
+        assert!(is_uuid(&n));
+        assert_eq!(&n[14..15], "7");
+        let o = operation_id();
+        assert!(is_uuid(&o));
+        assert_eq!(&o[14..15], "4");
+        assert!(!is_uuid("20"));
     }
 
     #[test]
-    fn leaves_alone_what_is_not_one() {
-        // Half a command is not a command: sending "/w @Someone" as a whisper
-        // with an empty body would be a whisper nobody wrote, and passing it
-        // through as ordinary text is what the site does with it anyway.
-        assert_eq!(parse_whisper_command("/w @Someone"), None);
-    }
-
-    /// The form the site takes and people type: an @name with a space in it
-    /// and no comma. Unreadable without knowing who is here, which is why the
-    /// room's own roster is handed in - read blind it split at the first
-    /// space, so a whisper to "Ancient Pioneer" went to "Ancient" about
-    /// "Pioneer ..." and came back in the room instead.
-    #[test]
-    fn a_name_with_a_space_is_found_among_the_people_in_the_room() {
-        let here = vec!["Ancient Pioneer".to_string(), "Ann".to_string(), "Annabel Lee".to_string()];
-        assert_eq!(
-            parse_whisper_command_among("/w @Ancient Pioneer a", &here),
-            Some(("Ancient Pioneer".into(), "a".into()))
-        );
-        // Without the @, which the site also takes.
-        assert_eq!(
-            parse_whisper_command_among("/w Ancient Pioneer hello there", &here),
-            Some(("Ancient Pioneer".into(), "hello there".into()))
-        );
-        // The comma still works, and is not left in the message.
-        assert_eq!(
-            parse_whisper_command_among("/w @Ancient Pioneer, hello", &here),
-            Some(("Ancient Pioneer".into(), "hello".into()))
-        );
-        // The longer name wins, or half of it would be left in the message.
-        assert_eq!(
-            parse_whisper_command_among("/w @Annabel Lee hi", &here),
-            Some(("Annabel Lee".into(), "hi".into()))
-        );
-        // And a name that merely starts the same is not it.
-        assert_eq!(parse_whisper_command_among("/w @Ann hi", &here), Some(("Ann".into(), "hi".into())));
-    }
-
-    /// A numeric id is the site's other form, and belongs to nobody in the
-    /// roster - so it still has to fall through to the plain split.
-    #[test]
-    fn an_id_still_works_when_nobody_here_is_called_that() {
-        let here = vec!["Ancient Pioneer".to_string()];
-        assert_eq!(parse_whisper_command_among("/w 38746 hello", &here), Some(("38746".into(), "hello".into())));
+    fn attributes_are_whole_names() {
+        assert_eq!(attr("<li data-room-seq=\"1\" seq=\"2\">", "seq").as_deref(), Some("2"));
+        assert_eq!(attr("<li x=\"1\">", "seq"), None);
     }
 
     #[test]
-    fn a_name_with_nothing_after_it_is_not_a_whisper() {
-        let here = vec!["Ancient Pioneer".to_string()];
-        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer", &here), None);
-        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer   ", &here), None);
-        assert_eq!(parse_whisper_command("/w @Someone,"), None);
-        assert_eq!(parse_whisper_command("/w , body"), None);
-        assert_eq!(parse_whisper_command("/w "), None);
-        assert_eq!(parse_whisper_command("/w"), None);
-        // A word that merely starts the same way. The trailing space in the
-        // prefix is what makes this safe, and is the reason it is tested.
-        assert_eq!(parse_whisper_command("/wait for it"), None);
-        assert_eq!(parse_whisper_command("just talking"), None);
-        assert_eq!(parse_whisper_command("/me waves"), None);
+    fn reaction_chips_are_read_off_the_row() {
+        let html = r#"<li><div class="chat-body">x</div><ul data-chat-reactions><li><span data-reaction-code="reaction_2" data-count="3"><img src="a.svg" alt="Agree"></span></li><li><span data-reaction-code="reaction_1" data-count="1"></span></li></ul></li>"#;
+        assert_eq!(chips(html), vec![("reaction_2".to_string(), 3), ("reaction_1".to_string(), 1)]);
+        assert!(chips("<ul data-chat-reactions></ul>").is_empty());
+        assert!(chips("<li>no list</li>").is_empty());
+    }
+
+    #[test]
+    fn mentions_go_both_ways() {
+        assert_eq!(mentions_to_names("hi [user=019e-1]Ryo Ma[/user], ok"), "hi @Ryo Ma, ok");
+        assert_eq!(mentions_to_names("[user=broken"), "[user=broken");
+        let people = vec![("u1".to_string(), "Ryo".to_string()), ("u2".to_string(), "Ryo Ma".to_string())];
+        assert_eq!(names_to_mentions("@ryo ma hello @Ryo!", &people), "[user=u2]Ryo Ma[/user] hello [user=u1]Ryo[/user]!");
+        // Not a mention: inside a word, or nobody of that name.
+        assert_eq!(names_to_mentions("mail me@ryo and @Nobody", &people), "mail me@ryo and @Nobody");
+        // "@Ryox" is not "@Ryo".
+        assert_eq!(names_to_mentions("@Ryox", &people), "@Ryox");
+    }
+
+    #[test]
+    fn entities_in_names_decode() {
+        assert_eq!(unescape_html("Bob&#x27;s &amp; co"), "Bob's & co");
     }
 }

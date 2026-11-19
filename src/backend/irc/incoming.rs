@@ -109,7 +109,7 @@ pub(super) async fn handle_message(
     let tagged_bot = message_tag(&msg, "bot").is_some();
     // Anything carrying one of our labels is the server accounting for a send
     // - the echo of it, or a refusal - so the send is no longer outstanding.
-    settle_send(&msg);
+    let echo_of_ours = settle_send(account_id, &msg);
     // And anything the server never accounted for gets written locally. Here
     // as well as on the ISON tick so that on a busy connection it happens at
     // once; the map is empty except between a send and its echo.
@@ -158,6 +158,9 @@ pub(super) async fn handle_message(
     match msg.command {
         Command::PRIVMSG(target, body) => {
             let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            // Our own message coming back under whatever name the network
+            // shows us by; it is written as ours, under our nick.
+            let from = if echo_of_ours { own.clone() } else { from };
             let (buffer_name, kind) = if is_channel(&target) {
                 (target.clone(), "channel")
             } else if from.eq_ignore_ascii_case(&own) {
@@ -178,7 +181,9 @@ pub(super) async fn handle_message(
             if let Some(action_body) = strip_action(&body) {
                 state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+                // Our own reply, coming back: the line carries the author's name, and the link to what it answered goes back on it.
+                let reply = if echo_of_ours { send::take_reply(account_id, &target, &body) } else { None };
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", reply, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             }
         }
 

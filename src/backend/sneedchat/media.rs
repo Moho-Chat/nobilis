@@ -143,6 +143,31 @@ pub(crate) fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Whether these bytes are an SVG document: text, opening with an XML
+/// declaration, a comment or the `<svg` element itself.
+pub(super) fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    (head.starts_with("<?xml") || head.starts_with("<svg") || head.starts_with("<!--")) && head.contains("<svg")
+}
+
+/// Draws an SVG to a PNG whose longer side is `size` pixels. Nothing in the
+/// document runs: resvg only paints, and this build has no text or external
+/// image support, so a hostile file can at worst draw nothing.
+pub(super) fn svg_to_png(svg: &[u8], size: u32) -> Option<Vec<u8>> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default()).ok()?;
+    let natural = tree.size();
+    let longest = natural.width().max(natural.height());
+    if longest <= 0.0 {
+        return None;
+    }
+    let scale = size as f32 / longest;
+    let (w, h) = ((natural.width() * scale).ceil().max(1.0) as u32, (natural.height() * scale).ceil().max(1.0) as u32);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    pixmap.encode_png().ok()
+}
+
 /// Every extension sniff_image_ext can produce, plus the ones older caches
 /// were written with - what a lookup has to consider, since the name a
 /// cached avatar ended up under depends on what its bytes turned out to be.
@@ -240,6 +265,18 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
         .next()
         .filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or("jpg");
+    // SVG - the chat's emoticons and reaction pictures - is drawn to PNG
+    // here: the window shows no SVG from a file, since one can carry script.
+    let bytes = match sniff_image_ext(&bytes) {
+        None if looks_like_svg(&bytes) => match svg_to_png(&bytes, 64) {
+            Some(png) => bytes::Bytes::from(png),
+            None => {
+                tracing::debug!("sneedchat: a picture for {user_id} is SVG that could not be drawn");
+                return None;
+            }
+        },
+        _ => bytes,
+    };
     let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
     let path = dir.join(format!("{user_id}.{ext}"));
     // Unchanged bytes are not rewritten, so the version a window holds only

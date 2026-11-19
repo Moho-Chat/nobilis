@@ -68,6 +68,12 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        "fluxer" if target.parse::<u64>().is_ok() => {
+            let handle = state.runtime.fluxer_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Fluxer account is not connected"))?;
+            backend::fluxer::people::block(state, &handle, target, ignored).await?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         // Telegram's block list is the account's, so it holds on the phone too; recorded here as well, because what a
         // blocked person says in a group still arrives. Only a person's number can be blocked: a name is only hidden.
         "telegram" if target.parse::<i64>().is_ok_and(|n| n > 0) => {
@@ -122,6 +128,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_stoat(id) {
             backend::stoat::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("fluxer:") {
+        if let Some(cfg) = state.accounts.get_fluxer(id) {
+            backend::fluxer::spawn(state.clone(), cfg);
+        }
     } else if id.starts_with("signal:") {
         // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
         // where an account set to strict Tor stayed on its direct connection).
@@ -156,6 +166,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => Some("fluxer"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -254,16 +265,20 @@ pub async fn dispatch(
                     icon_url: None,
                     buffers: Vec::new(),
                     sendable_anywhere: true,
-                    emoji: backend::sneedchat::smilies::SMILIES
-                        .iter()
-                        .map(|s| crate::model::EmojiEntry {
-                            id: s.aliases.first().unwrap_or(&s.label).to_string(),
-                            name: s.label.to_string(),
-                            url: None,
-                            animated: false,
-                            locked: false,
-                        })
-                        .collect(),
+                    // The chat's own list once a connection has read it; the
+                    // bundled table until then.
+                    emoji: backend::sneedchat::catalogue::picker_entries().unwrap_or_else(|| {
+                        backend::sneedchat::smilies::SMILIES
+                            .iter()
+                            .map(|s| crate::model::EmojiEntry {
+                                id: s.aliases.first().unwrap_or(&s.label).to_string(),
+                                name: s.label.to_string(),
+                                url: None,
+                                animated: false,
+                                locked: false,
+                            })
+                            .collect()
+                    }),
                 });
             }
 
@@ -394,10 +409,74 @@ pub async fn dispatch(
             (Some(serde_json::json!(backend::kick::emotecache::resolve(&ids).await)), None)
         }
 
+        // The chat's own emoticons, once a connection has read them, each
+        // with its cached picture (`path`); until then the table that ships
+        // with the client, whose `file` the client resolves itself.
         "listSneedchatSmilies" => (
-            Some(serde_json::json!(backend::sneedchat::smilies::SMILIES.iter().map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file })).collect::<Vec<_>>())),
+            Some(serde_json::json!(backend::sneedchat::catalogue::smilies_json().unwrap_or_else(|| backend::sneedchat::smilies::SMILIES
+                .iter()
+                .map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file }))
+                .collect()))),
             None,
         ),
+
+        // The reactions the chat offers, for the reaction picker.
+        "listSneedchatReactions" => (Some(serde_json::json!(backend::sneedchat::reaction_choices())), None),
+
+        // What this account may do in the room a conversation shows.
+        "sneedchatPowers" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => (Some(backend::sneedchat::powers(&buffer.account_id, &buffer.name)), None),
+            _ => (None, Some("not a Sneedchat conversation".to_string())),
+        },
+
+        // A moderator's mute, ban or lifting of one, on somebody in the room
+        // a conversation shows (or across the chat, `siteWide`).
+        "sneedchatModerate" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
+                let who = p_str(params, "who", "");
+                let action = p_str(params, "action", "");
+                let minutes = params.get("minutes").and_then(|m| m.as_u64());
+                match backend::sneedchat::moderate(&buffer.account_id, &buffer.name, who, action, minutes, p_bool(params, "siteWide", false), p_str_opt(params, "reason")).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            }
+            _ => (None, Some("not a Sneedchat conversation".to_string())),
+        },
+
+        // The account's side rooms, for choosing where to invite somebody.
+        "sneedchatSideRooms" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => (Some(serde_json::json!(backend::sneedchat::side_rooms(a))), None),
+            _ => (None, Some("sneedchatSideRooms requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // People to invite, by name, from everyone the chat has shown the account.
+        "searchSneedchatPeople" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => (Some(serde_json::json!(backend::sneedchat::search_people(state, a, p_str(params, "query", "")))), None),
+            _ => (None, Some("searchSneedchatPeople requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // Inviting somebody to a side room: the one `bufferId` shows, or a new
+        // one. Answers the conversation they were invited into.
+        "sneedchatInvite" => match p_str_opt(params, "accountId") {
+            Some(a) if a.starts_with("sneedchat:") => {
+                let to = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)).filter(|b| b.account_id == a).map(|b| b.name);
+                match backend::sneedchat::invite(a, p_str(params, "who", ""), to.as_deref()).await {
+                    Ok(name) => (Some(serde_json::json!({ "bufferId": crate::model::buffer_id(a, &name) })), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            }
+            _ => (None, Some("sneedchatInvite requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // Bringing back a message that was taken down.
+        "sneedchatRestore" => match (p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)), p_str_opt(params, "messageId")) {
+            (Some(buffer), Some(msg)) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::restore(&buffer.account_id, msg).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRestore requires a Sneedchat \"bufferId\" and \"messageId\"".to_string())),
+        },
 
         // Stop the daemon cleanly. A client that adopted an already-running
         // nobilis has no child process to signal, so this is the only way it
@@ -468,12 +547,16 @@ pub async fn dispatch(
                 { "id": "irc", "name": "IRC", "available": true },
                 { "id": "matrix", "name": "Matrix", "available": true },
                 { "id": "discord", "name": "Discord", "available": true },
+                // Kiwi Farms' own chat (Ephyra Chat). Its IRC/XMPP portal is
+                // offered too, as an IRC network tile in the frontend; this is
+                // the native protocol, with what the portal cannot carry.
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "fluxer", "name": "Fluxer", "available": true },
                 { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
             ])),
@@ -561,6 +644,22 @@ pub async fn dispatch(
                             let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
                             if let Err(e) = backend::stoat::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("stoat history: {e:#}");
+                            }
+                        }
+                    }
+                    // Sneedchat pages back through the room's log from the
+                    // oldest entry held; opening a room has its replay already.
+                    if before > 0 && buffer.account_id.starts_with("sneedchat:") {
+                        if let Err(e) = backend::sneedchat::older_history(state, &buffer.account_id, &buffer.name).await {
+                            tracing::debug!("sneedchat history: {e:#}");
+                        }
+                    }
+                    // Fluxer too: its history is paged by message id.
+                    if buffer.account_id.starts_with("fluxer:") {
+                        if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) {
+                            let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
+                            if let Err(e) = backend::fluxer::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
+                                tracing::debug!("fluxer history: {e:#}");
                             }
                         }
                     }
@@ -873,6 +972,8 @@ pub async fn dispatch(
                 // A Stoat session this client made is ended at Stoat; a token that was pasted belongs to another app
                 // of the person's, which ending would sign out.
                 let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
+                // The same for Fluxer: only a session moho made is ended there.
+                let fluxer_session = state.accounts.get_fluxer(id).filter(|a| a.made_here && !a.token.is_empty());
                 // A Signal device is taken off the account at Signal, and its file deleted.
                 let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
@@ -884,6 +985,16 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        if let Some(config) = fluxer_session {
+                            tokio::spawn(async move {
+                                let origin = if config.instance.is_empty() { backend::fluxer::discovery::DEFAULT_ORIGIN.to_string() } else { config.instance.clone() };
+                                if let Ok(instance) = backend::fluxer::discovery::fetch(&config.account_id(), &origin).await {
+                                    let api = backend::fluxer::api::Api::new(&config.account_id(), &instance.api, Some(config.token.clone()));
+                                    let _ = api.post("/auth/logout", &serde_json::Value::Null).await;
+                                }
+                            });
+                        }
+                        state.runtime.clear_fluxer_handle(id);
                         if let Some(config) = signal_account {
                             backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
@@ -1148,6 +1259,16 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             }
+            // A Fluxer guild too.
+            if id.starts_with("fluxer:") {
+                let Some(handle) = state.runtime.fluxer_handle(id) else {
+                    return (None, Some("that Fluxer account is not connected".to_string()));
+                };
+                return match backend::fluxer::people::join_invite(state, &handle, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             if id.starts_with("telegram:") {
                 return match backend::telegram::membership::join(state, id, name).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -1232,6 +1353,14 @@ pub async fn dispatch(
                     // It lapses by itself, so only "typing" is said.
                     if typing {
                         if let Err(e) = backend::stoat::send::typing(state, &buffer) {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    if typing {
+                        if let Err(e) = backend::fluxer::send::typing(state, &buffer).await {
                             tracing::debug!("sendTyping: {e}");
                         }
                     }
@@ -1398,6 +1527,7 @@ pub async fn dispatch(
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "fluxer" => backend::fluxer::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "signal" => backend::signal::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
@@ -1492,6 +1622,12 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     if let Err(e) = backend::stoat::send::mark_read(state, &buffer).await {
                         tracing::debug!("stoat read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    if let Err(e) = backend::fluxer::send::mark_read(state, &buffer).await {
+                        tracing::debug!("fluxer read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1953,6 +2089,8 @@ pub async fn dispatch(
                 true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(account_id).filter(|_| account_id.starts_with("fluxer:")) {
+                backend::fluxer::own::apply_status(&handle, status, text.as_deref()).await
             } else if account_id.starts_with("telegram:") {
                 // Online or not, which is all Telegram shows; recorded above for the next connection either way.
                 backend::telegram::account::presence_changed(state, account_id)
@@ -2010,6 +2148,11 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if let Some(handle) = state.runtime.fluxer_handle(id).filter(|_| id.starts_with("fluxer:")) {
+                    let handle = handle.clone();
+                    let shown = shown.clone();
+                    tokio::spawn(async move { backend::fluxer::own::apply_status(&handle, &shown, None).await });
+                    true
                 } else if id.starts_with("telegram:") {
                     backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
@@ -2059,6 +2202,18 @@ pub async fn dispatch(
                             tokio::spawn(async move {
                                 if let Err(e) = backend::stoat::members::refresh(&state, &handle, &buffer).await {
                                     tracing::debug!("stoat members: {e}");
+                                }
+                            });
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(buffer) if buffer.account_id.starts_with("fluxer:") => match state.runtime.fluxer_handle(&buffer.account_id) {
+                        Some(handle) => {
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backend::fluxer::members::refresh(&state, &handle, &buffer).await {
+                                    tracing::debug!("fluxer members: {e}");
                                 }
                             });
                             true
@@ -2211,6 +2366,24 @@ pub async fn dispatch(
         }
 
         // The account's own profile on Stoat, and changing it. What is not given is left as it is.
+        // Fluxer's own profile answers to the same calls, for the same account tools.
+        "stoatOwnProfile" | "setStoatProfile" | "setStoatProfileAvatar" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let done = match method {
+                "stoatOwnProfile" => backend::fluxer::own::get(&handle).await,
+                "setStoatProfile" => backend::fluxer::own::set(&handle, p_str_opt(params, "displayName"), p_str_opt(params, "pronouns"), p_str_opt(params, "bio"), p_str_opt(params, "statusText")).await.map(|_| serde_json::json!({ "ok": true })),
+                _ => match p_str_opt(params, "path").filter(|p| !p.is_empty()) {
+                    Some(path) => backend::fluxer::own::set_avatar(&handle, path).await.map(|url| serde_json::json!({ "avatarUrl": url })),
+                    None => backend::fluxer::own::clear_avatar(&handle).await.map(|_| serde_json::json!({ "avatarUrl": null })),
+                },
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
         "stoatOwnProfile" | "setStoatProfile" | "setStoatProfileAvatar" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
                 return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
@@ -2376,6 +2549,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::list(&handle, &buffer).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             if !buffer.account_id.starts_with("discord:") {
                 return (None, Some("that is not a Discord conversation".to_string()));
             }
@@ -2395,6 +2574,12 @@ pub async fn dispatch(
             };
             let sort = p_str_opt(params, "sort").unwrap_or("active");
             let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::forum_posts(&handle, &buffer, sort, offset).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::list_forum_posts(state, &buffer.account_id, buffer_id, sort, offset).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2411,6 +2596,12 @@ pub async fn dispatch(
                 return (None, Some("no such conversation".to_string()));
             };
             let tags: Vec<String> = params.get("tags").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::create_post(state, &handle, &buffer, title, body, &tags).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::create_forum_post(state, &buffer.account_id, buffer_id, title, body, &tags).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2426,6 +2617,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
+            if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                return match backend::fluxer::threads::open(state, &handle, thread_id).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             match backend::discord::open_thread(state, &buffer.account_id, buffer_id, thread_id).await {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -2621,6 +2818,8 @@ pub async fn dispatch(
                 backend::telegram::history::context(state, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::context(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::context(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2665,6 +2864,8 @@ pub async fn dispatch(
                 backend::telegram::history::newer(state, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::newer(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::newer(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -2694,6 +2895,8 @@ pub async fn dispatch(
                 backend::telegram::pins::list(state, &buffer).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::pins(&handle, &buffer).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::pins(&handle, &buffer).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2720,6 +2923,12 @@ pub async fn dispatch(
                 backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::send::reactors(&handle, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("sneedchat:") {
+                backend::sneedchat::reactors(&buffer.account_id, &buffer.name, message_id, emoji)
+                    .await
+                    .map(|names| serde_json::json!({ "users": names.into_iter().map(|n| serde_json::json!({ "name": n })).collect::<Vec<_>>() }))
             } else if state.accounts.get_irc(&buffer.account_id).is_some() {
                 // Only those seen this run: IRC replays no reactions.
                 Ok(backend::irc::reactions::list_reactors(buffer_id, message_id, emoji))
@@ -2752,6 +2961,8 @@ pub async fn dispatch(
                 backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::set_pinned(&handle, &buffer, message_id, pinned).await
+            } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
+                backend::fluxer::search::set_pinned(&handle, &buffer, message_id, pinned).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2769,6 +2980,16 @@ pub async fn dispatch(
             };
             if query.trim().is_empty() {
                 return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            // Fluxer's search answers to the same name: one channel at a time, the same rows.
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("fluxer:")) {
+                let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                    return (None, Some("that Fluxer account is not connected".to_string()));
+                };
+                return match backend::fluxer::search::run(&handle, &buffer, query.trim(), p_i64(params, "limit", 25) as usize).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
             }
             let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("stoat:")) else {
                 return (None, Some("that conversation is not on Stoat".to_string()));
@@ -2926,6 +3147,7 @@ pub async fn dispatch(
                     })
                 })
                 .chain(state.runtime.all_stoat_handles().into_iter().flat_map(|h| backend::stoat::events::ringing(state, &h)))
+                .chain(state.runtime.all_fluxer_handles().into_iter().flat_map(|h| backend::fluxer::voice::ringing(state, &h)))
                 .collect();
             (Some(Value::Array(calls)), None)
         }
@@ -3668,7 +3890,7 @@ pub async fn dispatch(
                                     return (None, Some(format!("{e:#}")));
                                 }
                             }
-                        } else if buffer.account_id.starts_with("sneedchat:") && buffer.kind == "channel" {
+                        } else if buffer.account_id.starts_with("sneedchat:") {
                             match backend::sneedchat::leave_room(state, &buffer.account_id, &buffer.name) {
                                 // Its buffer is already gone, with its history.
                                 Ok(true) => return (Some(ok_node()), None),
@@ -3740,6 +3962,11 @@ pub async fn dispatch(
             };
             let result = if let Some(group) = backend::steam::chatgroups::group_of_rail_id(group_id) {
                 backend::steam::chatgroups::act(state, group.0, backend::steam::chatgroups::Action::Leave { group: group.1 }).await.map(|_| ()).map_err(anyhow::Error::msg)
+            } else if let Some(guild_id) = rest.strip_prefix("guild:").filter(|_| account_id.starts_with("fluxer:")) {
+                match state.runtime.fluxer_handle(account_id) {
+                    Some(handle) => backend::fluxer::people::leave_guild(state, &handle, guild_id).await,
+                    None => Err(anyhow::anyhow!("that Fluxer account is not connected")),
+                }
             } else if let Some(guild_id) = rest.strip_prefix("guild:") {
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
@@ -3892,6 +4119,24 @@ pub async fn dispatch(
                     let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
                     let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
                     let sent = backend::stoat::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
                     if let Some(p) = progress {
                         if !files.is_empty() {
                             p.done(sent.as_ref().err().map(String::as_str));
@@ -4065,9 +4310,9 @@ pub async fn dispatch(
                     // being replied to. A reply to something no longer in
                     // scrollback still sends, just without the mention -
                     // losing the message would be the worse trade.
-                    let reply_to_nick = reply_to_id
+                    let reply_to = reply_to_id
                         .and_then(|id| state.store.get_message(buffer_id, id).ok().flatten())
-                        .map(|m| m.from);
+                        .map(|m| backend::sneedchat::ReplyTo { from: m.from, id: m.id, body: m.body });
                     // Unlike Discord, Sneedchat's own chat protocol has no
                     // upload endpoint at all - see backend::sneedchat::
                     // send_attachment's own doc comment for how this
@@ -4081,7 +4326,7 @@ pub async fn dispatch(
                             backend::sneedchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host, progress)
                                 .await
                         }
-                        None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
+                        None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to).await,
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
@@ -4095,7 +4340,7 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
-                Some(_) if reply_to_id.is_some() => (None, Some("replies aren't supported for this service".to_string())),
+                Some(buffer) if reply_to_id.is_some() && crate::model::service_of(&buffer.account_id) != "irc" => (None, Some("replies aren't supported for this service".to_string())),
                 Some(buffer) => match state.runtime.irc_sender(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(sender) => {
@@ -4118,7 +4363,19 @@ pub async fn dispatch(
                                 }
                             }
                         };
-                        match backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body) {
+                        // IRC has no replies of its own: the author's name goes in front of the words, as people write it,
+                        // and the link to what was answered is put back on the line when the network returns it.
+                        let reply = reply_to_id.and_then(|id| state.store.get_message(buffer_id, id).ok().flatten()).map(|m| crate::model::ReplyPreview {
+                            id: m.id,
+                            from: m.from,
+                            body: m.body,
+                            ..Default::default()
+                        });
+                        let sent = match reply {
+                            Some(reply) => backend::irc::send_reply(state, &buffer.account_id, &sender, &buffer.name, &body, reply),
+                            None => backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body),
+                        };
+                        match sent {
                             Ok(()) => (Some(ok_node()), None),
                             Err(e) => (None, Some(format!("{e:#}"))),
                         }
@@ -4149,6 +4406,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4157,7 +4418,7 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
-                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
@@ -4204,6 +4465,14 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::react(&buffer.account_id, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -4252,6 +4521,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4280,7 +4553,7 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
-                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 },
@@ -4522,6 +4795,23 @@ pub async fn dispatch(
                 }
             }
         },
+
+        // How to start the web helper - moho's own binary, which carries
+        // requests on Chromium's network stack for sites that admit only a
+        // browser (see net/webhelper.rs). Sent by the client on every connect.
+        "setWebHelper" => {
+            let command: Vec<String> = params
+                .get("command")
+                .and_then(|c| c.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if command.is_empty() {
+                (None, Some("command must be a non-empty list".to_string()))
+            } else {
+                crate::net::webhelper::set_command(command);
+                (Some(ok_node()), None)
+            }
+        }
 
         // The daemon-wide network settings: what routed means (moho's own Tor
         // or a SOCKS5 proxy of one's own), and whether everything is routed.
@@ -5021,6 +5311,38 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Fluxer's guild settings and moderation answer to the same calls, in the same shapes (backend/fluxer/manage.rs).
+        "stoatManage" | "getStoatPowers" | "moderateStoatMember" | "setStoatMemberRole" | "createStoatInvite" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "stoatManage" => {
+                    return match backend::fluxer::manage::run(&handle, &buffer, p_str(params, "action", ""), params).await {
+                        Ok(answer) => (Some(answer), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "getStoatPowers" => return (Some(backend::fluxer::moderation::powers(&handle, &buffer)), None),
+                "createStoatInvite" => {
+                    return match backend::fluxer::moderation::invite(&handle, &buffer).await {
+                        Ok(link) => (Some(serde_json::json!({ "link": link })), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "moderateStoatMember" => backend::fluxer::moderation::moderate(&handle, &buffer, user, p_str(params, "action", ""), params.get("minutes").and_then(|v| v.as_i64()), p_str_opt(params, "reason")).await,
+                _ => backend::fluxer::moderation::set_role(&handle, &buffer, user, p_str(params, "roleId", ""), p_bool(params, "give", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Looking after the Stoat server a conversation is in (backend/stoat/manage.rs): one call, with the action to run.
         "stoatManage" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
@@ -5064,6 +5386,51 @@ pub async fn dispatch(
 
         // A Stoat call: the token and address of the media server to join (what is done with them is the window's, as for
         // a Matrix call on a media server), and who is in each channel's call.
+        // Fluxer's calls answer to Stoat's calls (the window joins both on LiveKit the same way), and two of their own:
+        // leaving, which Fluxer wants said on the gateway, and saying the microphone, camera and screen.
+        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match method {
+                "declineStoatCall" => match backend::fluxer::voice::decline(state, &handle, &buffer).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                },
+                "joinStoatCall" => {
+                    if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
+                        return (None, Some(why));
+                    }
+                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false)).await {
+                        Ok(joined) => (Some(joined), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                "leaveFluxerCall" => {
+                    backend::fluxer::voice::leave(&handle);
+                    (Some(ok_node()), None)
+                }
+                _ => {
+                    backend::fluxer::voice::set_state(&handle, p_bool(params, "muted", false), p_bool(params, "camera", false), p_bool(params, "screen", false));
+                    (Some(ok_node()), None)
+                }
+            }
+        }
+        "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let channels: Vec<String> = handle.voice.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+            let out: serde_json::Map<String, serde_json::Value> = channels
+                .into_iter()
+                .filter_map(|c| backend::fluxer::messages::buffer_of(state, &handle.account_id, &c).map(|b| (b.id, serde_json::Value::Array(backend::fluxer::voice::voice_members(&handle, &c)))))
+                .collect();
+            (Some(serde_json::Value::Object(out)), None)
+        }
+
         "declineStoatCall" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
                 return (None, Some("declineStoatCall requires a Stoat \"bufferId\"".to_string()));
@@ -5105,6 +5472,23 @@ pub async fn dispatch(
         }
 
         // Stoat's friends: who has asked, answering, asking, and blocking.
+        // Fluxer's are the same shape, and answer to the same names.
+        "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "stoatFriendRequests" => return (Some(backend::fluxer::people::page(&handle)), None),
+                "answerStoatFriendRequest" => backend::fluxer::people::answer_friend(state, &handle, user, p_bool(params, "accept", true)).await,
+                "addStoatFriend" => backend::fluxer::people::add_friend(&handle, p_str(params, "username", "")).await,
+                _ => backend::fluxer::people::block(state, &handle, user, p_bool(params, "block", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
         "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
                 return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
@@ -5150,6 +5534,29 @@ pub async fn dispatch(
                     return (None, Some("addStoatAccountToken requires \"token\"".to_string()));
                 };
                 backend::stoat::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
+            }
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Signing in to Fluxer: an id now and the rest as events (backend/fluxer/login.rs). The instance is optional and
+        // is the official one when it is left out.
+        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => {
+            let instance = p_str(params, "instance", "").to_string();
+            let login_id = format!("fluxer-{}", crate::model::next_message_id());
+            match method {
+                "addFluxerAccount" => {
+                    let (Some(login), Some(password)) = (p_str_opt(params, "login"), p_str_opt(params, "password")) else {
+                        return (None, Some("addFluxerAccount requires \"login\" and \"password\"".to_string()));
+                    };
+                    backend::fluxer::login::start(state.clone(), login_id.clone(), instance, login.to_string(), password.to_string());
+                }
+                "addFluxerAccountToken" => {
+                    let Some(token) = p_str_opt(params, "token") else {
+                        return (None, Some("addFluxerAccountToken requires \"token\"".to_string()));
+                    };
+                    backend::fluxer::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
+                }
+                _ => backend::fluxer::login::start_handoff(state.clone(), login_id.clone(), instance),
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
@@ -6329,6 +6736,24 @@ pub async fn dispatch(
         "cancelSignalLink" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
                 backend::signal::link::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
+        // The second factor Fluxer asked for, for a sign-in that is waiting.
+        "submitFluxerCode" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some("submitFluxerCode requires \"loginId\" and \"value\"".to_string()));
+            };
+            match backend::fluxer::login::submit_code(login_id, value) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelFluxerLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::fluxer::login::cancel(login_id);
             }
             (Some(ok_node()), None)
         }
@@ -7923,6 +8348,11 @@ pub async fn dispatch(
                     None => Err(anyhow::anyhow!("that Signal account is not connected")),
                     Some(handle) => backend::signal::inbox::open_dm(state, &handle, user_id).await,
                 },
+                "fluxer" => match (state.runtime.fluxer_handle(account_id), user_id.parse::<u64>().is_ok()) {
+                    (None, _) => Err(anyhow::anyhow!("that Fluxer account is not connected")),
+                    (_, false) => Err(anyhow::anyhow!("Fluxer needs the person's id, not their name")),
+                    (Some(handle), true) => backend::fluxer::people::open_dm(state, &handle, user_id).await,
+                },
                 "telegram" => backend::telegram::people::open_dm(state, account_id, user_id).await.map_err(|e| anyhow::anyhow!(e)),
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };
@@ -7950,7 +8380,7 @@ pub async fn dispatch(
                 .and_then(|id| state.runtime.get_buffer(id))
                 .filter(|b| b.account_id == account_id)
                 .map(|b| b.name);
-            match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()) {
+            match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -9201,7 +9631,11 @@ fn parse_sneedchat_rooms(params: &Value) -> Option<Vec<crate::accounts::SneedCha
     Some(
         arr.iter()
             .filter_map(|r| {
-                let id = r.get("id")?.as_u64()? as u32;
+                let id = match r.get("id")? {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => return None,
+                };
                 let name = r.get("name")?.as_str()?.to_string();
                 Some(crate::accounts::SneedChatRoom { id, name })
             })

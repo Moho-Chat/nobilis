@@ -806,6 +806,24 @@ impl Store {
         Ok(id)
     }
 
+    /// Who has written in an account's conversations under a name containing
+    /// `query` (any case): their sender id and the name last used, most
+    /// recently heard from first. For finding somebody to invite when the
+    /// service has no directory to search.
+    pub fn senders_matching(&self, account_id: &str, query: &str, limit: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let prefix = format!("{}|%", account_id.replace('%', "\\%").replace('_', "\\_"));
+        let needle = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT sender_id, from_nick FROM messages
+             WHERE buffer_id LIKE ?1 ESCAPE '\\' AND sender_id IS NOT NULL AND sender_id != ''
+               AND from_nick LIKE ?2 ESCAPE '\\'
+             GROUP BY sender_id ORDER BY MAX(ts) DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![prefix, needle, limit.max(1)], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// When the oldest message this buffer holds was sent (unix seconds): where an archive that pages by time goes back from.
     pub fn oldest_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
@@ -975,24 +993,6 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE messages SET components = '[]' WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
         Ok(())
-    }
-
-    /// The names that have spoken here lately, most recent first.
-    ///
-    /// Wanted because a roster is not always there to ask: a service may not
-    /// send one until somebody joins or leaves, and a name with a space in it
-    /// cannot be picked out of typed text without a list of the names it
-    /// could be. Whoever has spoken recently is the list that matters anyway -
-    /// they are who somebody is answering.
-    pub fn recent_senders(&self, buffer_id: &str, limit: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT from_nick FROM messages
-             WHERE buffer_id = ?1 AND from_nick IS NOT NULL AND from_nick != ''
-             GROUP BY from_nick ORDER BY MAX(ts) DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![buffer_id, limit.max(1)], |row| row.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Who somebody is, from the last thing they said.
@@ -1432,7 +1432,7 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
         // backend/telegram/media.rs and backend/stoat/media.rs): a file that is not there yet is the usual state of one,
         // not a sign it was swept.
         let path = std::path::Path::new(rest);
-        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
+        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::fluxer::media::MEDIA, crate::backend::fluxer::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
         if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| named_first.contains(&n)) {
             return false;
         }

@@ -245,6 +245,7 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         None => wire_body,
     };
     let encrypted = encrypting(&handle, &jid);
+    let wire_body_sent = wire_body.clone();
     // Who a message to a room names is said in words and, besides, by reference (XEP-0372), as the clients that draw mentions send it.
     if in_room(buffer) && !encrypted {
         let skip = if reply_to.as_deref().is_some_and(|r| !r.is_empty()) { wire_body.chars().count().saturating_sub(body.chars().count()) } else { 0 };
@@ -264,6 +265,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     if in_room(buffer) && !encrypted {
         // The room sends it back to everybody including its sender, and that copy is what is shown: a message the room
         // refused (no voice, a ban) is then not shown as if it had been said.
+        if let Some(r) = handle.session().rooms.get_mut(&jid) {
+            r.pending.push((wire_body_sent, std::time::Instant::now()));
+        }
         handle.send_message(m).await;
         return Ok(());
     }

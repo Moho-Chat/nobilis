@@ -336,6 +336,46 @@ pub(super) fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode
     sender.send(Command::ChannelMODE(channel.to_string(), vec![m])).map_err(|e| anyhow!(e))
 }
 
+/// Replies waiting for their message to come back: IRC has no reply field (the `+draft/reply` tag is not carried by most
+/// networks, Libera among them), so a reply is sent as the message with the author's name in front - what everybody does
+/// by hand - and the link to what was answered is kept here, to be put back on the line when the network returns it.
+type WaitingReplies = std::sync::Mutex<HashMap<(String, String, String), crate::model::ReplyPreview>>;
+
+fn replies() -> &'static WaitingReplies {
+    static REPLIES: std::sync::OnceLock<WaitingReplies> = std::sync::OnceLock::new();
+    REPLIES.get_or_init(Default::default)
+}
+
+pub(super) fn take_reply(account_id: &str, target: &str, body: &str) -> Option<crate::model::ReplyPreview> {
+    replies().lock().unwrap().remove(&(account_id.to_string(), target.to_ascii_lowercase(), body.trim().to_string()))
+}
+
+/// What goes on the wire for a reply to `author`: their name and a colon before the words, unless the person already
+/// addressed them that way.
+pub(super) fn addressed(author: &str, body: &str) -> String {
+    let lower = body.trim_start().to_ascii_lowercase();
+    let name = author.to_ascii_lowercase();
+    let already = [":", ",", " "].iter().any(|sep| lower.starts_with(&format!("{name}{sep}")) || lower.starts_with(&format!("@{name}{sep}")));
+    if author.is_empty() || already {
+        body.to_string()
+    } else {
+        format!("{author}: {body}")
+    }
+}
+
+/// Sends `body` as an answer to `reply`, in the way IRC does it.
+pub fn send_reply(state: &AppState, account_id: &str, sender: &Sender, target_buffer: &str, body: &str, reply: crate::model::ReplyPreview) -> Result<()> {
+    let wire = addressed(&reply.from, body);
+    {
+        let mut all = replies().lock().unwrap();
+        if all.len() > 64 {
+            all.clear();
+        }
+        all.insert((account_id.to_string(), target_buffer.to_ascii_lowercase(), wire.trim().to_string()), reply);
+    }
+    send_message(state, account_id, sender, target_buffer, &wire)
+}
+
 pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
     // Noted on the way past, so a transfer that stops short can be asked for
     // again without anybody having to remember the pack number. Ignores
@@ -386,7 +426,8 @@ pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, ta
     if !echoes {
         sender.send_privmsg(target, body)?;
         let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
-        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+        let reply = take_reply(account_id, target, body);
+        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", reply, None, false, None, Vec::new(), Vec::new(), None);
         return Ok(());
     }
 
@@ -478,15 +519,124 @@ pub(super) fn sweep_pending_sends(state: &AppState) {
     }
 }
 
-/// Drops the record of a send the server has now accounted for.
-pub(super) fn settle_send(msg: &Message) {
-    let Some(label) = msg
+/// Drops the record of a send the server has now accounted for, saying whether
+/// `msg` is the echo of one of ours.
+///
+/// Two ways to know. The label is the proper one, but a server may put it on
+/// the `BATCH` that wraps the reply rather than on the echoed line, or not
+/// echo it at all. The fallback is the thing itself: a `PRIVMSG` to the same
+/// target with the same text as a send still waiting.
+///
+/// That fallback is not only a rescue for a missing label. A network that
+/// shows everybody under a pseudonym (kiwifarms: every user, ourselves
+/// included, is `u` plus an id, while registration used our handle) echoes
+/// our own message from a name that is not our nick. Nothing about the line
+/// then says it is ours, so without this the echo is written as somebody
+/// else's, the send is never settled, and six seconds later a second copy
+/// is written locally - a message that "failed" and arrived anyway.
+pub(super) fn settle_send(account_id: &str, msg: &Message) -> bool {
+    let mut all = pending_sends().lock().unwrap();
+    if all.is_empty() {
+        return false;
+    }
+    let label = msg
         .tags
         .as_ref()
         .and_then(|tags| tags.iter().find(|t| t.0 == "label"))
-        .and_then(|t| t.1.clone())
-    else {
-        return;
-    };
-    pending_sends().lock().unwrap().remove(&label);
+        .and_then(|t| t.1.clone());
+    if let Some(label) = label {
+        if all.get(&label).is_some_and(|p| p.account_id == account_id) {
+            match &msg.command {
+                // The echo itself, carrying our label.
+                Command::PRIVMSG(..) => {
+                    all.remove(&label);
+                    return true;
+                }
+                // A refusal (a numeric or a FAIL): nothing is coming back.
+                Command::Response(..) | Command::NOTICE(..) => {
+                    all.remove(&label);
+                    return false;
+                }
+                // Anything else is the server saying it took the command - an
+                // `ACK` - which is not the echo. kiwifarms sends one first
+                // and the echo after it, without a label; dropping the send
+                // here left that echo with nothing to match.
+                _ => return false,
+            }
+        }
+    }
+    let Command::PRIVMSG(target, body) = &msg.command else { return false };
+    let found = all
+        .iter()
+        .find(|(_, p)| p.account_id == account_id && p.target.eq_ignore_ascii_case(target) && p.body.trim() == body.trim())
+        .map(|(label, _)| label.clone());
+    match found {
+        Some(label) => {
+            all.remove(&label);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    fn pending(account: &str, target: &str, body: &str) -> String {
+        let label = next_label();
+        pending_sends().lock().unwrap().insert(
+            label.clone(),
+            PendingSend { account_id: account.into(), target: target.into(), body: body.into(), sent: std::time::Instant::now() },
+        );
+        label
+    }
+
+    /// The echo of a send comes from a pseudonym, not our nick, and carries
+    /// no label: it is still ours, and the send is settled by it.
+    #[test]
+    fn echo_under_another_name_without_a_label_settles_the_send() {
+        let label = pending("echo-test@kf", "#fishtank", "no its double sending");
+        let echo: Message = ":uk0f7bgvv!u@principal/k0f7bgvv PRIVMSG #fishtank :no its double sending".parse().unwrap();
+        assert!(settle_send("echo-test@kf", &echo));
+        assert!(!pending_sends().lock().unwrap().contains_key(&label));
+    }
+
+    /// A labelled ACK is the server taking the send, not the echo of it: the
+    /// echo that follows, from another name and with no label, still settles it.
+    #[test]
+    fn a_label_ack_does_not_settle_the_send_before_the_echo() {
+        let label = pending("echo-test3@kf", "#a", "hi");
+        let ack: Message = format!("@label={label} :irc ACK").parse().unwrap();
+        assert!(!settle_send("echo-test3@kf", &ack));
+        assert!(pending_sends().lock().unwrap().contains_key(&label));
+        assert!(settle_send("echo-test3@kf", &":u!u@h PRIVMSG #a :hi".parse().unwrap()));
+    }
+
+    /// Somebody else saying the same thing elsewhere is not our echo.
+    #[test]
+    fn other_targets_accounts_and_text_are_not_echoes() {
+        let label = pending("echo-test2@kf", "#a", "hello");
+        for line in [":x!x@h PRIVMSG #b :hello", ":x!x@h PRIVMSG #a :hello there"] {
+            assert!(!settle_send("echo-test2@kf", &line.parse().unwrap()));
+        }
+        assert!(!settle_send("other@kf", &":x!x@h PRIVMSG #a :hello".parse().unwrap()));
+        assert!(pending_sends().lock().unwrap().contains_key(&label));
+        pending_sends().lock().unwrap().remove(&label);
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::addressed;
+
+    #[test]
+    fn a_reply_leads_with_the_author_unless_it_already_does() {
+        assert_eq!(addressed("bob", "yes"), "bob: yes");
+        assert_eq!(addressed("bob", "bob: yes"), "bob: yes");
+        assert_eq!(addressed("Bob", "bob, yes"), "bob, yes");
+        assert_eq!(addressed("bob", "@bob yes"), "@bob yes");
+        assert_eq!(addressed("", "yes"), "yes");
+        assert_eq!(addressed("bobby", "bob: yes"), "bobby: bob: yes");
+    }
 }

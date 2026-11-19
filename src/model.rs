@@ -213,7 +213,7 @@ pub struct Account {
 /// persisted config shape this mirrors).
 #[derive(Serialize, Clone, Debug)]
 pub struct SneedChatRoomInfo {
-    pub id: u32,
+    pub id: String,
     pub name: String,
 }
 
@@ -967,6 +967,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("twitch") => "twitch",
         Some("telegram") => "telegram",
         Some("stoat") => "stoat",
+        Some("fluxer") => "fluxer",
         Some("signal") => "signal",
         Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",
@@ -1138,7 +1139,7 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:") || account_id.starts_with("telegram:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:") || account_id.starts_with("fluxer:") || account_id.starts_with("telegram:"),
         // Stoat's own: only mentions reach the account.
         "focus" => account_id.starts_with("stoat:"),
         _ => false,

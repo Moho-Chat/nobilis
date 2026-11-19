@@ -128,17 +128,28 @@ impl DiscordAccountConfig {
     }
 }
 
-/// One configured room to maintain a permanent connection to - see
-/// backend/sneedchat/mod.rs, which opens one websocket per room rather than
-/// switching a single connection between them (the earlier v1 approach).
-/// `name` is the room's real, human-chosen name (e.g. "general") - the
-/// server has no endpoint this backend uses to look names up on its own,
-/// so it's supplied at account-creation time, same spirit as an IRC
-/// account's autojoin list being user-provided rather than discovered.
+/// One room an account stays in.
+///
+/// `id` is the room's uuid on Ephyra Chat (`chat_room_uuid`) and `name` its
+/// slug ("fishtank"), which is what the room's buffer is called. Accounts made
+/// for the old chat saved a small number as the id; it still reads, as text,
+/// and is swapped for the uuid of the room with the same name the first time
+/// the account connects (see backend/sneedchat/rooms.rs `adopt_uuids`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SneedChatRoom {
-    pub id: u32,
+    #[serde(deserialize_with = "room_id_from_either")]
+    pub id: String,
     pub name: String,
+}
+
+/// A room id as text, whether it was saved as text (a uuid) or as a number
+/// (the old chat's room numbers).
+fn room_id_from_either<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => Err(serde::de::Error::custom(format!("a room id is text or a number, not {other}"))),
+    }
 }
 
 /// Sneedchat (SneedChat) account shape. Unlike Discord's token, the daemon
@@ -582,6 +593,52 @@ impl StoatAccountConfig {
     }
 }
 
+/// A Fluxer account: a chat service shaped like Discord, open source and self-hostable (see backend/fluxer and issue #57).
+/// The account names its instance by its origin, and every address is read from the instance's own
+/// `/.well-known/fluxer`, as Fluxer asks of a client; the default is the official one.
+///
+/// The session token is what the account is, and is as private as a Discord token: kept here, never logged and never
+/// put in an address.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct FluxerAccountConfig {
+    /// The instance's origin, without a trailing slash (`https://fluxer.com`).
+    #[serde(default)]
+    pub instance: String,
+    /// Fluxer's id for the account (a snowflake), which survives a change of name. The account's id here is built from it.
+    #[serde(default)]
+    pub user_id: String,
+    /// The `username` (with its `#0000` discriminator where it has one), for the sidebar.
+    #[serde(default)]
+    pub username: String,
+    /// The session token, sent as `Authorization`.
+    #[serde(default)]
+    pub token: String,
+    /// Whether moho made this session (a password or a code from another app), so it is ended at Fluxer when the
+    /// account is removed. A pasted token belongs to another of the person's apps, which ending it would sign out.
+    #[serde(default)]
+    pub made_here: bool,
+    /// What to call this account here. Local: Fluxer is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl FluxerAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("fluxer:{}", self.user_id)
+    }
+
+    /// Whether there is a sign-in behind this account.
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && !self.token.is_empty()
+    }
+}
+
 /// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
 /// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
 /// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
@@ -756,6 +813,8 @@ struct AccountsFile {
     telegram: Vec<TelegramAccountConfig>,
     #[serde(default, rename = "stoat_account")]
     stoat: Vec<StoatAccountConfig>,
+    #[serde(default, rename = "fluxer_account")]
+    fluxer: Vec<FluxerAccountConfig>,
     #[serde(default, rename = "signal_account")]
     signal: Vec<SignalAccountConfig>,
     #[serde(default, rename = "xmpp_account")]
@@ -786,6 +845,8 @@ pub struct AccountStore {
     /// And this one.
     stoat: Mutex<HashMap<String, StoatAccountConfig>>,
     /// And this one.
+    fluxer: Mutex<HashMap<String, FluxerAccountConfig>>,
+    /// And this one.
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
 }
 
@@ -797,7 +858,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -813,9 +874,10 @@ impl AccountStore {
             let stoat = file.stoat.into_iter().map(|a| (a.account_id(), a)).collect();
             let xmpp = file.xmpp.into_iter().map(|a| (a.account_id(), a)).collect();
             let signal = file.signal.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal)
+            let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -829,6 +891,7 @@ impl AccountStore {
             twitch: Mutex::new(twitch),
             telegram: Mutex::new(telegram),
             stoat: Mutex::new(stoat),
+            fluxer: Mutex::new(fluxer),
             xmpp: Mutex::new(xmpp),
         })
     }
@@ -855,6 +918,7 @@ impl AccountStore {
             twitch: self.twitch.lock().unwrap().values().cloned().collect(),
             telegram: self.telegram.lock().unwrap().values().cloned().collect(),
             stoat: self.stoat.lock().unwrap().values().cloned().collect(),
+            fluxer: self.fluxer.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
@@ -891,6 +955,7 @@ impl AccountStore {
             || self.get_twitch(account_id).is_some()
             || self.get_telegram(account_id).is_some()
             || self.get_stoat(account_id).is_some()
+            || self.get_fluxer(account_id).is_some()
             || self.get_xmpp(account_id).is_some()
             || self.get_signal(account_id).is_some()
     }
@@ -1183,6 +1248,48 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_fluxer(&self, account_id: &str) -> Option<FluxerAccountConfig> {
+        self.fluxer.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_fluxer(&self) -> Vec<FluxerAccountConfig> {
+        self.fluxer.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again as the same account is how a session Fluxer has ended gets replaced. What the person
+    /// set up on the account - its route, its name here - stays.
+    pub fn add_fluxer(&self, mut config: FluxerAccountConfig) -> Result<FluxerAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut fluxer = self.fluxer.lock().unwrap();
+            if let Some(old) = fluxer.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            fluxer.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Fluxer account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_fluxer(&self, account_id: &str, change: impl FnOnce(&mut FluxerAccountConfig)) -> Result<bool> {
+        {
+            let mut fluxer = self.fluxer.lock().unwrap();
+            match fluxer.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
         self.xmpp.lock().unwrap().get(account_id).cloned()
     }
@@ -1435,6 +1542,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.fluxer.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else if let Some(a) = self.xmpp.lock().unwrap().get_mut(account_id) {
             a.use_tor = routed;
             a.strict_route = strict;
@@ -1479,6 +1590,9 @@ impl AccountStore {
         if let Some(a) = self.get_stoat(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
+        if let Some(a) = self.get_fluxer(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
         if let Some(a) = self.get_xmpp(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
@@ -1503,6 +1617,22 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.user_id = Some(user_id);
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The name the chat shows this account under, as its `welcome` says -
+    /// kept so the account reads right before it next connects. Written only
+    /// when it changed.
+    pub fn set_sneedchat_display_name(&self, account_id: &str, name: &str) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) if a.display_name.as_deref() == Some(name) => Ok(false),
+            Some(a) => {
+                a.display_name = Some(name.to_string());
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
@@ -1581,6 +1711,13 @@ impl AccountStore {
         }
         {
             let removed = self.stoat.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.fluxer.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1770,6 +1907,9 @@ impl AccountStore {
         if self.mutate_stoat(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_fluxer(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         if self.mutate_xmpp(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
@@ -1816,6 +1956,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.stoat.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.fluxer.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         if let Some(a) = self.xmpp.lock().unwrap().get(account_id) {
@@ -2019,7 +2162,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
-        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
+        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id.clone(), name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
         use_tor: a.use_tor,
@@ -2268,6 +2411,50 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         moderation: false,
         reactions: false,
         stop_reason: String::new(),
+    }
+}
+
+/// Nor has Fluxer. `has_password` says there is a sign-in behind the account.
+pub fn fluxer_account_to_json(a: &FluxerAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "fluxer".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.username.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        stop_reason: String::new(),
+        reactions: false,
     }
 }
 
@@ -2860,6 +3047,7 @@ mod has_account_tests {
             s.add_twitch(TwitchAccountConfig { login: "twitcher".into(), ..Default::default() }).unwrap().account_id(),
             s.add_telegram(TelegramAccountConfig { user_id: 42, ..Default::default() }).unwrap().account_id(),
             s.add_stoat(StoatAccountConfig { user_id: "01STOAT".into(), ..Default::default() }).unwrap().account_id(),
+            s.add_fluxer(FluxerAccountConfig { user_id: "1501314428688990000".into(), ..Default::default() }).unwrap().account_id(),
             s.add_xmpp(XmppAccountConfig { jid: "alice@example.org".into(), ..Default::default() }).unwrap().account_id(),
             s.add_signal(SignalAccountConfig { aci: "00000000-0000-4000-8000-000000000009".into(), ..Default::default() }).unwrap().account_id(),
         ];

@@ -1,121 +1,15 @@
-//! The rooms an account is in, changed while it stays signed in.
+//! The rooms an account is in, changed while it stays connected.
 //!
-//! An account signs in once. Its session - the cookies the sign-in captured,
-//! or the ones a browser handed over - is kept here with what it takes to
-//! reach the site, and every room is a task of its own that borrows it: to
-//! join, and again after any interruption, when a room reconnects on its own
-//! and refreshes the session if the site has let it lapse. So opening a room
-//! is starting one task and closing one is stopping it. Nothing else is
-//! touched: the other rooms stay connected, and nobody signs in again.
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+//! One socket carries every room (see chat.rs), so opening a room is a `join`
+//! on it and closing one a `leave`; nothing else is touched, and nobody signs
+//! in again. An account that is not connected picks its list up when it is.
 
 use super::*;
 
-/// One signed-in account's means of reaching the site, and its rooms.
-pub(super) struct Live {
-    transport: Transport,
-    session: Session,
-    host: String,
-    username: String,
-    password: String,
-    totp_secret: Option<String>,
-    /// The room whose socket records whispers, or zero for none.
-    ///
-    /// Every room's socket receives every whisper - they are not
-    /// room-scoped - so exactly one of them writes them down. Moved to
-    /// another room when that one closes, and none when no room is open.
-    whisper_room: Arc<AtomicU32>,
-    rooms: Mutex<HashMap<u32, tokio::task::AbortHandle>>,
-}
-
-fn registry() -> &'static Mutex<HashMap<String, Arc<Live>>> {
-    static LIVE: OnceLock<Mutex<HashMap<String, Arc<Live>>>> = OnceLock::new();
-    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Stops an account's rooms when the connection that owns them ends.
-pub(super) struct LiveGuard {
-    account_id: String,
-    live: Arc<Live>,
-}
-
-impl Drop for LiveGuard {
-    fn drop(&mut self) {
-        let mut all = registry().lock().unwrap();
-        // Only if it is still this connection's: a newer one may already
-        // have taken the account over, and its rooms are not ours to stop.
-        if all.get(&self.account_id).is_some_and(|current| Arc::ptr_eq(current, &self.live)) {
-            all.remove(&self.account_id);
-        }
-        drop(all);
-        for (_, task) in self.live.rooms.lock().unwrap().drain() {
-            task.abort();
-        }
-    }
-}
-
-/// Registers a freshly signed-in account. Its rooms are started by
-/// `sync_rooms`, which the caller runs next.
-pub(super) fn install(account_id: &str, transport: Transport, session: Session, host: String, config: &SneedChatAccountConfig) -> LiveGuard {
-    let live = Arc::new(Live {
-        transport,
-        session,
-        host,
-        username: config.username.clone(),
-        password: config.password.clone(),
-        totp_secret: config.totp_secret.clone(),
-        whisper_room: Arc::new(AtomicU32::new(0)),
-        rooms: Mutex::new(HashMap::new()),
-    });
-    registry().lock().unwrap().insert(account_id.to_string(), live.clone());
-    LiveGuard { account_id: account_id.to_string(), live }
-}
-
-/// Brings an account's running rooms into line with its configured ones:
-/// starts the ones newly chosen, stops the ones dropped, and leaves the rest
-/// exactly as they are. Nothing happens for an account that is not signed in;
-/// it picks the list up when it is.
-///
-/// The stopping is done here, before this returns, so a caller that goes on
-/// to remove a room's buffer knows no message from it can arrive afterwards
-/// and bring the buffer back.
+/// Brings the connection's rooms into line with the account's saved ones.
 pub fn sync_rooms(state: &AppState, account_id: &str) {
-    let Some(live) = registry().lock().unwrap().get(account_id).cloned() else { return };
     let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
-    let wanted = config.rooms;
-
-    let mut running = live.rooms.lock().unwrap();
-    running.retain(|id, task| {
-        let keep = wanted.iter().any(|r| r.id == *id);
-        if !keep {
-            task.abort();
-        }
-        keep
-    });
-    live.whisper_room.store(wanted.first().map(|r| r.id).unwrap_or(0), Ordering::Relaxed);
-    for room in wanted {
-        if running.contains_key(&room.id) {
-            continue;
-        }
-        let (state, live2, account_id) = (state.clone(), live.clone(), account_id.to_string());
-        let id = room.id;
-        let task = tokio::spawn(async move {
-            let creds = Credentials { username: live2.username.clone(), password: live2.password.clone() };
-            let two_factor = match &live2.totp_secret {
-                Some(secret) => match totp::decode_secret(secret) {
-                    Ok(bytes) => TwoFactor::Totp(bytes),
-                    Err(_) => TwoFactor::None,
-                },
-                None => TwoFactor::None,
-            };
-            run_room(&state, &live2.transport, &live2.session, &creds, &two_factor, &account_id, &live2.host, &room, live2.whisper_room.clone()).await;
-        });
-        running.insert(id, task.abort_handle());
-    }
-    tracing::info!("sneedchat[{account_id}]: {} room(s) open", running.len());
+    super::chat::chat(account_id).want_rooms(&config.rooms);
 }
 
 /// Leaves the room a buffer shows, and deletes it and its history.
@@ -124,8 +18,13 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
 /// whisper conversation - which has nothing to leave.
 pub fn leave_room(state: &AppState, account_id: &str, buffer_name: &str) -> Result<bool> {
     let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    // A side room (a whisper, or a group chat somebody pulled us into) is
+    // left on the chat itself; its conversation is then closed like any other.
+    if super::chat::chat(account_id).leave_side_room(buffer_name) {
+        return Ok(false);
+    }
     let name = room_name_of(buffer_name);
-    if !config.rooms.iter().any(|r| r.name == name) {
+    if !buffer_name.starts_with('#') || !config.rooms.iter().any(|r| r.name == name) {
         return Ok(false);
     }
     let remaining: Vec<SneedChatRoom> = config.rooms.into_iter().filter(|r| r.name != name).collect();

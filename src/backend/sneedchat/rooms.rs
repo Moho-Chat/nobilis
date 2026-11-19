@@ -1,22 +1,17 @@
 //! Which rooms exist, what they are called, and who is in them.
 //!
-//! The catalogue is read off the chat page rather than from an endpoint,
-//! because the site has no endpoint that lists rooms - a fact worth knowing
-//! before wondering why this parses HTML.
+//! The catalogue is the chat's own `rooms/heads?kind=listed`; who is in a
+//! room arrives as `presence` frames on the socket.
 
 use super::*;
+use protocol::Principal;
 
-/// Who somebody is, on Sneedchat.
-///
-/// The chat protocol carries a user id, a name and a picture and nothing
-/// else - no join date, no rank, no last seen. What it does carry is the id,
-/// and the id is a link to the forum profile where all of that lives, so that
-/// is what this offers rather than inventing the rest.
+/// Who somebody is, on Sneedchat: the name and picture the chat shows for
+/// them. The chat knows people by principal, not by forum account, so there
+/// is no profile page to point at.
 pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
     let mut profile = crate::profile::pending("sneedchat", account_id, username);
     profile["pending"] = serde_json::json!(false);
-
-    // The roster the room already has: their id and picture are in it.
     if let Some(members) = state.runtime.get_presence(buffer_id) {
         if let Some(member) = members
             .as_array()
@@ -26,9 +21,6 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
         {
             if let Some(id) = member["userId"].as_str() {
                 profile["id"] = serde_json::json!(id);
-                if let Some(config) = state.accounts.get_sneedchat(account_id) {
-                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.site_host()));
-                }
             }
             if let Some(avatar) = member["avatarUrl"].as_str() {
                 profile["avatarUrl"] = serde_json::json!(avatar);
@@ -38,25 +30,11 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
     profile
 }
 
-/// Which rooms the site has, asked of the site.
-///
-/// The catalogue was six rooms written into the frontend, with a comment
-/// saying no endpoint lists them. There is one - it is simply not an API: the
-/// chat page the browser loads carries the room switcher as ordinary markup,
-/// `<a class="chat-room" data-id="20">Lolcows</a>`, and that is the same list
-/// a person sees down the side of the site.
-///
-/// Unauthenticated on purpose. The list is the same for everybody and the
-/// gate is the only thing in the way, so this needs no account session - which
-/// means the room list can be refreshed while an account is signed out or
-/// failing to sign in.
 /// Reads the catalogue in the background and tells everybody when it arrives.
 ///
-/// Not returned from the RPC that asks for it, because reading it costs a Tor
-/// round trip through a proof-of-work gate - about fifteen seconds - and the
-/// daemon answers one request at a time per client. A blocking answer here
-/// froze the whole window for the duration, which is a far worse thing than a
-/// room list that fills in a moment later.
+/// Not returned from the RPC that asks for it: it is read through the
+/// account's own chat session, over the web helper, and the daemon answers
+/// one request at a time per client.
 pub fn refresh_rooms(state: AppState, account_id: String) {
     tokio::spawn(async move {
         match list_rooms(&state, &account_id).await {
@@ -68,29 +46,21 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
     });
 }
 
-pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
-    let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
-    let transport = build_transport(state, &config, account_id).await?;
-    let host = config.site_host();
-    let session = Session::new(transport, format!("https://{host}"), DEFAULT_USER_AGENT.to_string());
-    restore_session(&session, &config);
+/// The rooms the chat lists, asked through the account's connection - the
+/// list needs a chat session, which only a connected account has.
+pub async fn list_rooms(_state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
+    let chat = super::chat::chat(account_id);
+    let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("connect the account to see its rooms"))?;
+    let host = chat.host.lock().unwrap().clone();
     read_catalogue(&session, &host).await
 }
 
-/// The rooms the site lists, read off its chat page with `session`.
-///
-/// From the address the account connects to: the stored host is the onion
-/// address for every account made before the open internet was the default,
-/// and without Tor that address cannot be reached.
+/// The listed rooms, as the account names them.
 pub(super) async fn read_catalogue(session: &Session, host: &str) -> Result<Vec<SneedChatRoom>> {
-    let url = format!("https://{host}/test-chat");
-    let resp = session.fetch(&url).await.context("fetching the chat page")?;
-    if !(200..400).contains(&resp.status) {
-        bail!("the chat page answered HTTP {}", resp.status);
-    }
-    let rooms = parse_rooms(&resp.body);
+    let heads = super::chat::api_get(session, host, "rooms/heads?kind=listed").await?;
+    let rooms: Vec<SneedChatRoom> = protocol::parse_heads(&heads.to_string()).into_iter().map(|h| SneedChatRoom { id: h.uuid, name: h.slug }).collect();
     if rooms.is_empty() {
-        bail!("the chat page listed no rooms - its markup has probably changed");
+        bail!("the chat listed no rooms");
     }
     Ok(rooms)
 }
@@ -108,43 +78,61 @@ pub(super) fn publish_catalogue(state: &AppState, account_id: &str, rooms: &[Sne
     );
 }
 
+/// The account's rooms, made right against the chat's own list once a
+/// connection is admitted: rooms saved under the old chat's numbers are moved
+/// to the uuid of the room with the same name, and an account that has never
+/// had a room is given one as a courtesy.
+pub(super) async fn settle_rooms(state: &AppState, account_id: &str, session: &Session, host: &str) {
+    let catalogue = match read_catalogue(session, host).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("sneedchat[{account_id}]: reading the room list: {e:#}");
+            return;
+        }
+    };
+    publish_catalogue(state, account_id, &catalogue);
+    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
+    let (rooms, changed) = adopt_uuids(&config.rooms, &catalogue);
+    if changed {
+        tracing::info!("sneedchat[{account_id}]: rooms moved to the new chat: {:?}", rooms.iter().map(|r| &r.name).collect::<Vec<_>>());
+        let _ = state.accounts.set_sneedchat_rooms(account_id, rooms);
+    } else if !config.rooms_chosen && config.rooms.is_empty() {
+        if let Some(room) = courtesy_room(&catalogue) {
+            tracing::info!("sneedchat[{account_id}]: opening #{} for a new account", room.name);
+            let _ = state.accounts.set_sneedchat_rooms(account_id, vec![room]);
+        }
+    }
+}
+
+/// Saved rooms against the catalogue: any not yet named by uuid takes the
+/// uuid of the listed room with its name, and one the chat no longer has is
+/// dropped. Whether anything changed.
+pub(super) fn adopt_uuids(saved: &[SneedChatRoom], catalogue: &[SneedChatRoom]) -> (Vec<SneedChatRoom>, bool) {
+    let mut changed = false;
+    let mut out: Vec<SneedChatRoom> = Vec::new();
+    for room in saved {
+        if protocol::is_uuid(&room.id) {
+            out.push(room.clone());
+            continue;
+        }
+        changed = true;
+        match catalogue.iter().find(|c| c.name == room.name) {
+            Some(found) if !out.iter().any(|r| r.id == found.id) => out.push(found.clone()),
+            _ => {}
+        }
+    }
+    (out, changed)
+}
+
 /// The room a new account is opened in, as a courtesy: the one the site
-/// calls general, or else the first it lists. From the site's own list, so
-/// nothing here assumes what the site's rooms are called or numbered.
+/// calls general, or else the first it lists.
 pub(super) fn courtesy_room(catalogue: &[SneedChatRoom]) -> Option<SneedChatRoom> {
     catalogue.iter().find(|r| r.name == "general").or_else(|| catalogue.first()).cloned()
 }
 
-/// The room switcher, out of the chat page's markup.
-///
-/// Deliberately a scan for the two things that matter rather than an HTML
-/// parse: `data-id` and the text after it. The page is generated markup and
-/// its shape will change; a scan that finds nothing is a room list that could
-/// not be read, which the caller reports, and not a panic or silent empty.
-pub(super) fn parse_rooms(html: &str) -> Vec<SneedChatRoom> {
-    let mut rooms = Vec::new();
-    for chunk in html.split("class=\"chat-room\"").skip(1) {
-        let Some(id) = chunk.split("data-id=\"").nth(1).and_then(|rest| rest.split('"').next()) else { continue };
-        let Ok(id) = id.parse::<u32>() else { continue };
-        // The link's own text, which is the room's name as the site writes it.
-        let Some(label) = chunk.split_once('>').map(|(_, rest)| rest).and_then(|rest| rest.split('<').next()) else {
-            continue;
-        };
-        let name = slug(label);
-        if !name.is_empty() && !rooms.iter().any(|r: &SneedChatRoom| r.id == id) {
-            rooms.push(SneedChatRoom { id, name });
-        }
-    }
-    rooms
-}
-
 /// The site's own display name reduced to the form this project has always
 /// used for a room - lower case, words joined by hyphens, punctuation gone.
-///
-/// Not a new convention: run over the rooms the catalogue already listed it
-/// reproduces every one of them exactly ("Beauty Parlor" -> beauty-parlor,
-/// "SPORTS!!" -> sports), which is what says the rule is the right one rather
-/// than merely a plausible one.
+/// What the chat calls a room's slug is the same thing.
 pub(super) fn slug(label: &str) -> String {
     let mut out = String::new();
     for ch in label.trim().chars() {
@@ -157,84 +145,8 @@ pub(super) fn slug(label: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-#[cfg(test)]
-pub(super) mod room_list_tests {
-    use super::{parse_rooms, slug};
-
-    /// The six rooms the catalogue held were written by hand from the site.
-    /// If the rule that turns a display name into one of them is right, it
-    /// reproduces all six - and it does.
-    #[test]
-    fn the_sites_names_become_the_names_this_project_already_used() {
-        assert_eq!(slug("General"), "general");
-        assert_eq!(slug("Gunt"), "gunt");
-        assert_eq!(slug("Keno Kasino"), "keno-kasino");
-        assert_eq!(slug("Fishtank"), "fishtank");
-        assert_eq!(slug("Beauty Parlor"), "beauty-parlor");
-        assert_eq!(slug("SPORTS!!"), "sports");
-        // And the one that was missing.
-        assert_eq!(slug("Lolcows"), "lolcows");
-    }
-
-    /// The courtesy room is found by the site's own name for it, wherever
-    /// the site numbers it, and a site with no room of that name still gets
-    /// its first one rather than nothing.
-    #[test]
-    fn a_new_account_opens_the_room_the_site_calls_general() {
-        use crate::accounts::SneedChatRoom;
-        use crate::backend::sneedchat::rooms::courtesy_room;
-        let room = |id: u32, name: &str| SneedChatRoom { id, name: name.to_string() };
-        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(7, "general")]), Some(room(7, "general")));
-        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(19, "sports")]), Some(room(16, "fishtank")));
-        assert_eq!(courtesy_room(&[]), None);
-    }
-
-    #[test]
-    fn reads_the_room_switcher_out_of_the_page() {
-        let html = concat!(
-            "<div id=\"chat-rooms\">",
-            "<a class=\"chat-room\" role=\"button\" href=\"#1\" data-id=\"1\">General</a>",
-            "<a class=\"chat-room\" role=\"button\" href=\"#20\" data-id=\"20\">Lolcows</a>",
-            "<a class=\"chat-room\" role=\"button\" href=\"#19\" data-id=\"19\">SPORTS!!</a>",
-            "</div>"
-        );
-        let rooms = parse_rooms(html);
-        assert_eq!(rooms.len(), 3);
-        assert_eq!((rooms[0].id, rooms[0].name.as_str()), (1, "general"));
-        assert_eq!((rooms[1].id, rooms[1].name.as_str()), (20, "lolcows"));
-        assert_eq!((rooms[2].id, rooms[2].name.as_str()), (19, "sports"));
-    }
-
-    /// Markup that no longer says what this expects reads as no rooms, which
-    /// the caller turns into an error rather than an empty catalogue - the
-    /// difference between "the site has no rooms" and "this could not tell".
-    #[test]
-    fn markup_that_changed_reads_as_nothing_rather_than_as_nonsense() {
-        assert!(parse_rooms("<div>no switcher here</div>").is_empty());
-        assert!(parse_rooms("<a class=\"chat-room\" data-id=\"x\">Bad</a>").is_empty());
-    }
-}
-
-/// Shared by sendMessage/editMessage/deleteMessage's SneedChat branches -
-/// looks up which configured room a buffer belongs to and returns that
-/// room's own permanent connection (see `run_room`). There's no "switch
-/// active room" step needed since every configured room is already
-/// connected simultaneously.
-pub(super) fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
-    let room_name = room_name_of(buffer_name);
-    let room = cfg.rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
-    state.runtime.sneedchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
-}
-
-/// What a room's buffer is called.
-///
-/// The `#` is not decoration - it is part of the name every other part of this
-/// daemon and every frontend knows the room by. Writing whispers into
-/// `room.name` instead of this made a second, empty buffer per room named
-/// without it, which is the "new chat buffer" that opened when one was sent:
-/// not a window being opened, but a conversation being written somewhere
-/// nobody was looking. One definition so the two cannot disagree again.
+/// What a room's buffer is called. The `#` is part of the name every other
+/// part of this daemon and every frontend knows the room by.
 pub(super) fn room_buffer_name(room_name: &str) -> String {
     format!("#{room_name}")
 }
@@ -244,68 +156,31 @@ pub(super) fn room_name_of(buffer_name: &str) -> &str {
     buffer_name.strip_prefix('#').unwrap_or(buffer_name)
 }
 
-/// Any live room connection for this account.
-///
-/// A whisper belongs to no room, so it does not matter which carries it - but
-/// there has to be one, since the only way to say anything at all is over a
-/// room's socket.
-pub(super) fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
-    cfg.rooms
-        .iter()
-        .find_map(|r| state.runtime.sneedchat_sender(account_id, r.id))
-        .ok_or_else(|| anyhow!("whispers travel over a room's connection - open a room on the Join page to send one"))
-}
+/// One member as published: name, picture, and the group they are listed
+/// under (their highest badge, "staff"), which the client shows as a prefix.
+type Member = (String, Option<String>, Option<String>);
 
-
-/// Applies a roster delta to a room and republishes it.
-///
-/// The server sends the full roster on join and single entries afterwards,
-/// both under the same key and in the same shape, so both are simply merged -
-/// the roster is emptied when the room is joined, which is what makes that
-/// safe. Departures arrive separately, keyed by id with a presence flag.
-///
-/// Ordering is by name here rather than left to the client: every other
-/// backend hands over a sorted roster, and a five-hundred-name list arriving
-/// in map order would be unreadable.
-/// The site owner's forum account. SneedChat carries no rank information at
-/// all - the roster's user objects are id, name, avatar and last activity, and
-/// the only `permissions` frame describes our *own* ability to view and send -
-/// so there is no wire signal to derive staff from. This one id is a fact
-/// about the site rather than something the protocol tells us, which is why it
-/// is the only such marking: guessing at moderators without data would be
-/// worse than showing everyone as an ordinary member.
-pub(super) const SITE_OWNER_ID: &str = "1";
-
-pub(super) fn update_roster(
-    state: &AppState,
-    http: &super::http::HttpClient,
-    host: &str,
-    account_id: &str,
-    buffer_name: &str,
-    joined: &[protocol::WireUser],
-    left: &[String],
-) {
+/// Publishes who is in a room, as a `presence` frame lists them - the whole
+/// list each time.
+pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient, host: &str, account_id: &str, buffer_name: &str, principals: &[Principal]) {
     let buffer_id = crate::model::buffer_id(account_id, buffer_name);
-    let mut by_id = published_roster(state, &buffer_id);
-
-    for user in joined {
-        // Whatever picture they already had stays until a new one is fetched.
-        let known = by_id.get(&user.id).and_then(|(_, a)| a.clone());
-        by_id.insert(user.id.clone(), (user.username.clone(), known));
-    }
-    for id in left {
-        by_id.remove(id);
-    }
+    let before = published_roster(state, &buffer_id);
+    let by_id: std::collections::BTreeMap<String, Member> = principals
+        .iter()
+        .map(|p| {
+            // Whatever picture they already had stays until a new one is fetched.
+            let known = before.get(&p.uuid).and_then(|(_, a, _)| a.clone());
+            (p.uuid.clone(), (p.name.clone(), known, super::catalogue::member_group(&p.badges)))
+        })
+        .collect();
     publish_roster(state, &buffer_id, &by_id);
 
-    // The pictures, after the list is already on screen: fetching one goes over
-    // the site's own route and is slow the first time, and neither the list nor
-    // the room's messages should wait for a face. Fetched together, then laid
-    // over the roster as it is by then and said again.
-    let wanted: Vec<(String, String)> = joined
+    // The pictures, after the list is already on screen: fetching one is slow
+    // the first time, and neither the list nor the room should wait for it.
+    let wanted: Vec<(String, String)> = principals
         .iter()
-        .filter_map(|u| Some((u.id.clone(), u.avatar_url.clone().filter(|a| !a.is_empty())?)))
+        .filter(|p| before.get(&p.uuid).and_then(|(_, a, _)| a.as_ref()).is_none())
+        .filter_map(|p| Some((p.uuid.clone(), super::chat::mirrored(p.avatar.as_deref()?, host))))
         .collect();
     if !wanted.is_empty() {
         tokio::spawn({
@@ -315,8 +190,8 @@ pub(super) fn update_roster(
     }
 }
 
-/// The roster as last published: who is there, and the picture each has.
-fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+/// The roster as last published: who is there, their picture and group.
+fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, Member> {
     state
         .runtime
         .get_presence(buffer_id)
@@ -327,7 +202,8 @@ fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTre
             let id = m.get("userId")?.as_str()?.to_string();
             let nick = m.get("nick")?.as_str()?.to_string();
             let avatar = m.get("avatarUrl").and_then(|a| a.as_str()).map(str::to_string);
-            Some((id, (nick, avatar)))
+            let group = m.get("prefix").and_then(|a| a.as_str()).filter(|p| !p.is_empty()).map(str::to_string);
+            Some((id, (nick, avatar, group)))
         })
         .collect()
 }
@@ -352,149 +228,90 @@ async fn add_pictures(state: &AppState, http: &super::http::HttpClient, host: &s
     }
 }
 
-/// Orders and publishes a roster: sorted here rather than left to the client,
-/// since every other backend hands over a sorted one and a five-hundred-name
-/// list in map order would be unreadable.
-fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, (String, Option<String>)>) {
-    let mut members: Vec<(&String, &(String, Option<String>))> = by_id.iter().collect();
-    members.sort_by(|(_, (a, _)), (_, (b, _))| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+/// Orders and publishes a roster: by group (the page's order, highest first),
+/// then by name - the order the site's own list has.
+fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, Member>) {
+    let groups = super::catalogue::member_groups();
+    let rank = |g: &Option<String>| g.as_ref().and_then(|g| groups.iter().position(|x| x == g)).unwrap_or(groups.len());
+    let mut members: Vec<(&String, &Member)> = by_id.iter().collect();
+    members.sort_by(|(_, (a, _, ga)), (_, (b, _, gb))| rank(ga).cmp(&rank(gb)).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members
         .into_iter()
-        .map(|(id, (nick, avatar))| {
-            // "~" is the owner prefix the frontend already ranks by, shared
-            // with IRC rather than inventing a Sneedchat-only convention.
-            let prefix = if id == SITE_OWNER_ID { "~" } else { "" };
-            serde_json::json!({ "nick": nick, "userId": id, "prefix": prefix, "away": false, "avatarUrl": avatar })
-        })
+        .map(|(id, (nick, avatar, group))| serde_json::json!({ "nick": nick, "userId": id, "prefix": group.clone().unwrap_or_default(), "away": false, "avatarUrl": avatar }))
         .collect::<Vec<_>>());
-
     // Persisted as well as broadcast, so a client that subscribes later gets
-    // the roster from subscribe's replay rather than waiting for the next
-    // arrival or departure - which in a quiet room could be a long wait.
+    // the roster from subscribe's replay rather than waiting for the next one.
     state.runtime.set_presence(buffer_id, member_list.clone());
     state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 #[cfg(test)]
-pub(super) mod buffer_name_tests {
+mod tests {
     use super::*;
 
+    const FISH: &str = "01a1f0f8-2d29-7ac3-b779-b3b0904d6dd6";
+    const GUNT: &str = "01a1f0f8-2d21-782a-b666-f218122ea33b";
+
+    fn room(id: &str, name: &str) -> SneedChatRoom {
+        SneedChatRoom { id: id.into(), name: name.into() }
+    }
+
     #[test]
-    fn knows_its_own_name_either_way_round() {
-        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "Ancient Pioneer"));
-        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "ancientpioneer"));
-        // Trimmed and case-insensitive, because the echo is matched against
-        // whichever name the site happened to be showing.
-        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "  ancient pioneer  "));
-        // Somebody else, which must never match - a false match drops a real
-        // whisper instead of a duplicate line.
-        assert!(!name_matches("Ancient Pioneer", "ancientpioneer", "no-exit"));
-        // An account with no display name set still matches on its login name,
-        // and an empty candidate matches nothing.
-        assert!(name_matches("", "ancientpioneer", "AncientPioneer"));
-        assert!(!name_matches("", "ancientpioneer", ""));
-        assert!(!name_matches("", "", "anyone"));
+    fn the_sites_names_become_the_names_this_project_already_used() {
+        assert_eq!(slug("Gunt"), "gunt");
+        assert_eq!(slug("Fishtank"), "fishtank");
+        assert_eq!(slug("Beauty Parlor"), "beauty-parlor");
+        assert_eq!(slug("SPORTS!!"), "sports");
+        assert_eq!(slug("Lolcows"), "lolcows");
+    }
+
+    #[test]
+    fn old_room_numbers_become_the_uuids_of_the_same_rooms() {
+        let catalogue = [room(FISH, "fishtank"), room(GUNT, "gunt")];
+        // Fishtank was 16 on the old chat; "general" exists no more.
+        let (rooms, changed) = adopt_uuids(&[room("16", "fishtank"), room("1", "general")], &catalogue);
+        assert!(changed);
+        assert_eq!(rooms, vec![room(FISH, "fishtank")]);
+        // Already moved: nothing to do.
+        let (rooms, changed) = adopt_uuids(&[room(FISH, "fishtank")], &catalogue);
+        assert!(!changed);
+        assert_eq!(rooms.len(), 1);
+        // Two old entries for the same room make one.
+        let (rooms, _) = adopt_uuids(&[room("16", "fishtank"), room("99", "fishtank")], &catalogue);
+        assert_eq!(rooms.len(), 1);
+    }
+
+    #[test]
+    fn a_new_account_opens_the_room_the_site_calls_general_or_its_first() {
+        assert_eq!(courtesy_room(&[room(FISH, "fishtank"), room("x", "general")]), Some(room("x", "general")));
+        assert_eq!(courtesy_room(&[room(FISH, "fishtank"), room(GUNT, "gunt")]), Some(room(FISH, "fishtank")));
+        assert_eq!(courtesy_room(&[]), None);
     }
 
     #[test]
     fn a_room_and_its_buffer_name_are_one_pairing() {
-        // The bug this exists to prevent: whispers were written to
-        // `room.name`, while every room's buffer is named with a "#" in front.
-        // That is not a typo with no consequence - it made a second, empty
-        // buffer per room, which is the "new chat buffer" that opened when a
-        // whisper was sent.
-        assert_eq!(room_buffer_name("general"), "#general");
-        assert_eq!(room_name_of(&room_buffer_name("general")), "general");
-        assert_eq!(room_name_of("#fishtank"), "fishtank");
-        // Tolerant read-back: a caller that already stripped it gets the same
-        // answer rather than a different one.
+        assert_eq!(room_buffer_name("fishtank"), "#fishtank");
+        assert_eq!(room_name_of(&room_buffer_name("fishtank")), "fishtank");
         assert_eq!(room_name_of("fishtank"), "fishtank");
     }
-}
-
-#[cfg(test)]
-mod roster_tests {
-    use super::*;
-    use crate::backend::kick::testkit::simulated_daemon;
-    use crate::backend::sneedchat::http::{CookieJar, HttpClient};
-    use crate::net::tor::Transport;
-
-    const ACCOUNT: &str = "sneedchat:test";
-
-    fn client() -> HttpClient {
-        HttpClient::new(Transport::Direct, CookieJar::new(), "test".to_string())
-    }
-
-    fn user(id: &str, name: &str, avatar: Option<&str>) -> protocol::WireUser {
-        serde_json::from_value(serde_json::json!({ "id": id, "username": name, "avatar_url": avatar })).unwrap()
-    }
-
-    fn members(state: &AppState) -> Vec<(String, Option<String>)> {
-        let list = state.runtime.get_presence(&crate::model::buffer_id(ACCOUNT, "general")).unwrap();
-        list.as_array().unwrap().iter().map(|m| (m["nick"].as_str().unwrap().to_string(), m["avatarUrl"].as_str().map(str::to_string))).collect()
-    }
 
     #[tokio::test]
-    async fn the_list_is_published_at_once_with_nobody_waiting_on_a_picture() {
-        let state = simulated_daemon("sneedchat-roster-plain");
-        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("2", "bob", None), user("1", "Amy", None)], &[]);
-        assert_eq!(members(&state), [("Amy".to_string(), None), ("bob".to_string(), None)], "sorted, and no picture is no picture");
-        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[], &["2".to_string()]);
-        assert_eq!(members(&state).len(), 1);
-    }
-
-    /// A tiny picture on a local server, fetched into a scratch cache.
-    async fn picture_server() -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // A PNG's signature and a few more bytes: enough to be sniffed as one.
-        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
-                let png = png.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 2048];
-                    let _ = sock.read(&mut buf).await;
-                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(&png).await;
-                });
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    #[tokio::test]
-    async fn pictures_follow_the_list_and_stay_through_later_arrivals() {
-        let dir = std::env::temp_dir().join(format!("nobilis-roster-avatars-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = Some(dir.clone());
-        let base = picture_server().await;
-        let state = simulated_daemon("sneedchat-roster-pictures");
-
-        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("7", "Amy", Some(&format!("{base}/a.png")))], &[]);
-        // On screen first, without the picture.
-        assert_eq!(members(&state), [("Amy".to_string(), None)]);
-        let mut with = None;
-        for _ in 0..100 {
-            with = members(&state)[0].1.clone();
-            if with.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let path = with.expect("the picture arrives after the list");
-        assert!(path.contains("7."), "a file named for the user: {path}");
-
-        // Somebody arrives, and Amy keeps hers.
-        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("8", "Bob", None)], &[]);
-        let list = members(&state);
-        assert_eq!(list.iter().find(|m| m.0 == "Amy").unwrap().1.as_deref().map(|p| p.contains("7.")), Some(true));
-        assert_eq!(list.iter().find(|m| m.0 == "Bob").unwrap().1, None);
-
-        *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = None;
-        let _ = std::fs::remove_dir_all(&dir);
+    async fn presence_is_the_whole_list_sorted() {
+        let state = crate::backend::kick::testkit::simulated_daemon("sneedchat-presence");
+        let http = super::super::http::HttpClient::new(crate::net::tor::Transport::Direct, super::super::http::CookieJar::new(), "t".into());
+        let p = |id: &str, name: &str| Principal { uuid: id.into(), name: name.into(), ..Default::default() };
+        publish_presence(&state, &http, "example.invalid", "sneedchat:t", "#fishtank", &[p("2", "bob"), p("1", "Amy")]);
+        let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
+        let names: Vec<&str> = list.as_array().unwrap().iter().map(|m| m["nick"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Amy", "bob"]);
+        // Staff first, marked, then everybody by name.
+        let staff = Principal { uuid: "3".into(), name: "zed".into(), badges: vec!["hidden".into(), "staff".into()], ..Default::default() };
+        publish_presence(&state, &http, "example.invalid", "sneedchat:t", "#fishtank", &[p("2", "bob"), p("1", "Amy"), staff]);
+        let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
+        let shown: Vec<(&str, &str)> = list.as_array().unwrap().iter().map(|m| (m["nick"].as_str().unwrap(), m["prefix"].as_str().unwrap())).collect();
+        assert_eq!(shown, [("zed", "staff"), ("Amy", ""), ("bob", "")]);
+        publish_presence(&state, &http, "example.invalid", "sneedchat:t", "#fishtank", &[p("2", "bob")]);
+        let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
     }
 }

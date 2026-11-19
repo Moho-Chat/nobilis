@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 # A larger receive buffer for the Discord voice and stream sockets, on every
 # platform - see backend/discord/streamconn.rs `widen_receive_buffer`.
 socket2 = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -43,6 +43,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", features = ["ring"] }
 rsa = "0.9"
 sha2 = "0.10"
+# Fluxer's ALTCHA proof of work (backend/fluxer/altcha.rs): PBKDF2-SHA256, as the server derives it.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # The login captcha's proof of work; see backend/sneedchat/captcha.rs.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 rand = "0.8"
@@ -57,6 +59,9 @@ davey = "0.1"
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+# The chat's emoticons and reactions are SVG, which the window will not show from a
+# file (it can carry script); they are drawn to PNG here instead. No text or fonts.
+resvg = { version = "0.50", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Telegram backend (MTProto, pure Rust). `grammers-session` without its default `sqlite-storage` (libsql would sit

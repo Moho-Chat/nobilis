@@ -47,7 +47,7 @@ fn post_thumbnail(first: &Value) -> Option<String> {
 }
 
 /// One post, from the thread and the first message that came with it.
-fn post_card(thread: &Value, first: Option<&Value>, tags: &[Value], own_user_id: &str, own_name: Option<&str>) -> Value {
+pub(crate) fn post_card(thread: &Value, first: Option<&Value>, tags: &[Value], own_user_id: &str, own_name: Option<&str>) -> Value {
     let id = thread["id"].as_str().unwrap_or_default();
     let applied: Vec<&str> = thread["applied_tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).collect();
     let tag_names: Vec<Value> = applied
@@ -236,7 +236,7 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
 }
 
 /// The tags a forum offers, as the window needs them for a new post.
-fn tag_list(tags: &[Value]) -> Vec<Value> {
+pub(crate) fn tag_list(tags: &[Value]) -> Vec<Value> {
     tags.iter()
         .map(|t| json!({ "id": t["id"], "name": t["name"], "emoji": t["emoji_name"], "moderated": t["moderated"].as_bool().unwrap_or(false) }))
         .collect()
