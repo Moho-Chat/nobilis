@@ -161,7 +161,13 @@ pub fn reaction_choices() -> Vec<serde_json::Value> {
 /// What this account may do in the room a buffer shows.
 pub fn powers(account_id: &str, buffer_name: &str) -> serde_json::Value {
     let chat = super::chat::chat(account_id);
-    let p = chat.room_of_buffer(buffer_name).map(|r| super::catalogue::powers(&r)).unwrap_or_default();
+    // A room not joined yet (the daemon has just started) is answered as any
+    // member's, not as one this account may do nothing in: the window keeps
+    // what it is told until the connection says to ask again.
+    let p = match chat.room_of_buffer(buffer_name) {
+        Some(room) => super::catalogue::powers(&room),
+        None => super::catalogue::Powers { post: true, react: true, whisper: true, moderate: false },
+    };
     json!({ "post": p.post, "react": p.react, "whisper": p.whisper, "moderate": p.moderate, "frozen": chat.frozen() })
 }
 
