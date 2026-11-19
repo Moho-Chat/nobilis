@@ -336,6 +336,46 @@ pub(super) fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode
     sender.send(Command::ChannelMODE(channel.to_string(), vec![m])).map_err(|e| anyhow!(e))
 }
 
+/// Replies waiting for their message to come back: IRC has no reply field (the `+draft/reply` tag is not carried by most
+/// networks, Libera among them), so a reply is sent as the message with the author's name in front - what everybody does
+/// by hand - and the link to what was answered is kept here, to be put back on the line when the network returns it.
+type WaitingReplies = std::sync::Mutex<HashMap<(String, String, String), crate::model::ReplyPreview>>;
+
+fn replies() -> &'static WaitingReplies {
+    static REPLIES: std::sync::OnceLock<WaitingReplies> = std::sync::OnceLock::new();
+    REPLIES.get_or_init(Default::default)
+}
+
+pub(super) fn take_reply(account_id: &str, target: &str, body: &str) -> Option<crate::model::ReplyPreview> {
+    replies().lock().unwrap().remove(&(account_id.to_string(), target.to_ascii_lowercase(), body.trim().to_string()))
+}
+
+/// What goes on the wire for a reply to `author`: their name and a colon before the words, unless the person already
+/// addressed them that way.
+pub(super) fn addressed(author: &str, body: &str) -> String {
+    let lower = body.trim_start().to_ascii_lowercase();
+    let name = author.to_ascii_lowercase();
+    let already = [":", ",", " "].iter().any(|sep| lower.starts_with(&format!("{name}{sep}")) || lower.starts_with(&format!("@{name}{sep}")));
+    if author.is_empty() || already {
+        body.to_string()
+    } else {
+        format!("{author}: {body}")
+    }
+}
+
+/// Sends `body` as an answer to `reply`, in the way IRC does it.
+pub fn send_reply(state: &AppState, account_id: &str, sender: &Sender, target_buffer: &str, body: &str, reply: crate::model::ReplyPreview) -> Result<()> {
+    let wire = addressed(&reply.from, body);
+    {
+        let mut all = replies().lock().unwrap();
+        if all.len() > 64 {
+            all.clear();
+        }
+        all.insert((account_id.to_string(), target_buffer.to_ascii_lowercase(), wire.trim().to_string()), reply);
+    }
+    send_message(state, account_id, sender, target_buffer, &wire)
+}
+
 pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
     // Noted on the way past, so a transfer that stops short can be asked for
     // again without anybody having to remember the pack number. Ignores
@@ -386,7 +426,8 @@ pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, ta
     if !echoes {
         sender.send_privmsg(target, body)?;
         let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
-        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+        let reply = take_reply(account_id, target, body);
+        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", reply, None, false, None, Vec::new(), Vec::new(), None);
         return Ok(());
     }
 
@@ -582,5 +623,20 @@ mod echo_tests {
         assert!(!settle_send("other@kf", &":x!x@h PRIVMSG #a :hello".parse().unwrap()));
         assert!(pending_sends().lock().unwrap().contains_key(&label));
         pending_sends().lock().unwrap().remove(&label);
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::addressed;
+
+    #[test]
+    fn a_reply_leads_with_the_author_unless_it_already_does() {
+        assert_eq!(addressed("bob", "yes"), "bob: yes");
+        assert_eq!(addressed("bob", "bob: yes"), "bob: yes");
+        assert_eq!(addressed("Bob", "bob, yes"), "bob, yes");
+        assert_eq!(addressed("bob", "@bob yes"), "@bob yes");
+        assert_eq!(addressed("", "yes"), "yes");
+        assert_eq!(addressed("bobby", "bob: yes"), "bobby: bob: yes");
     }
 }

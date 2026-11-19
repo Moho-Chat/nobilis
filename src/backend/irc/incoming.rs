@@ -181,7 +181,9 @@ pub(super) async fn handle_message(
             if let Some(action_body) = strip_action(&body) {
                 state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+                // Our own reply, coming back: the line carries the author's name, and the link to what it answered goes back on it.
+                let reply = if echo_of_ours { send::take_reply(account_id, &target, &body) } else { None };
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", reply, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             }
         }
 

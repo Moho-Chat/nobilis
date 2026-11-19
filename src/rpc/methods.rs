@@ -4096,7 +4096,7 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
-                Some(_) if reply_to_id.is_some() => (None, Some("replies aren't supported for this service".to_string())),
+                Some(buffer) if reply_to_id.is_some() && crate::model::service_of(&buffer.account_id) != "irc" => (None, Some("replies aren't supported for this service".to_string())),
                 Some(buffer) => match state.runtime.irc_sender(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(sender) => {
@@ -4119,7 +4119,19 @@ pub async fn dispatch(
                                 }
                             }
                         };
-                        match backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body) {
+                        // IRC has no replies of its own: the author's name goes in front of the words, as people write it,
+                        // and the link to what was answered is put back on the line when the network returns it.
+                        let reply = reply_to_id.and_then(|id| state.store.get_message(buffer_id, id).ok().flatten()).map(|m| crate::model::ReplyPreview {
+                            id: m.id,
+                            from: m.from,
+                            body: m.body,
+                            ..Default::default()
+                        });
+                        let sent = match reply {
+                            Some(reply) => backend::irc::send_reply(state, &buffer.account_id, &sender, &buffer.name, &body, reply),
+                            None => backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body),
+                        };
+                        match sent {
                             Ok(()) => (Some(ok_node()), None),
                             Err(e) => (None, Some(format!("{e:#}"))),
                         }
