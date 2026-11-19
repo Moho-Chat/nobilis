@@ -27,15 +27,39 @@ pub(super) fn compose(body: &str, reply: Option<&ReplyTo>) -> String {
 }
 
 /// Sends a message to the room a buffer shows, optionally as a reply.
-pub async fn send_message(_state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<ReplyTo>) -> Result<()> {
-    let text = compose(body, reply_to.as_ref());
+///
+/// What the site's own composer understands typed here as well: `/w Name
+/// text` (or `/whisper`) whispers - a private room with that person - and
+/// `/topic text` (or `/subtitle`) sets the room's subtitle. `@Name` for
+/// anybody the chat has shown is sent as the mention the chat reads.
+pub async fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<ReplyTo>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let trimmed = body.trim_start();
+    for command in ["/whisper ", "/w ", "/msg "] {
+        if let Some(rest) = trimmed.strip_prefix(command) {
+            let (target, text) = whisper_target(&chat, rest).ok_or_else(|| anyhow!("whisper to whom? Nobody of that name has been seen in this chat"))?;
+            return send_whisper(state, account_id, &target, &text, Some(buffer_name)).await;
+        }
+    }
+    for command in ["/topic ", "/subtitle "] {
+        if let Some(rest) = trimmed.strip_prefix(command) {
+            return set_subtitle(account_id, buffer_name, rest.trim()).await;
+        }
+    }
+    post(account_id, buffer_name, &compose(body, reply_to.as_ref())).await
+}
+
+/// Posts text as it stands to the room a buffer shows, mentions written as
+/// the chat reads them, and waits for its echo.
+async fn post(account_id: &str, buffer_name: &str, text: &str) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let text = protocol::names_to_mentions(text, &chat.known_names());
     if text.is_empty() {
         return Ok(());
     }
     if text.len() > 15 * 1024 {
         bail!("that's longer than the chat takes");
     }
-    let chat = super::chat::chat(account_id);
     let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
     if !chat.joined(&room) {
         bail!("not in this room right now - it is still joining");
@@ -44,9 +68,145 @@ pub async fn send_message(_state: &AppState, account_id: &str, buffer_name: &str
     chat.command(&nonce, json!({ "t": "send", "chat_room_uuid": room, "body": text, "client_nonce": nonce })).await
 }
 
-/// Whispers are side rooms on the new chat - not built yet.
-pub fn send_whisper(_state: &AppState, _account_id: &str, _target: &str, _body: &str, _from_buffer: Option<&str>) -> Result<()> {
-    bail!("whispers aren't supported on the new Sneedchat yet")
+/// Who a typed whisper is for and what it says: the longest name the chat
+/// has shown that the text starts with, since names have spaces in them.
+fn whisper_target(chat: &super::chat::Chat, rest: &str) -> Option<(String, String)> {
+    let rest = rest.trim_start().trim_start_matches('@');
+    let mut names: Vec<String> = chat.known_names().into_iter().map(|(_, n)| n).collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
+    names.into_iter().find_map(|name| {
+        let head = rest.get(..name.len())?;
+        let tail = &rest[name.len()..];
+        (head.eq_ignore_ascii_case(&name) && tail.chars().next().is_none_or(|c| c.is_whitespace() || c == ',' || c == ':'))
+            .then(|| (name.clone(), tail.trim_start_matches([',', ':']).trim().to_string()))
+    })
+}
+
+/// Whispers to somebody: in the private room this account already has with
+/// them, or a new one, which the chat opens (`open_side_room`) and which
+/// appears as a conversation of its own.
+pub async fn send_whisper(_state: &AppState, account_id: &str, target: &str, body: &str, _from_buffer: Option<&str>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let person = chat.person_named(target).ok_or_else(|| anyhow!("nobody called {target} has been seen in this chat"))?;
+    let buffer = match chat.side_room_with(&person.uuid) {
+        Some((_, buffer)) => buffer,
+        None => {
+            let key = format!("side:{}", person.uuid);
+            chat.command(&key, json!({ "t": "open_side_room", "principal_uuids": [person.uuid] })).await.context("opening a private room")?;
+            chat.side_room_with(&person.uuid).map(|(_, b)| b).ok_or_else(|| anyhow!("the chat opened no private room with {}", person.name))?
+        }
+    };
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+    // A moment for the new room's join to land before the post that needs it.
+    for _ in 0..20 {
+        if chat.room_of_buffer(&buffer).is_some_and(|r| chat.joined(&r)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    post(account_id, &buffer, body.trim()).await
+}
+
+/// Sets the room's subtitle - what the site shows under its name.
+pub async fn set_subtitle(account_id: &str, buffer_name: &str, text: &str) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+    let op = protocol::operation_id();
+    chat.command(&op, json!({ "t": "subtitle", "chat_room_uuid": room, "chat_room_subtitle": text, "chat_operation_uuid": op })).await
+}
+
+/// Adds or takes back this account's reaction on a message. The chat holds
+/// one reaction per person per message: a new one replaces the old, and
+/// taking one back sends no reaction at all.
+pub async fn react(account_id: &str, msg_id: &str, emoji: &str, add: bool) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let code = super::catalogue::reaction_code(emoji).ok_or_else(|| anyhow!("Kiwi Farms reactions are its own set - pick one from the reaction list"))?;
+    let message = msg_id.to_lowercase();
+    // Taking back a reaction that is not ours is nothing to do.
+    if !add && chat.own_reaction(&message).as_deref() != Some(code.as_str()) {
+        return Ok(());
+    }
+    let reaction = if add { json!(code) } else { serde_json::Value::Null };
+    chat.command(&format!("react:{message}"), json!({ "t": "react", "chat_message_uuid": message, "reaction_code": reaction })).await
+}
+
+/// Who reacted to a message with a reaction, by name.
+pub async fn reactors(account_id: &str, buffer_name: &str, msg_id: &str, emoji: &str) -> Result<Vec<String>> {
+    let chat = super::chat::chat(account_id);
+    let code = super::catalogue::reaction_code(emoji).ok_or_else(|| anyhow!("not one of the chat's reactions"))?;
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("not one of this account's rooms"))?;
+    let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let host = chat.host.lock().unwrap().clone();
+    let v = super::chat::api_get(&session, &host, &format!("rooms/{room}/messages/{}/reactions", msg_id.to_lowercase())).await?;
+    Ok(v["reactions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["reaction_code"].as_str() == Some(code.as_str()))
+        .flat_map(|r| r["reactors"].as_array().cloned().unwrap_or_default())
+        .filter_map(|p| p["display_name"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// What the reaction picker offers for this account: the site's reactions.
+pub fn reaction_choices() -> Vec<serde_json::Value> {
+    super::catalogue::reactions()
+        .into_iter()
+        .filter_map(|r| Some(json!({ "id": r.code, "name": r.title, "url": r.path? })))
+        .collect()
+}
+
+/// What this account may do in the room a buffer shows.
+pub fn powers(account_id: &str, buffer_name: &str) -> serde_json::Value {
+    let chat = super::chat::chat(account_id);
+    let p = chat.room_of_buffer(buffer_name).map(|r| super::catalogue::powers(&r)).unwrap_or_default();
+    json!({ "post": p.post, "react": p.react, "whisper": p.whisper, "moderate": p.moderate, "frozen": chat.frozen() })
+}
+
+/// A moderator's action on somebody: `mute` or `ban`, in this room or across
+/// the whole chat (`estate`), for `minutes` or for good; or `lift` to undo
+/// the sanction they are under.
+pub async fn moderate(account_id: &str, buffer_name: &str, who: &str, action: &str, minutes: Option<u64>, site_wide: bool, reason: Option<&str>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let person = match chat.person_named(who) {
+        Some(p) => p.uuid,
+        None if protocol::is_uuid(who) => who.to_string(),
+        None => bail!("nobody called {who} has been seen in this chat"),
+    };
+    let op = protocol::operation_id();
+    let frame = match action {
+        "lift" => {
+            let sanction = chat.sanction_of(&person).ok_or_else(|| anyhow!("no mute or ban on them has been seen here to lift"))?;
+            json!({ "t": "lift_sanction", "chat_sanction_uuid": sanction, "chat_operation_uuid": op })
+        }
+        "mute" | "ban" => {
+            let room = if site_wide { None } else { Some(chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("not one of this account's rooms"))?) };
+            let expires = minutes.map(|m| chrono::Utc::now().timestamp() + (m as i64) * 60);
+            json!({
+                "t": "sanction",
+                "principal_uuid": person,
+                "chat_room_uuid": room,
+                "sanction_kind": action,
+                "expires_at": expires,
+                "reason": reason.filter(|r| !r.trim().is_empty()),
+                "chat_operation_uuid": op,
+            })
+        }
+        other => bail!("not a moderation action: {other}"),
+    };
+    chat.command(&op, frame).await
+}
+
+/// The page of a room's history before the oldest message held.
+pub async fn older_history(state: &AppState, account_id: &str, buffer_name: &str) -> Result<()> {
+    super::chat::older(state, account_id, buffer_name).await
+}
+
+/// Brings back a message that was taken down.
+pub async fn restore(account_id: &str, msg_id: &str) -> Result<()> {
+    operate(account_id, msg_id, "restore", None).await
 }
 
 /// The "+" attachment button's SneedChat backend. Unlike Discord (whose API
@@ -187,7 +347,7 @@ pub async fn edit_message(state: &AppState, account_id: &str, _buffer_name: &str
     // An edit keeps the reply it was: the quote stays at its head.
     let stored = state.store.get_message(&crate::model::buffer_id(account_id, _buffer_name), msg_id).ok().flatten();
     let reply = stored.and_then(|m| m.reply_to).map(|r| ReplyTo { from: r.from, id: r.id, body: r.body });
-    let text = compose(text, reply.as_ref());
+    let text = protocol::names_to_mentions(&compose(text, reply.as_ref()), &super::chat::chat(account_id).known_names());
     operate(account_id, msg_id, "revise", Some(&text)).await
 }
 

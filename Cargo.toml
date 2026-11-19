@@ -59,6 +59,9 @@ davey = "0.1"
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+# The chat's emoticons and reactions are SVG, which the window will not show from a
+# file (it can carry script); they are drawn to PNG here instead. No text or fonts.
+resvg = { version = "0.50", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Telegram backend (MTProto, pure Rust). `grammers-session` without its default `sqlite-storage` (libsql would sit

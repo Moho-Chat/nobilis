@@ -265,16 +265,20 @@ pub async fn dispatch(
                     icon_url: None,
                     buffers: Vec::new(),
                     sendable_anywhere: true,
-                    emoji: backend::sneedchat::smilies::SMILIES
-                        .iter()
-                        .map(|s| crate::model::EmojiEntry {
-                            id: s.aliases.first().unwrap_or(&s.label).to_string(),
-                            name: s.label.to_string(),
-                            url: None,
-                            animated: false,
-                            locked: false,
-                        })
-                        .collect(),
+                    // The chat's own list once a connection has read it; the
+                    // bundled table until then.
+                    emoji: backend::sneedchat::catalogue::picker_entries().unwrap_or_else(|| {
+                        backend::sneedchat::smilies::SMILIES
+                            .iter()
+                            .map(|s| crate::model::EmojiEntry {
+                                id: s.aliases.first().unwrap_or(&s.label).to_string(),
+                                name: s.label.to_string(),
+                                url: None,
+                                animated: false,
+                                locked: false,
+                            })
+                            .collect()
+                    }),
                 });
             }
 
@@ -405,10 +409,49 @@ pub async fn dispatch(
             (Some(serde_json::json!(backend::kick::emotecache::resolve(&ids).await)), None)
         }
 
+        // The chat's own emoticons, once a connection has read them, each
+        // with its cached picture (`path`); until then the table that ships
+        // with the client, whose `file` the client resolves itself.
         "listSneedchatSmilies" => (
-            Some(serde_json::json!(backend::sneedchat::smilies::SMILIES.iter().map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file })).collect::<Vec<_>>())),
+            Some(serde_json::json!(backend::sneedchat::catalogue::smilies_json().unwrap_or_else(|| backend::sneedchat::smilies::SMILIES
+                .iter()
+                .map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file }))
+                .collect()))),
             None,
         ),
+
+        // The reactions the chat offers, for the reaction picker.
+        "listSneedchatReactions" => (Some(serde_json::json!(backend::sneedchat::reaction_choices())), None),
+
+        // What this account may do in the room a conversation shows.
+        "sneedchatPowers" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => (Some(backend::sneedchat::powers(&buffer.account_id, &buffer.name)), None),
+            _ => (None, Some("not a Sneedchat conversation".to_string())),
+        },
+
+        // A moderator's mute, ban or lifting of one, on somebody in the room
+        // a conversation shows (or across the chat, `siteWide`).
+        "sneedchatModerate" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
+                let who = p_str(params, "who", "");
+                let action = p_str(params, "action", "");
+                let minutes = params.get("minutes").and_then(|m| m.as_u64());
+                match backend::sneedchat::moderate(&buffer.account_id, &buffer.name, who, action, minutes, p_bool(params, "siteWide", false), p_str_opt(params, "reason")).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            }
+            _ => (None, Some("not a Sneedchat conversation".to_string())),
+        },
+
+        // Bringing back a message that was taken down.
+        "sneedchatRestore" => match (p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)), p_str_opt(params, "messageId")) {
+            (Some(buffer), Some(msg)) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::restore(&buffer.account_id, msg).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRestore requires a Sneedchat \"bufferId\" and \"messageId\"".to_string())),
+        },
 
         // Stop the daemon cleanly. A client that adopted an already-running
         // nobilis has no child process to signal, so this is the only way it
@@ -577,6 +620,13 @@ pub async fn dispatch(
                             if let Err(e) = backend::stoat::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("stoat history: {e:#}");
                             }
+                        }
+                    }
+                    // Sneedchat pages back through the room's log from the
+                    // oldest entry held; opening a room has its replay already.
+                    if before > 0 && buffer.account_id.starts_with("sneedchat:") {
+                        if let Err(e) = backend::sneedchat::older_history(state, &buffer.account_id, &buffer.name).await {
+                            tracing::debug!("sneedchat history: {e:#}");
                         }
                     }
                     // Fluxer too: its history is paged by message id.
@@ -2850,6 +2900,10 @@ pub async fn dispatch(
                 backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::send::reactors(&handle, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if buffer.account_id.starts_with("sneedchat:") {
+                backend::sneedchat::reactors(&buffer.account_id, &buffer.name, message_id, emoji)
+                    .await
+                    .map(|names| serde_json::json!({ "users": names.into_iter().map(|n| serde_json::json!({ "name": n })).collect::<Vec<_>>() }))
             } else if state.accounts.get_irc(&buffer.account_id).is_some() {
                 // Only those seen this run: IRC replays no reactions.
                 Ok(backend::irc::reactions::list_reactors(buffer_id, message_id, emoji))
@@ -4390,6 +4444,10 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::react(&buffer.account_id, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -8297,7 +8355,7 @@ pub async fn dispatch(
                 .and_then(|id| state.runtime.get_buffer(id))
                 .filter(|b| b.account_id == account_id)
                 .map(|b| b.name);
-            match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()) {
+            match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }

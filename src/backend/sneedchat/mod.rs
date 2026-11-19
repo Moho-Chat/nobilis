@@ -29,6 +29,7 @@
 //! As in the other backends, the submodules are re-exported flat so callers
 //! say `backend::sneedchat::send_message` without knowing which file that is,
 //! and each opens with `use super::*` to share the imports below.
+pub mod catalogue;
 pub mod chat;
 pub mod connect;
 pub mod media;

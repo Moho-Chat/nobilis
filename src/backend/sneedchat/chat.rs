@@ -5,11 +5,18 @@
 //! of its rooms on it. Opening a room is a `join` on the socket that is
 //! already there, closing one a `leave`.
 //!
+//! Two kinds of room share it. *Listed* rooms are the site's own (#fishtank),
+//! chosen on the Join page and kept in the account's settings. *Side* rooms
+//! are private conversations - what the site calls a whisper - which the chat
+//! itself remembers and names in every `welcome`; each is a conversation of
+//! its own here, named after the people in it.
+//!
 //! The socket and every request go through the web helper (net/webhelper.rs),
 //! because the site's gate admits only a browser's network stack.
 
 use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::net::webhelper::{self, WsEvent, WsSender};
@@ -26,6 +33,9 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 pub(super) const RECONNECT_INITIAL: Duration = Duration::from_secs(3);
 pub(super) const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
+/// Refusals that mean "not now" rather than "no" - worth one more try.
+pub(super) const TRANSIENT: [&str; 3] = ["rate_limited", "unavailable", "internal_error"];
+
 /// What one account's connection knows, shared with what sends on it.
 #[derive(Default)]
 pub(super) struct Chat {
@@ -34,17 +44,47 @@ pub(super) struct Chat {
     messages: Mutex<HashMap<String, Known>>,
     waiters: Mutex<HashMap<String, oneshot::Sender<std::result::Result<(), String>>>>,
     pub(super) people: Mutex<HashMap<String, Principal>>,
+    /// This account's own reaction on each message it has been told about:
+    /// a message the chat covered and named nothing for maps to None.
+    own_reactions: Mutex<HashMap<String, Option<String>>>,
+    /// Who is sanctioned, by principal: the sanction's id, which lifting it
+    /// has to name.
+    sanctions: Mutex<HashMap<String, String>>,
+    frozen: AtomicBool,
     socket: Mutex<Option<WsSender>>,
     pub(super) session: Mutex<Option<Session>>,
     pub(super) host: Mutex<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum RoomKind {
+    #[default]
+    Listed,
+    Side,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RoomState {
-    name: String,
+    /// The conversation it is shown as: `#slug` for a listed room, the other
+    /// people's names for a side room.
+    buffer: String,
+    kind: RoomKind,
+    /// A side room's members, ourselves included.
+    members: Vec<Principal>,
     last: Option<u64>,
+    /// The oldest entry held, where history paging continues from.
+    first: Option<u64>,
     replay_to: Option<u64>,
     joined: bool,
+}
+
+impl RoomState {
+    fn buffer_kind(&self) -> &'static str {
+        match self.kind {
+            RoomKind::Listed => "channel",
+            RoomKind::Side => "query",
+        }
+    }
 }
 
 /// What an edit or a removal has to name: the state the message is in,
@@ -52,6 +92,7 @@ struct RoomState {
 #[derive(Clone, Debug)]
 pub(super) struct Known {
     pub state_seq: u64,
+    pub room: String,
 }
 
 fn chats() -> &'static Mutex<HashMap<String, Arc<Chat>>> {
@@ -75,11 +116,15 @@ impl Chat {
         self.socket.lock().unwrap().clone()
     }
 
-    fn send(&self, frame: &Value) -> bool {
+    pub(super) fn send(&self, frame: &Value) -> bool {
         match self.socket() {
             Some(s) => s.send(&frame.to_string()).is_ok(),
             None => false,
         }
+    }
+
+    pub(super) fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
     }
 
     pub(super) fn joined(&self, room: &str) -> bool {
@@ -90,7 +135,7 @@ impl Chat {
         self.messages.lock().unwrap().get(&message.to_lowercase()).cloned()
     }
 
-    fn remember(&self, message: &str, state_seq: u64) {
+    fn remember(&self, message: &str, room: &str, state_seq: u64) {
         let mut all = self.messages.lock().unwrap();
         // Bounded: a long-lived connection in busy rooms would otherwise keep
         // every message it ever saw. What falls out is old enough that an
@@ -98,11 +143,19 @@ impl Chat {
         if all.len() > 50_000 {
             all.clear();
         }
-        all.insert(message.to_string(), Known { state_seq });
+        all.insert(message.to_string(), Known { state_seq, room: room.to_string() });
     }
 
-    /// Waits for the answer to something sent under `key` - a post's nonce or
-    /// a command's operation id.
+    pub(super) fn own_reaction(&self, message: &str) -> Option<String> {
+        self.own_reactions.lock().unwrap().get(message).cloned().flatten()
+    }
+
+    pub(super) fn sanction_of(&self, principal: &str) -> Option<String> {
+        self.sanctions.lock().unwrap().get(principal).cloned()
+    }
+
+    /// Waits for the answer to something sent under `key` - a post's nonce, a
+    /// command's operation id, or a message's uuid for a reaction.
     pub(super) fn expect(&self, key: &str) -> oneshot::Receiver<std::result::Result<(), String>> {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(key.to_string(), tx);
@@ -123,33 +176,70 @@ impl Chat {
         }
     }
 
-    /// Sends a frame that expects an answer, and waits for it.
+    /// Sends a frame that expects an answer under `key`, and waits for it.
+    ///
+    /// A refusal that means "not now" is tried once more after a moment. A
+    /// durable command (one with an operation id) whose answer never comes is
+    /// asked after with `query_operation`, which answers with what became of
+    /// it - so a lost answer is not reported as a failure that went through.
     pub(super) async fn command(&self, key: &str, frame: Value) -> Result<()> {
-        let rx = self.expect(key);
-        if !self.send(&frame) {
-            self.give_up(key);
-            bail!("not connected to the chat right now");
+        if self.frozen() && frame["t"] != "query_operation" {
+            bail!("{}", protocol::describe_error("frozen"));
         }
-        match tokio::time::timeout(Duration::from_secs(15), rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(code))) => bail!("{}", protocol::describe_error(&code)),
-            Ok(Err(_)) => bail!("the chat connection dropped before it answered"),
-            Err(_) => {
+        let durable = frame.get("chat_operation_uuid").is_some();
+        let mut retried = false;
+        loop {
+            let rx = self.expect(key);
+            if !self.send(&frame) {
                 self.give_up(key);
-                bail!("the chat hasn't answered - it may still go through")
+                bail!("not connected to the chat right now");
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => bail!("the chat connection dropped before it answered"),
+                Err(_) => {
+                    self.give_up(key);
+                    if !durable {
+                        bail!("the chat hasn't answered - it may still go through");
+                    }
+                    let rx = self.expect(key);
+                    if !self.send(&json!({ "t": "query_operation", "chat_operation_uuid": key })) {
+                        self.give_up(key);
+                        bail!("the chat hasn't answered - it may still go through");
+                    }
+                    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                        Ok(Ok(result)) => result,
+                        _ => {
+                            self.give_up(key);
+                            bail!("the chat hasn't answered - it may still go through");
+                        }
+                    }
+                }
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                // Asked after and never heard of: it was lost on the way, so
+                // it goes again (same id, so it cannot be done twice).
+                Err(code) if code == "operation_not_found" && !retried => retried = true,
+                Err(code) if TRANSIENT.contains(&code.as_str()) && !retried => {
+                    retried = true;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                Err(code) => bail!("{}", protocol::describe_error(&code)),
             }
         }
     }
 
-    /// The rooms the account wants, as the connection tracks them: new ones
-    /// added (and joined, when the socket is up), dropped ones left.
+    /// The listed rooms the account wants, as the connection tracks them: new
+    /// ones added (and joined, when the socket is up), dropped ones left. Side
+    /// rooms are the chat's to list and are left alone.
     pub(super) fn want_rooms(&self, rooms: &[SneedChatRoom]) {
         let mut joins = Vec::new();
         let mut leaves = Vec::new();
         {
             let mut tracked = self.rooms.lock().unwrap();
             tracked.retain(|uuid, state| {
-                let keep = rooms.iter().any(|r| &r.id == uuid);
+                let keep = state.kind == RoomKind::Side || rooms.iter().any(|r| &r.id == uuid);
                 if !keep && state.joined {
                     leaves.push(uuid.clone());
                 }
@@ -157,7 +247,7 @@ impl Chat {
             });
             for room in rooms.iter().filter(|r| protocol::is_uuid(&r.id)) {
                 let state = tracked.entry(room.id.clone()).or_default();
-                state.name = room.name.clone();
+                state.buffer = room_buffer_name(&room.name);
                 if !state.joined {
                     joins.push((room.id.clone(), state.last));
                 }
@@ -171,6 +261,19 @@ impl Chat {
         }
     }
 
+    /// A side room the chat has told us of, tracked and joined.
+    fn want_side_room(&self, uuid: &str, after: Option<u64>) {
+        let join = {
+            let mut tracked = self.rooms.lock().unwrap();
+            let state = tracked.entry(uuid.to_string()).or_insert_with(|| RoomState { kind: RoomKind::Side, ..Default::default() });
+            state.kind = RoomKind::Side;
+            !state.joined
+        };
+        if join {
+            self.join(uuid, after);
+        }
+    }
+
     fn join(&self, uuid: &str, after: Option<u64>) {
         let mut frame = json!({ "t": "join", "chat_room_uuid": uuid });
         if let Some(seq) = after {
@@ -179,23 +282,67 @@ impl Chat {
         self.send(&frame);
     }
 
-    fn room_name(&self, uuid: &str) -> Option<String> {
-        self.rooms.lock().unwrap().get(uuid).map(|r| r.name.clone())
+    /// The conversation a room is shown as, and its kind.
+    fn buffer_of(&self, uuid: &str) -> Option<(String, &'static str)> {
+        self.rooms.lock().unwrap().get(uuid).filter(|r| !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind()))
     }
 
-    /// The room a buffer shows, by uuid.
+    /// The room a conversation shows, by uuid.
     pub(super) fn room_of_buffer(&self, buffer_name: &str) -> Option<String> {
-        let name = room_name_of(buffer_name);
-        self.rooms.lock().unwrap().iter().find(|(_, r)| r.name == name).map(|(uuid, _)| uuid.clone())
+        self.rooms.lock().unwrap().iter().find(|(_, r)| r.buffer == buffer_name).map(|(uuid, _)| uuid.clone())
+    }
+
+    /// The side room that is a conversation with exactly this person, if any.
+    pub(super) fn side_room_with(&self, principal: &str) -> Option<(String, String)> {
+        let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        self.rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, r)| {
+                r.kind == RoomKind::Side && {
+                    let others: Vec<&str> = r.members.iter().map(|m| m.uuid.as_str()).filter(|u| *u != me).collect();
+                    others == [principal]
+                }
+            })
+            .map(|(uuid, r)| (uuid.clone(), r.buffer.clone()))
+    }
+
+    /// Somebody, by the name shown for them.
+    pub(super) fn person_named(&self, name: &str) -> Option<Principal> {
+        let name = name.trim().trim_start_matches('@');
+        self.people.lock().unwrap().values().find(|p| p.name.eq_ignore_ascii_case(name)).cloned()
+    }
+
+    /// Everyone known, as (uuid, name) for writing mentions.
+    pub(super) fn known_names(&self) -> Vec<(String, String)> {
+        self.people.lock().unwrap().values().map(|p| (p.uuid.clone(), p.name.clone())).collect()
+    }
+
+    /// The oldest entry held in a room and whether more is before it.
+    pub(super) fn history_cursor(&self, room: &str) -> Option<u64> {
+        self.rooms.lock().unwrap().get(room).and_then(|r| r.first).filter(|f| *f > 1)
+    }
+
+    fn note_first(&self, room: &str, seq: u64) {
+        if let Some(r) = self.rooms.lock().unwrap().get_mut(room) {
+            if r.first.is_none_or(|f| seq < f) {
+                r.first = Some(seq);
+            }
+        }
     }
 }
 
 /// Gets this session admitted to the chat: a ticket from the forum, traded
-/// for the chat's own session cookie.
+/// for the chat's own session cookie. The chat's own page is the one asked
+/// for the ticket's form token, because it also carries what each room lets
+/// this account do and the reactions the site offers.
 pub(super) async fn admit(session: &Session, host: &str) -> Result<()> {
     let base = format!("https://{host}");
-    let page = session.fetch(&format!("{base}/")).await.context("loading the forum")?;
+    let page = session.fetch(&format!("{base}/ephyra-chat/")).await.context("loading the chat page")?;
+    let page = if page.body.contains("data-csrf=\"") { page } else { session.fetch(&format!("{base}/")).await.context("loading the forum")? };
     let token = protocol::attr(&page.body, "data-csrf").context("the forum page carries no form token - its markup may have changed")?;
+    super::catalogue::take_page(&session.http, host, &page.body).await;
     let form = http::encode_form(&[("_xfToken", &token)]);
     let resp = session
         .http
@@ -267,8 +414,9 @@ pub(super) async fn run_connection(state: &AppState, account_id: &str, session: 
                 }
             }
         }
-        for name in chat.rooms.lock().unwrap().values().map(|r| r.name.clone()).collect::<Vec<_>>() {
-            let buffer_id = crate::model::buffer_id(account_id, &room_buffer_name(&name));
+        let buffers: Vec<String> = chat.rooms.lock().unwrap().values().map(|r| r.buffer.clone()).filter(|b| !b.is_empty()).collect();
+        for name in buffers {
+            let buffer_id = crate::model::buffer_id(account_id, &name);
             state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
         }
         tokio::time::sleep(delay).await;
@@ -323,7 +471,7 @@ async fn connect_once(state: &AppState, account_id: &str, chat: &Arc<Chat>, sess
     }
     let _pinger = Abort(pinger);
 
-    let ctx = Ctx { state, account_id, chat, http: &session.http, host, sender: &sender };
+    let ctx = Ctx { state, account_id, chat, session, http: &session.http, host, sender: &sender };
     loop {
         let event = match tokio::time::timeout(IDLE_TIMEOUT, ws.next()).await {
             Ok(Some(e)) => e,
@@ -341,12 +489,13 @@ async fn connect_once(state: &AppState, account_id: &str, chat: &Arc<Chat>, sess
     }
 }
 
-struct Ctx<'a> {
-    state: &'a AppState,
-    account_id: &'a str,
-    chat: &'a Arc<Chat>,
-    http: &'a http::HttpClient,
-    host: &'a str,
+pub(super) struct Ctx<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) account_id: &'a str,
+    pub(super) chat: &'a Arc<Chat>,
+    pub(super) session: &'a Session,
+    pub(super) http: &'a http::HttpClient,
+    pub(super) host: &'a str,
     sender: &'a WsSender,
 }
 
@@ -365,33 +514,40 @@ impl Ctx<'_> {
                     let _ = state.accounts.set_sneedchat_display_name(account_id, &name);
                 }
                 *chat.socket.lock().unwrap() = Some(self.sender.clone());
+                self.set_frozen(frame["link_state"].as_str() == Some("frozen"));
                 super::health::recovered(account_id);
                 let rooms = state.accounts.get_sneedchat(account_id).map(|c| c.rooms).unwrap_or_default();
                 chat.want_rooms(&rooms);
-            }
-            "joined" => {
-                let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
-                let head = frame["head_seq"].as_u64();
-                let name = {
-                    let mut rooms = chat.rooms.lock().unwrap();
-                    let Some(room) = rooms.get_mut(uuid) else { return Ok(()) };
-                    room.joined = true;
-                    room.replay_to = head;
-                    if room.last.is_none() && head == Some(0) {
-                        room.last = Some(0);
+                for room in frame["side_rooms"].as_array().into_iter().flatten() {
+                    if let Some(uuid) = room["chat_room_uuid"].as_str() {
+                        let after = chat.rooms.lock().unwrap().get(uuid).and_then(|r| r.last);
+                        chat.want_side_room(uuid, after);
                     }
-                    room.name.clone()
-                };
-                let buffer = state.runtime.ensure_buffer(state, account_id, &room_buffer_name(&name), "channel");
-                state.runtime.set_buffer_link(state, &buffer.id, None);
-                tracing::info!("sneedchat[{account_id}]: joined #{name}");
+                }
+                let revision = frame["emoticon_revision"].as_str().map(str::to_string);
+                self.refresh_emoticons(revision);
             }
+            "emoticons_changed" => self.refresh_emoticons(frame["emoticon_revision"].as_str().map(str::to_string)),
+            "link_state" => self.set_frozen(frame["state"].as_str() == Some("frozen")),
+            "joined" => self.joined(frame),
             "left" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
-                if let Some(room) = chat.rooms.lock().unwrap().get_mut(uuid) {
-                    room.joined = false;
+                let reason = frame["reason"].as_str().unwrap_or("no reason given").to_string();
+                let buffer = {
+                    let mut rooms = chat.rooms.lock().unwrap();
+                    rooms.get_mut(uuid).map(|room| {
+                        room.joined = false;
+                        (room.buffer.clone(), room.buffer_kind())
+                    })
+                };
+                tracing::info!("sneedchat[{account_id}]: left {uuid} ({reason})");
+                // Put out of a room by the chat rather than leaving it: said in it.
+                if let Some((name, kind)) = buffer.filter(|(b, _)| !b.is_empty()) {
+                    if reason.contains("sanction") || reason.contains("ban") || reason.contains("kick") {
+                        let said = format!("You were removed from this room ({}).", reason.replace('_', " "));
+                        state.runtime.record_message(state, account_id, &name, kind, "", &said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                    }
                 }
-                tracing::info!("sneedchat[{account_id}]: left {uuid} ({})", frame["reason"].as_str().unwrap_or("no reason given"));
             }
             "resync" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default().to_string();
@@ -401,7 +557,39 @@ impl Ctx<'_> {
                 }
                 chat.join(&uuid, None);
             }
-            "entry" | "elided" => self.entry(frame).await,
+            "entry" | "elided" => self.entry(frame, false).await,
+            "own_reactions" => {
+                // The replay is over: what it named holds this reaction of
+                // ours, and anything it covered without naming holds none.
+                let room = frame["chat_room_uuid"].as_str().unwrap_or_default();
+                let named: Vec<(String, String)> = frame["reactions"]
+                    .as_object()
+                    .map(|m| m.iter().filter_map(|(k, v)| Some((k.to_lowercase(), v.as_str()?.to_string()))).collect())
+                    .unwrap_or_default();
+                let buffer = chat.buffer_of(room);
+                {
+                    let mut own = chat.own_reactions.lock().unwrap();
+                    for (message, code) in &named {
+                        own.insert(message.clone(), Some(code.clone()));
+                    }
+                }
+                if let Some((name, _)) = buffer {
+                    let buffer_id = crate::model::buffer_id(account_id, &name);
+                    for (message, _) in named {
+                        self.mark_own(&buffer_id, &message);
+                    }
+                }
+            }
+            "rendered" => {
+                // A row drawn again - its reactions are what can have changed.
+                if let (Some(message), Some(html)) = (frame["chat_message_uuid"].as_str(), frame["html"].as_str()) {
+                    let room = frame["chat_room_uuid"].as_str().map(str::to_string).or_else(|| chat.known(message).map(|k| k.room));
+                    if let Some((name, _)) = room.and_then(|r| chat.buffer_of(&r)) {
+                        let buffer_id = crate::model::buffer_id(account_id, &name);
+                        self.set_reactions(&buffer_id, &message.to_lowercase(), html);
+                    }
+                }
+            }
             "presence" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
                 let principals: Vec<Principal> = frame["principals"].as_array().into_iter().flatten().filter_map(Principal::from_value).collect();
@@ -411,8 +599,8 @@ impl Ctx<'_> {
                         people.insert(p.uuid.clone(), p.clone());
                     }
                 }
-                if let Some(name) = chat.room_name(uuid) {
-                    super::rooms::publish_presence(state, self.http, self.host, account_id, &room_buffer_name(&name), &principals);
+                if let Some((name, _)) = chat.buffer_of(uuid) {
+                    super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &principals);
                 }
             }
             "command_ack" => {
@@ -424,31 +612,115 @@ impl Ctx<'_> {
                 chat.answer(key, result);
             }
             "error" => {
-                let key = frame["ref"].as_str().unwrap_or_default();
+                let key = frame["ref"].as_str().unwrap_or_default().to_lowercase();
                 let code = frame["code"].as_str().unwrap_or("refused").to_string();
-                if !chat.answer(key, Err(code.clone())) {
-                    if let Some(name) = chat.room_name(key) {
+                let answered = chat.answer(&key, Err(code.clone()))
+                    || chat.answer(frame["ref"].as_str().unwrap_or_default(), Err(code.clone()))
+                    || chat.answer(&format!("react:{key}"), Err(code.clone()));
+                if !answered {
+                    if let Some((name, kind)) = chat.buffer_of(&key) {
                         let said = format!("Couldn't join this room: {}.", protocol::describe_error(&code));
-                        state.runtime.record_message(state, account_id, &room_buffer_name(&name), "channel", "", &said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                        state.runtime.record_message(state, account_id, &name, kind, "", &said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                     } else {
                         tracing::warn!("sneedchat[{account_id}]: chat error {code} (ref {key})");
                     }
                 }
-            }
-            "link_state" => {
-                tracing::info!("sneedchat[{account_id}]: chat link {}", frame["state"].as_str().unwrap_or("?"));
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn entry(&self, frame: &Value) {
+    fn refresh_emoticons(&self, revision: Option<String>) {
+        let (state, session, host) = (self.state.clone(), self.session.clone(), self.host.to_string());
+        tokio::spawn(async move { super::catalogue::take_emoticons(&state, &session, &host, revision.as_deref()).await });
+    }
+
+    /// The chat stopped (or started again) taking anything but reads. Said in
+    /// each room once, when it changes.
+    fn set_frozen(&self, frozen: bool) {
+        let was = self.chat.frozen.swap(frozen, Ordering::Relaxed);
+        if was == frozen {
+            return;
+        }
+        let said = if frozen { "The chat is frozen: nothing can be sent until it is back." } else { "The chat is back: messages can be sent again." };
+        let buffers: Vec<(String, &'static str)> = self.chat.rooms.lock().unwrap().values().filter(|r| r.joined && !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind())).collect();
+        for (name, kind) in buffers {
+            self.state.runtime.record_message(self.state, self.account_id, &name, kind, "", said, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+        }
+    }
+
+    fn joined(&self, frame: &Value) {
         let (state, account_id, chat) = (self.state, self.account_id, self.chat);
-        let Some(entry) = Entry::from_value(frame) else { return };
-        // In order, once each: a gap means something was missed, and the
-        // chat replays it on a fresh join from the last seen.
-        let replaying = {
+        let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
+        let head = frame["head_seq"].as_u64();
+        let side = frame["chat_room_kind"].as_str() == Some("side");
+        let members: Vec<Principal> = frame["members"].as_array().into_iter().flatten().filter_map(Principal::from_value).collect();
+        if !members.is_empty() {
+            let mut people = chat.people.lock().unwrap();
+            for p in &members {
+                people.insert(p.uuid.clone(), p.clone());
+            }
+        }
+        let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let (name, kind) = {
+            let mut rooms = chat.rooms.lock().unwrap();
+            let room = match rooms.get_mut(uuid) {
+                Some(r) => r,
+                // A side room nobody here asked for: somebody opened one with us.
+                None if side => rooms.entry(uuid.to_string()).or_insert_with(|| RoomState { kind: RoomKind::Side, ..Default::default() }),
+                None => return,
+            };
+            room.joined = true;
+            room.replay_to = head;
+            if room.last.is_none() && head == Some(0) {
+                room.last = Some(0);
+            }
+            if side {
+                room.kind = RoomKind::Side;
+                if !members.is_empty() {
+                    room.members = members.clone();
+                }
+                if room.buffer.is_empty() {
+                    room.buffer = side_room_name(&room.members, &me, uuid);
+                }
+            }
+            (room.buffer.clone(), room.buffer_kind())
+        };
+        if name.is_empty() {
+            return;
+        }
+        let buffer = state.runtime.ensure_buffer(state, account_id, &name, kind);
+        state.runtime.set_buffer_link(state, &buffer.id, None);
+        if kind == "channel" {
+            if let Some(subtitle) = super::catalogue::subtitle(uuid) {
+                state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
+            }
+        } else {
+            let members: Vec<Principal> = chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default();
+            super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &members);
+        }
+        // Whoever opened a side room with us is waiting on this.
+        for m in chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default() {
+            chat.answer(&format!("side:{}", m.uuid), Ok(()));
+        }
+        tracing::info!("sneedchat[{account_id}]: joined {name}");
+    }
+
+    /// One log entry, live or from a history page (`paged`): history is never
+    /// news, and is not held to the live sequence.
+    pub(super) async fn entry(&self, frame: &Value, paged: bool) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some(mut entry) = Entry::from_value(frame) else { return };
+        if paged && entry.room.is_empty() {
+            entry.room = frame["_room"].as_str().unwrap_or_default().to_string();
+        }
+        let replaying = if paged {
+            chat.note_first(&entry.room, entry.room_seq);
+            true
+        } else {
+            // In order, once each: a gap means something was missed, and the
+            // chat replays it on a fresh join from the last seen.
             let mut rooms = chat.rooms.lock().unwrap();
             let Some(room) = rooms.get_mut(&entry.room) else { return };
             if room.last.is_some_and(|last| entry.room_seq <= last) {
@@ -463,27 +735,86 @@ impl Ctx<'_> {
                 }
             }
             room.last = Some(entry.room_seq);
+            if room.first.is_none_or(|f| entry.room_seq < f) {
+                room.first = Some(entry.room_seq);
+            }
             room.replay_to.is_some_and(|head| entry.room_seq <= head)
         };
         // A post's own echo answers whoever sent it, whatever else it is.
         if let Some(nonce) = &entry.client_nonce {
             chat.answer(nonce, Ok(()));
         }
-        if frame["t"] == "elided" {
+        if frame["t"] == "elided" || frame["elided"].as_bool() == Some(true) {
             return;
         }
-        let Some(name) = chat.room_name(&entry.room) else { return };
-        let buffer_name = room_buffer_name(&name);
+        let Some((buffer_name, buffer_kind)) = chat.buffer_of(&entry.room) else { return };
         let buffer_id = crate::model::buffer_id(account_id, &buffer_name);
         if let (Some(message), Some(seq)) = (&entry.message, entry.state_seq) {
-            chat.remember(message, seq);
+            chat.remember(message, &entry.room, seq);
         }
-        let Some(message) = entry.message.clone() else {
-            if entry.kind == "chat_room_subtitle_set" {
-                state.runtime.set_buffer_topic(state, &buffer_id, entry.subtitle.as_deref().unwrap_or_default());
-            }
-            return;
+        let system = |text: String| {
+            state.runtime.set_replaying(&buffer_id, replaying);
+            let id = frame["entry_uuid"].as_str().map(|e| format!("entry:{e}"));
+            state.runtime.record_message_at(state, account_id, &buffer_name, buffer_kind, "", &text, false, "system", None, id, false, None, Vec::new(), Vec::new(), None, entry.at, None, None);
+            state.runtime.set_replaying(&buffer_id, false);
         };
+        let who = |key: &str| -> String {
+            frame[key]
+                .as_str()
+                .and_then(|u| chat.people.lock().unwrap().get(u).map(|p| p.name.clone()))
+                .or_else(|| frame["display_name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "someone".to_string())
+        };
+        match entry.kind.as_str() {
+            "chat_room_subtitle_set" => {
+                state.runtime.set_buffer_topic(state, &buffer_id, entry.subtitle.as_deref().unwrap_or_default());
+                return;
+            }
+            "chat_side_room_member_added" | "chat_side_room_member_left" => {
+                let added = entry.kind.ends_with("added");
+                let name = who("principal_uuid");
+                if let Some(p) = frame["principal_uuid"].as_str().map(str::to_string) {
+                    let mut rooms = chat.rooms.lock().unwrap();
+                    if let Some(room) = rooms.get_mut(&entry.room) {
+                        if added && !room.members.iter().any(|m| m.uuid == p) {
+                            room.members.push(Principal { uuid: p, name: name.clone(), ..Default::default() });
+                        } else if !added {
+                            room.members.retain(|m| m.uuid != p);
+                        }
+                    }
+                }
+                system(format!("{name} {} the conversation.", if added { "joined" } else { "left" }));
+                return;
+            }
+            "chat_sanction_applied" | "chat_sanction_lifted" => {
+                let applied = entry.kind.ends_with("applied");
+                let target = frame["principal_uuid"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = frame["chat_sanction_uuid"].as_str() {
+                    let mut sanctions = chat.sanctions.lock().unwrap();
+                    if applied {
+                        sanctions.insert(target.clone(), id.to_string());
+                    } else {
+                        sanctions.remove(&target);
+                    }
+                }
+                let kind = frame["sanction_kind"].as_str().unwrap_or("mute");
+                let name = who("principal_uuid");
+                let text = if applied {
+                    let until = frame["expires_at"].as_i64().map(|t| format!(" until {}", chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default())).unwrap_or_default();
+                    format!("{name} was {}{until}.", if kind == "ban" { "banned" } else { "muted" })
+                } else {
+                    format!("{name} is no longer {}.", if kind == "ban" { "banned" } else { "muted" })
+                };
+                system(text);
+                return;
+            }
+            "chat_frozen" => {
+                self.set_frozen(true);
+                return;
+            }
+            _ => {}
+        }
+        let Some(message) = entry.message.clone() else { return };
         match entry.kind.as_str() {
             "chat_message_posted" | "chat_message_restored" => {
                 if entry.row_tombstoned() {
@@ -495,7 +826,7 @@ impl Ctx<'_> {
                     .or_else(|| entry.author.as_ref().and_then(|a| chat.people.lock().unwrap().get(a).cloned()))
                     .unwrap_or_else(|| Principal { uuid: entry.author.clone().unwrap_or_default(), name: "someone".into(), ..Default::default() });
                 chat.people.lock().unwrap().entry(author.uuid.clone()).or_insert_with(|| author.clone());
-                let raw = entry.body.clone().unwrap_or_default();
+                let raw = protocol::mentions_to_names(&entry.body.clone().unwrap_or_default());
                 let (quoted, rest) = protocol::split_reply(&raw);
                 let reply = quoted.map(|q| crate::model::ReplyPreview { id: q.message, from: q.name, body: q.text, ..Default::default() });
                 let body = expand_attachment_paths(rest, self.host).into_owned();
@@ -504,7 +835,7 @@ impl Ctx<'_> {
                 }
                 let me = chat.me.lock().unwrap().clone().unwrap_or_default();
                 let mine = !me.uuid.is_empty() && me.uuid == author.uuid;
-                let highlight = !mine && entry.mentions.iter().any(|m| m == &me.uuid);
+                let highlight = !mine && (entry.mentions.iter().any(|m| m == &me.uuid) || buffer_kind == "query");
                 if entry.kind == "chat_message_restored" && state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]) {
                     return;
                 }
@@ -517,7 +848,7 @@ impl Ctx<'_> {
                     state,
                     account_id,
                     &buffer_name,
-                    "channel",
+                    buffer_kind,
                     &author.name,
                     &body,
                     false,
@@ -534,21 +865,145 @@ impl Ctx<'_> {
                     None,
                 );
                 state.runtime.set_replaying(&buffer_id, false);
+                if let Some(html) = &entry.html {
+                    self.set_reactions(&buffer_id, &message, html);
+                }
                 if is_new {
                     spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
                 }
             }
             "chat_message_revised" => {
                 if let Some(raw) = &entry.body {
-                    let (_, rest) = protocol::split_reply(raw);
+                    let raw = protocol::mentions_to_names(raw);
+                    let (_, rest) = protocol::split_reply(&raw);
                     let body = expand_attachment_paths(rest, self.host).into_owned();
                     state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]);
+                }
+            }
+            "chat_message_reaction_set" => {
+                let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+                if frame["principal_uuid"].as_str().is_some_and(|p| p == me) {
+                    let code = frame["reaction_code"].as_str().map(str::to_string);
+                    chat.own_reactions.lock().unwrap().insert(message.clone(), code);
+                    chat.answer(&format!("react:{message}"), Ok(()));
+                }
+                match &entry.html {
+                    Some(html) => self.set_reactions(&buffer_id, &message, html),
+                    None => self.adjust_reaction(&buffer_id, &message, frame),
                 }
             }
             "chat_message_tombstoned" | "chat_message_purged" => state.runtime.delete_message(state, &buffer_id, &message),
             _ => {}
         }
     }
+
+    /// A message's reactions as its rendered row tallies them, with ours marked.
+    fn set_reactions(&self, buffer_id: &str, message: &str, html: &str) {
+        let chips = protocol::chips(html);
+        let own = self.chat.own_reaction(message);
+        let held = self.state.store.get_message(buffer_id, message).ok().flatten().map(|m| m.reactions).unwrap_or_default();
+        if chips.is_empty() && held.is_empty() {
+            return;
+        }
+        let reactions: Vec<crate::model::Reaction> = chips
+            .into_iter()
+            .map(|(code, count)| crate::model::Reaction { emoji: super::catalogue::reaction_token(&code), count, me: own.as_deref() == Some(code.as_str()), animated: false })
+            .collect();
+        if self.state.store.set_reactions(buffer_id, message, &reactions).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": reactions }));
+        }
+    }
+
+    /// A reaction change with no row to read: one person's reaction moved, so
+    /// one tally goes down and another up.
+    fn adjust_reaction(&self, buffer_id: &str, message: &str, frame: &Value) {
+        let Some(stored) = self.state.store.get_message(buffer_id, message).ok().flatten() else { return };
+        let mut held = stored.reactions;
+        let me = self.chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let mine = frame["principal_uuid"].as_str() == Some(me.as_str());
+        if let Some(previous) = frame["previous_reaction_code"].as_str() {
+            let token = super::catalogue::reaction_token(previous);
+            if let Some(r) = held.iter_mut().find(|r| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(previous)) {
+                r.count -= 1;
+                r.emoji = token;
+                if mine {
+                    r.me = false;
+                }
+            }
+        }
+        if let Some(code) = frame["reaction_code"].as_str() {
+            match held.iter_mut().find(|r| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(code)) {
+                Some(r) => {
+                    r.count += 1;
+                    r.me |= mine;
+                }
+                None => held.push(crate::model::Reaction { emoji: super::catalogue::reaction_token(code), count: 1, me: mine, animated: false }),
+            }
+        }
+        held.retain(|r| r.count > 0);
+        if self.state.store.set_reactions(buffer_id, message, &held).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": held }));
+        }
+    }
+
+    /// Marks our own reaction on a message whose tallies are already held.
+    fn mark_own(&self, buffer_id: &str, message: &str) {
+        let Some(stored) = self.state.store.get_message(buffer_id, message).ok().flatten() else { return };
+        let own = self.chat.own_reaction(message);
+        let mut held = stored.reactions;
+        let mut changed = false;
+        for r in held.iter_mut() {
+            let me = own.as_deref().is_some_and(|c| super::catalogue::reaction_code(&r.emoji).as_deref() == Some(c));
+            if r.me != me {
+                r.me = me;
+                changed = true;
+            }
+        }
+        if changed && self.state.store.set_reactions(buffer_id, message, &held).unwrap_or(false) {
+            self.state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": message, "reactions": held }));
+        }
+    }
+}
+
+/// What a side room is called: the other people in it, by name.
+fn side_room_name(members: &[Principal], me: &str, uuid: &str) -> String {
+    let others: Vec<&str> = members.iter().filter(|m| m.uuid != me).map(|m| m.name.as_str()).filter(|n| !n.is_empty()).collect();
+    if others.is_empty() {
+        format!("whisper-{}", &uuid[uuid.len().saturating_sub(6)..])
+    } else {
+        others.join(", ")
+    }
+}
+
+/// Reads the page of a room's log before the oldest entry held, as history:
+/// no alerts, the same messages as ever.
+pub(super) async fn older(state: &AppState, account_id: &str, buffer_name: &str) -> Result<()> {
+    let chat = chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("not one of this account's rooms"))?;
+    let Some(before) = chat.history_cursor(&room) else { return Ok(()) };
+    let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let host = chat.host.lock().unwrap().clone();
+    let page = api_get(&session, &host, &format!("rooms/{room}/log?before={before}&limit=100&unit=messages")).await?;
+    let sender = chat.socket().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
+    let ctx = Ctx { state, account_id, chat: &chat, session: &session, http: &session.http, host: &host, sender: &sender };
+    let entries = page["entries"].as_array().cloned().unwrap_or_default();
+    if let Some(own) = page["own_reactions"].as_object() {
+        let mut held = chat.own_reactions.lock().unwrap();
+        for (k, v) in own {
+            held.insert(k.to_lowercase(), v.as_str().map(str::to_string));
+        }
+    }
+    for mut e in entries {
+        e["_room"] = json!(room);
+        ctx.entry(&e, true).await;
+    }
+    // Nothing older than this page: paging stops here.
+    if page["page"]["prev_before"].is_null() {
+        if let Some(r) = chat.rooms.lock().unwrap().get_mut(&room) {
+            r.first = Some(1);
+        }
+    }
+    Ok(())
 }
 
 /// A picture's address on the host this account uses.
@@ -558,6 +1013,16 @@ impl Ctx<'_> {
 /// host is no use on another. The page itself does the same swap
 /// (`data-chat-image-origins`).
 pub(super) fn mirrored(url: &str, host: &str) -> String {
+    // Through Tor the account is on the onion, which serves the forum's own
+    // files (pictures included) under its own name.
+    if host.ends_with(".onion") {
+        for clear in ["https://kiwifarms.net/", "https://kiwifarms.st/"] {
+            if let Some(rest) = url.strip_prefix(clear) {
+                return format!("https://{host}/{rest}");
+            }
+        }
+        return url.to_string();
+    }
     if host == "kiwifarms.net" || !host.starts_with("kiwifarms.") {
         return url.to_string();
     }
@@ -580,19 +1045,43 @@ mod tests {
         assert_eq!(mirrored("https://kiwifarms.net/data/avatars/m/7/7421.jpg?1", "kiwifarms.st"), "https://kiwifarms.st/data/avatars/m/7/7421.jpg?1");
         assert_eq!(mirrored("https://uploads.kiwifarms.net/a.png", "kiwifarms.st"), "https://uploads.kiwifarms.st/a.png");
         assert_eq!(mirrored("https://example.com/a.png", "kiwifarms.st"), "https://example.com/a.png");
-        // The onion has no mirror of its own named here: left alone.
-        assert_eq!(mirrored("https://kiwifarms.net/a.png", "abc.onion"), "https://kiwifarms.net/a.png");
+        // Through Tor, the forum's own files come from the onion.
+        assert_eq!(mirrored("https://kiwifarms.net/data/a.png", "abc.onion"), "https://abc.onion/data/a.png");
+        assert_eq!(mirrored("https://uploads.kiwifarms.net/a.png", "abc.onion"), "https://uploads.kiwifarms.net/a.png");
     }
 
     #[test]
-    fn wanting_rooms_tracks_them_by_uuid() {
+    fn wanting_rooms_tracks_listed_rooms_by_uuid_and_keeps_side_rooms() {
         let chat = Chat::default();
         let room = |id: &str, name: &str| SneedChatRoom { id: id.into(), name: name.into() };
         chat.want_rooms(&[room("01a1f0f8-2d29-7ac3-b779-b3b0904d6dd6", "fishtank"), room("16", "old")]);
         // A room still under an old number is not tracked until it has a uuid.
         assert_eq!(chat.rooms.lock().unwrap().len(), 1);
         assert_eq!(chat.room_of_buffer("#fishtank").as_deref(), Some("01a1f0f8-2d29-7ac3-b779-b3b0904d6dd6"));
+        chat.want_side_room("side-1", None);
         chat.want_rooms(&[]);
-        assert!(chat.rooms.lock().unwrap().is_empty());
+        // The listed room goes; the side room is the chat's, and stays.
+        let rooms = chat.rooms.lock().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms.contains_key("side-1"));
+    }
+
+    #[test]
+    fn a_side_room_is_named_for_the_others_in_it() {
+        let p = |u: &str, n: &str| Principal { uuid: u.into(), name: n.into(), ..Default::default() };
+        assert_eq!(side_room_name(&[p("me", "Ancient Pioneer"), p("u2", "Ryo Ma")], "me", "abcdef-123456"), "Ryo Ma");
+        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B"), p("u3", "C")], "me", "x"), "B, C");
+        assert_eq!(side_room_name(&[p("me", "A")], "me", "abcdef-123456"), "whisper-123456");
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_for_good_says_why() {
+        let chat = Chat::default();
+        // Without a socket nothing can go out: said, not hung on.
+        let err = chat.command("op-1", json!({ "t": "revise", "chat_operation_uuid": "op-1" })).await.unwrap_err();
+        assert!(format!("{err:#}").contains("not connected"));
+        chat.frozen.store(true, Ordering::Relaxed);
+        let err = chat.command("op-2", json!({ "t": "revise", "chat_operation_uuid": "op-2" })).await.unwrap_err();
+        assert!(format!("{err:#}").contains("frozen"));
     }
 }

@@ -156,17 +156,21 @@ pub(super) fn room_name_of(buffer_name: &str) -> &str {
     buffer_name.strip_prefix('#').unwrap_or(buffer_name)
 }
 
+/// One member as published: name, picture, and the group they are listed
+/// under (their highest badge, "staff"), which the client shows as a prefix.
+type Member = (String, Option<String>, Option<String>);
+
 /// Publishes who is in a room, as a `presence` frame lists them - the whole
 /// list each time.
 pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient, host: &str, account_id: &str, buffer_name: &str, principals: &[Principal]) {
     let buffer_id = crate::model::buffer_id(account_id, buffer_name);
     let before = published_roster(state, &buffer_id);
-    let by_id: std::collections::BTreeMap<String, (String, Option<String>)> = principals
+    let by_id: std::collections::BTreeMap<String, Member> = principals
         .iter()
         .map(|p| {
             // Whatever picture they already had stays until a new one is fetched.
-            let known = before.get(&p.uuid).and_then(|(_, a)| a.clone());
-            (p.uuid.clone(), (p.name.clone(), known))
+            let known = before.get(&p.uuid).and_then(|(_, a, _)| a.clone());
+            (p.uuid.clone(), (p.name.clone(), known, super::catalogue::member_group(&p.badges)))
         })
         .collect();
     publish_roster(state, &buffer_id, &by_id);
@@ -175,7 +179,7 @@ pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient,
     // the first time, and neither the list nor the room should wait for it.
     let wanted: Vec<(String, String)> = principals
         .iter()
-        .filter(|p| before.get(&p.uuid).and_then(|(_, a)| a.as_ref()).is_none())
+        .filter(|p| before.get(&p.uuid).and_then(|(_, a, _)| a.as_ref()).is_none())
         .filter_map(|p| Some((p.uuid.clone(), super::chat::mirrored(p.avatar.as_deref()?, host))))
         .collect();
     if !wanted.is_empty() {
@@ -186,8 +190,8 @@ pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient,
     }
 }
 
-/// The roster as last published: who is there, and the picture each has.
-fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+/// The roster as last published: who is there, their picture and group.
+fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, Member> {
     state
         .runtime
         .get_presence(buffer_id)
@@ -198,7 +202,8 @@ fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTre
             let id = m.get("userId")?.as_str()?.to_string();
             let nick = m.get("nick")?.as_str()?.to_string();
             let avatar = m.get("avatarUrl").and_then(|a| a.as_str()).map(str::to_string);
-            Some((id, (nick, avatar)))
+            let group = m.get("prefix").and_then(|a| a.as_str()).filter(|p| !p.is_empty()).map(str::to_string);
+            Some((id, (nick, avatar, group)))
         })
         .collect()
 }
@@ -223,15 +228,16 @@ async fn add_pictures(state: &AppState, http: &super::http::HttpClient, host: &s
     }
 }
 
-/// Orders and publishes a roster: sorted here rather than left to the client,
-/// since every other backend hands over a sorted one and a five-hundred-name
-/// list in map order would be unreadable.
-fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, (String, Option<String>)>) {
-    let mut members: Vec<(&String, &(String, Option<String>))> = by_id.iter().collect();
-    members.sort_by(|(_, (a, _)), (_, (b, _))| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+/// Orders and publishes a roster: by group (the page's order, highest first),
+/// then by name - the order the site's own list has.
+fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, Member>) {
+    let groups = super::catalogue::member_groups();
+    let rank = |g: &Option<String>| g.as_ref().and_then(|g| groups.iter().position(|x| x == g)).unwrap_or(groups.len());
+    let mut members: Vec<(&String, &Member)> = by_id.iter().collect();
+    members.sort_by(|(_, (a, _, ga)), (_, (b, _, gb))| rank(ga).cmp(&rank(gb)).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members
         .into_iter()
-        .map(|(id, (nick, avatar))| serde_json::json!({ "nick": nick, "userId": id, "prefix": "", "away": false, "avatarUrl": avatar }))
+        .map(|(id, (nick, avatar, group))| serde_json::json!({ "nick": nick, "userId": id, "prefix": group.clone().unwrap_or_default(), "away": false, "avatarUrl": avatar }))
         .collect::<Vec<_>>());
     // Persisted as well as broadcast, so a client that subscribes later gets
     // the roster from subscribe's replay rather than waiting for the next one.
@@ -298,6 +304,12 @@ mod tests {
         let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
         let names: Vec<&str> = list.as_array().unwrap().iter().map(|m| m["nick"].as_str().unwrap()).collect();
         assert_eq!(names, ["Amy", "bob"]);
+        // Staff first, marked, then everybody by name.
+        let staff = Principal { uuid: "3".into(), name: "zed".into(), badges: vec!["hidden".into(), "staff".into()], ..Default::default() };
+        publish_presence(&state, &http, "example.invalid", "sneedchat:t", "#fishtank", &[p("2", "bob"), p("1", "Amy"), staff]);
+        let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
+        let shown: Vec<(&str, &str)> = list.as_array().unwrap().iter().map(|m| (m["nick"].as_str().unwrap(), m["prefix"].as_str().unwrap())).collect();
+        assert_eq!(shown, [("zed", "staff"), ("Amy", ""), ("bob", "")]);
         publish_presence(&state, &http, "example.invalid", "sneedchat:t", "#fishtank", &[p("2", "bob")]);
         let list = state.runtime.get_presence(&crate::model::buffer_id("sneedchat:t", "#fishtank")).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);

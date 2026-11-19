@@ -129,6 +129,95 @@ impl Entry {
     }
 }
 
+/// The reaction tallies a rendered row shows: `(code, count)` for each
+/// `[data-reaction-code][data-count]` chip in its `[data-chat-reactions]`.
+pub fn chips(html: &str) -> Vec<(String, i64)> {
+    let Some(start) = html.find("data-chat-reactions") else { return Vec::new() };
+    let list = &html[start..];
+    let list = &list[..list.find("</ul>").unwrap_or(list.len())];
+    let mut out = Vec::new();
+    let mut rest = list;
+    while let Some(at) = rest.find("data-reaction-code=\"") {
+        let tag_start = rest[..at].rfind('<').unwrap_or(0);
+        let tail = &rest[tag_start..];
+        let end = tail.find('>').unwrap_or(tail.len());
+        let tag = &tail[..end];
+        if let (Some(code), Some(count)) = (attr(tag, "data-reaction-code"), attr(tag, "data-count").and_then(|c| c.parse::<i64>().ok())) {
+            if count > 0 && !out.iter().any(|(c, _)| c == &code) {
+                out.push((code, count));
+            }
+        }
+        rest = &tail[end.max(1)..];
+    }
+    out
+}
+
+/// A mention as the chat writes it, `[user=<uuid>]Name[/user]`, read back as
+/// the `@Name` a person types and reads.
+pub fn mentions_to_names(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find("[user=") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let parsed = tail.find(']').and_then(|close| {
+            let inner = &tail[close + 1..];
+            let end = inner.find("[/user]")?;
+            Some((inner[..end].to_string(), close + 1 + end + "[/user]".len()))
+        });
+        match parsed {
+            Some((name, used)) => {
+                out.push('@');
+                out.push_str(name.trim_start_matches('@'));
+                rest = &tail[used..];
+            }
+            None => {
+                out.push_str("[user=");
+                rest = &tail["[user=".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `@Name` written the way the chat reads a mention, for every name it knows:
+/// the longest known name wins, so "@Ryo Ma" is not taken for "@Ryo".
+pub fn names_to_mentions(body: &str, people: &[(String, String)]) -> String {
+    let mut known: Vec<&(String, String)> = people.iter().filter(|(_, name)| !name.is_empty()).collect();
+    known.sort_by_key(|(_, name)| std::cmp::Reverse(name.chars().count()));
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        // Only at a word's start: an address like a@b is not a mention.
+        let starts_word = out.chars().last().is_none_or(|c| c.is_whitespace() || "([{,".contains(c));
+        let hit = starts_word
+            .then(|| {
+                known.iter().find(|(_, name)| {
+                    after.len() >= name.len()
+                        && after.is_char_boundary(name.len())
+                        && after[..name.len()].eq_ignore_ascii_case(name)
+                        && after[name.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                })
+            })
+            .flatten();
+        match hit {
+            Some((uuid, name)) => {
+                out.push_str(&format!("[user={uuid}]{name}[/user]"));
+                rest = &after[name.len()..];
+            }
+            None => {
+                out.push('@');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A message's reply, which Ephyra writes the way XenForo does: the message
 /// opens with a quote of the one it answers, attributed
 /// `[quote="Name, chat_message: <uuid>"]`. Split off here so the reply can
@@ -400,6 +489,26 @@ mod tests {
     fn attributes_are_whole_names() {
         assert_eq!(attr("<li data-room-seq=\"1\" seq=\"2\">", "seq").as_deref(), Some("2"));
         assert_eq!(attr("<li x=\"1\">", "seq"), None);
+    }
+
+    #[test]
+    fn reaction_chips_are_read_off_the_row() {
+        let html = r#"<li><div class="chat-body">x</div><ul data-chat-reactions><li><span data-reaction-code="reaction_2" data-count="3"><img src="a.svg" alt="Agree"></span></li><li><span data-reaction-code="reaction_1" data-count="1"></span></li></ul></li>"#;
+        assert_eq!(chips(html), vec![("reaction_2".to_string(), 3), ("reaction_1".to_string(), 1)]);
+        assert!(chips("<ul data-chat-reactions></ul>").is_empty());
+        assert!(chips("<li>no list</li>").is_empty());
+    }
+
+    #[test]
+    fn mentions_go_both_ways() {
+        assert_eq!(mentions_to_names("hi [user=019e-1]Ryo Ma[/user], ok"), "hi @Ryo Ma, ok");
+        assert_eq!(mentions_to_names("[user=broken"), "[user=broken");
+        let people = vec![("u1".to_string(), "Ryo".to_string()), ("u2".to_string(), "Ryo Ma".to_string())];
+        assert_eq!(names_to_mentions("@ryo ma hello @Ryo!", &people), "[user=u2]Ryo Ma[/user] hello [user=u1]Ryo[/user]!");
+        // Not a mention: inside a word, or nobody of that name.
+        assert_eq!(names_to_mentions("mail me@ryo and @Nobody", &people), "mail me@ryo and @Nobody");
+        // "@Ryox" is not "@Ryo".
+        assert_eq!(names_to_mentions("@Ryox", &people), "@Ryox");
     }
 
     #[test]
