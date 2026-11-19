@@ -71,6 +71,9 @@ struct RoomState {
     kind: RoomKind,
     /// A side room's members, ourselves included.
     members: Vec<Principal>,
+    /// A side room with more than one other person in it: a group chat,
+    /// shown with its member list, rather than a direct message.
+    group: bool,
     last: Option<u64>,
     /// The oldest entry held, where history paging continues from.
     first: Option<u64>,
@@ -82,8 +85,14 @@ impl RoomState {
     fn buffer_kind(&self) -> &'static str {
         match self.kind {
             RoomKind::Listed => "channel",
-            RoomKind::Side => "query",
+            RoomKind::Side if self.group => "channel",
+            RoomKind::Side => "dm",
         }
+    }
+
+    /// Whether a side room has more than one other person in it.
+    fn is_group(members: &[Principal], me: &str) -> bool {
+        members.iter().filter(|m| m.uuid != me).count() > 1
     }
 }
 
@@ -634,6 +643,20 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// A side room shown as what it is: a direct message with one other
+    /// person, or - with more - a group chat under its own heading, with its
+    /// member list. Called when it is joined and whenever its members change.
+    fn settle_side_room(&self, uuid: &str) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some((name, kind, members)) = chat.rooms.lock().unwrap().get(uuid).filter(|r| r.kind == RoomKind::Side && !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.buffer_kind(), r.members.clone())) else {
+            return;
+        };
+        let buffer_id = crate::model::buffer_id(account_id, &name);
+        state.runtime.set_buffer_kind(state, &buffer_id, kind);
+        state.runtime.set_buffer_category(state, &buffer_id, (kind == "channel").then_some("Group chats"), 0);
+        super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &members);
+    }
+
     fn refresh_emoticons(&self, revision: Option<String>) {
         let (state, session, host) = (self.state.clone(), self.session.clone(), self.host.to_string());
         tokio::spawn(async move { super::catalogue::take_emoticons(&state, &session, &host, revision.as_deref()).await });
@@ -684,6 +707,7 @@ impl Ctx<'_> {
                 if !members.is_empty() {
                     room.members = members.clone();
                 }
+                room.group = RoomState::is_group(&room.members, &me);
                 if room.buffer.is_empty() {
                     room.buffer = side_room_name(&room.members, &me, uuid);
                 }
@@ -695,13 +719,10 @@ impl Ctx<'_> {
         }
         let buffer = state.runtime.ensure_buffer(state, account_id, &name, kind);
         state.runtime.set_buffer_link(state, &buffer.id, None);
-        if kind == "channel" {
-            if let Some(subtitle) = super::catalogue::subtitle(uuid) {
-                state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
-            }
-        } else {
-            let members: Vec<Principal> = chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default();
-            super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &members);
+        if side {
+            self.settle_side_room(uuid);
+        } else if let Some(subtitle) = super::catalogue::subtitle(uuid) {
+            state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
         }
         // Whoever opened a side room with us is waiting on this.
         for m in chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default() {
@@ -777,16 +798,22 @@ impl Ctx<'_> {
                 let added = entry.kind.ends_with("added");
                 let name = who("principal_uuid");
                 if let Some(p) = frame["principal_uuid"].as_str().map(str::to_string) {
+                    let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
                     let mut rooms = chat.rooms.lock().unwrap();
                     if let Some(room) = rooms.get_mut(&entry.room) {
                         if added && !room.members.iter().any(|m| m.uuid == p) {
-                            room.members.push(Principal { uuid: p, name: name.clone(), ..Default::default() });
+                            let known = chat.people.lock().unwrap().get(&p).cloned();
+                            room.members.push(known.unwrap_or(Principal { uuid: p, name: name.clone(), ..Default::default() }));
                         } else if !added {
                             room.members.retain(|m| m.uuid != p);
                         }
+                        room.group = RoomState::is_group(&room.members, &me);
                     }
                 }
                 system(format!("{name} {} the conversation.", if added { "joined" } else { "left" }));
+                if !replaying {
+                    self.settle_side_room(&entry.room);
+                }
                 return;
             }
             "chat_sanction_applied" | "chat_sanction_lifted" => {
@@ -838,7 +865,7 @@ impl Ctx<'_> {
                 }
                 let me = chat.me.lock().unwrap().clone().unwrap_or_default();
                 let mine = !me.uuid.is_empty() && me.uuid == author.uuid;
-                let highlight = !mine && (entry.mentions.iter().any(|m| m == &me.uuid) || buffer_kind == "query");
+                let highlight = !mine && (entry.mentions.iter().any(|m| m == &me.uuid) || buffer_kind == "dm");
                 if entry.kind == "chat_message_restored" && state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]) {
                     return;
                 }
@@ -1067,6 +1094,17 @@ mod tests {
         let rooms = chat.rooms.lock().unwrap();
         assert_eq!(rooms.len(), 1);
         assert!(rooms.contains_key("side-1"));
+    }
+
+    #[test]
+    fn a_side_room_with_several_others_is_a_group_chat() {
+        let p = |u: &str| Principal { uuid: u.into(), name: u.into(), ..Default::default() };
+        let mut room = RoomState { kind: RoomKind::Side, ..Default::default() };
+        room.group = RoomState::is_group(&[p("me"), p("a")], "me");
+        assert_eq!(room.buffer_kind(), "dm");
+        room.group = RoomState::is_group(&[p("me"), p("a"), p("b")], "me");
+        assert_eq!(room.buffer_kind(), "channel");
+        assert_eq!(RoomState::default().buffer_kind(), "channel");
     }
 
     #[test]
