@@ -58,6 +58,11 @@ pub struct Room {
     pub own_affiliation: String,
     /// Our own occupant id in this room, which marks our messages whatever we are called.
     pub own_occupant_id: Option<String>,
+    /// The name our own messages arrive under when it is not the nick the room gave us in presence. kiwifarms joins us as our
+    /// handle and then speaks for us as `u` plus an id; learned from the first echo that matches something we just sent.
+    pub alias: Option<String>,
+    /// What was just sent into the room and not yet seen come back: (text, when).
+    pub pending: Vec<(String, std::time::Instant)>,
     /// The first subject has been seen (what comes with the history is the room's state, not a change).
     pub subject_seen: bool,
     /// What the room is like has been said in its conversation, once.
@@ -436,6 +441,15 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         let before = r.occupants.get(&nick).map(|o| (o.role.clone(), o.affiliation.clone()));
         let new = before.is_none();
         if is_self {
+            // The nick the room says we hold, which is not always the one we
+            // asked for: XEP-0045 lets a service change it, and kiwifarms
+            // does - we ask for our handle and are `u` plus an id. The
+            // room's own copy of our messages comes from that name, so
+            // keeping the requested one made every message we sent look like
+            // somebody else's, and the pending row never settled.
+            if r.nick != nick {
+                r.nick = nick.clone();
+            }
             r.own_role = occupant.role.clone();
             r.own_affiliation = occupant.affiliation.clone();
             r.own_occupant_id = occupant.occupant_id.clone();
@@ -600,12 +614,23 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
         }
         return;
     }
-    let (own_nick, own_oid) = {
-        let s = handle.session();
-        s.rooms.get(&room).map(|r| (r.nick.clone(), r.own_occupant_id.clone())).unwrap_or_default()
-    };
     let oid = occupant_id_of(&message.payloads, &room);
-    let is_own = nick == own_nick || (oid.is_some() && oid == own_oid);
+    let (own_nick, is_own) = {
+        let mut s = handle.session();
+        let Some(r) = s.rooms.get_mut(&room) else { return };
+        let mut own = nick == r.nick || (oid.is_some() && oid == r.own_occupant_id) || r.alias.as_deref() == Some(nick.as_str());
+        if !own && matches!(origin, Origin::Live) {
+            // Not under a name we know: it is still ours if it is what we just sent. Then that name is ours too.
+            r.pending.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(60));
+            let said = p.body.as_deref().map(str::trim);
+            if let Some(i) = r.pending.iter().position(|(text, _)| Some(text.trim()) == said) {
+                r.pending.remove(i);
+                r.alias = Some(nick.clone());
+                own = true;
+            }
+        }
+        (r.nick.clone(), own)
+    };
     let sender_id = match &oid {
         Some(oid) => format!("{room}#{oid}"),
         None => format!("{room}/{nick}"),
