@@ -426,6 +426,9 @@ pub(super) async fn run_connection(state: &AppState, account_id: &str, session: 
 
 async fn connect_once(state: &AppState, account_id: &str, chat: &Arc<Chat>, session: &Session, host: &str, first: bool) -> Result<()> {
     admit(session, host).await?;
+    // The reaction set is read with the chat page; a window that asked
+    // before then got none, and is told to ask again.
+    state.events.emit("sneedchatReactions", json!({}));
     if first {
         super::rooms::settle_rooms(state, account_id, session, host).await;
     }
