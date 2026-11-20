@@ -233,6 +233,12 @@ impl HttpClient {
         Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
     }
 
+    /// Like `request`, for a body that is bytes rather than text - a file.
+    pub async fn request_bytes(&self, method: Method, url: &str, body: Bytes, content_type: &str, extra_headers: &[(&str, &str)]) -> Result<Response> {
+        let (status, headers, bytes) = self.send_once_raw_bytes(method, url, Some(body), Some(content_type), extra_headers).await?;
+        Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
+    }
+
     async fn send_once(&self, method: Method, url: &str, body: Option<String>) -> Result<Response> {
         let (status, headers, bytes) = self.send_once_raw(method, url, body).await?;
         Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })

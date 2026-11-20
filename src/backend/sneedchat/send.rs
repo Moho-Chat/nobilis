@@ -343,7 +343,12 @@ pub async fn send_attachment(
     state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
 
     match host {
-        None | Some(crate::upload::Host::Postimg) => {}
+        // The chat's own hosting is the default: nothing leaves the site, and
+        // it takes video, audio and other files too.
+        None | Some(crate::upload::Host::Native) => {
+            return send_native(account_id, buffer_name, caption, file_path, progress).await;
+        }
+        Some(crate::upload::Host::Postimg) => {}
         Some(host) => {
             return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host, progress).await
         }
@@ -369,6 +374,29 @@ pub async fn send_attachment(
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.
     send_message(state, account_id, buffer_name, &text, None).await
+}
+
+/// Posting a file the chat hosts itself: stored under the room, then written
+/// into the message as the `[file]` tile the chat draws. The tile comes first
+/// and the caption after, as the site's own composer lays them out.
+async fn send_native(account_id: &str, buffer_name: &str, caption: &str, file_path: &str, progress: Option<&crate::upload::Progress>) -> Result<()> {
+    let result = async {
+        let chat = super::chat::chat(account_id);
+        let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+        // Before the upload rather than after it: a file stored for a room that
+        // cannot take the message is a file nobody will see.
+        if !chat.joined(&room) {
+            bail!("not in this room right now - it is still joining");
+        }
+        let stored = super::hosting::store(account_id, &room, file_path, progress).await?;
+        let text = if caption.trim().is_empty() { stored.tag } else { format!("{} {}", stored.tag, caption.trim()) };
+        Ok(text)
+    }
+    .await;
+    if let Some(progress) = progress {
+        progress.done(result.as_ref().err().map(|e: &anyhow::Error| format!("{e:#}")).as_deref());
+    }
+    post(account_id, buffer_name, &result?).await
 }
 
 /// Posting a file that went to one of the shared upload hosts.

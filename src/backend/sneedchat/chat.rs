@@ -54,6 +54,9 @@ pub(super) struct Chat {
     socket: Mutex<Option<WsSender>>,
     pub(super) session: Mutex<Option<Session>>,
     pub(super) host: Mutex<String>,
+    /// The edge's uploads bit: whether the chat's own file hosting is taking
+    /// files right now. None until the chat has said.
+    pub(super) uploads: Mutex<Option<bool>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -562,6 +565,9 @@ impl Ctx<'_> {
                 }
                 *chat.socket.lock().unwrap() = Some(self.sender.clone());
                 self.set_frozen(frame["link_state"].as_str() == Some("frozen"));
+                if let Some(available) = frame["uploads_available"].as_bool() {
+                    *chat.uploads.lock().unwrap() = Some(available);
+                }
                 super::health::recovered(account_id);
                 let rooms = state.accounts.get_sneedchat(account_id).map(|c| c.rooms).unwrap_or_default();
                 chat.want_rooms(&rooms);
@@ -576,6 +582,11 @@ impl Ctx<'_> {
             }
             "emoticons_changed" => self.refresh_emoticons(frame["emoticon_revision"].as_str().map(str::to_string)),
             "link_state" => self.set_frozen(frame["state"].as_str() == Some("frozen")),
+            "uploads" => {
+                if let Some(available) = frame["available"].as_bool() {
+                    *chat.uploads.lock().unwrap() = Some(available);
+                }
+            }
             "joined" => self.joined(frame),
             "left" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
@@ -898,7 +909,11 @@ impl Ctx<'_> {
                 let raw = protocol::mentions_to_names(&entry.body.clone().unwrap_or_default());
                 let (quoted, rest) = protocol::split_reply(&raw);
                 let reply = quoted.map(|q| crate::model::ReplyPreview { id: q.message, from: q.name, body: q.text, ..Default::default() });
-                let body = expand_attachment_paths(rest, self.host).into_owned();
+                // Files the chat hosts arrive as tags; until they are fetched
+                // the message reads as their names.
+                let tiles = entry.html.as_deref().map(media::file_tiles).unwrap_or_default();
+                let rest_with_tags = rest.to_string();
+                let body = expand_attachment_paths(&media::file_tags_as_labels(rest), self.host).into_owned();
                 if body.trim().is_empty() && reply.is_none() {
                     return;
                 }
@@ -938,14 +953,18 @@ impl Ctx<'_> {
                     self.set_reactions(&buffer_id, &message, html);
                 }
                 if is_new {
-                    spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
+                    if tiles.is_empty() {
+                        spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
+                    } else {
+                        spawn_file_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, rest_with_tags, tiles);
+                    }
                 }
             }
             "chat_message_revised" => {
                 if let Some(raw) = &entry.body {
                     let raw = protocol::mentions_to_names(raw);
                     let (_, rest) = protocol::split_reply(&raw);
-                    let body = expand_attachment_paths(rest, self.host).into_owned();
+                    let body = expand_attachment_paths(&media::file_tags_as_labels(rest), self.host).into_owned();
                     state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]);
                 }
             }

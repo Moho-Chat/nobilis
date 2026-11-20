@@ -21,7 +21,8 @@
 //! - `chat` - one websocket per room, and the frames it carries
 //! - `send` - messages, whispers, edits, attachments
 //! - `media` - avatars and attachments, fetched through Tor and cached
-//! - `postimg` - the one upload host, for what the forum will not take
+//! - `hosting` - the chat's own file hosting, where attachments go by default
+//! - `postimg` - an upload host for pictures, when chosen instead
 //! - `auth`, `pow` - getting past the door and staying in
 //! - `form`, `http`, `protocol`, `smilies` - the site's own shapes
 //! - `probes` - live checks against the real site, run by hand
@@ -33,6 +34,7 @@ pub mod catalogue;
 pub mod chat;
 pub mod connect;
 pub mod media;
+pub mod hosting;
 pub mod postimg;
 pub mod probes;
 pub mod rooms;

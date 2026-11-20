@@ -771,6 +771,164 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
     });
 }
 
+/// A file the chat hosts, as a message's rendered row carries it: the tile the
+/// site draws for a `[file=<id>]label[/file]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FileTile {
+    pub uuid: String,
+    pub label: String,
+    /// "image", "video", "audio" or whatever else the chat calls it.
+    pub kind: String,
+    /// The signed address on the chat's host, which is what a fetch needs: the
+    /// signature is the site's, so it is read off the row and never built.
+    pub href: String,
+}
+
+/// Every hosted-file tile in a rendered row, in order.
+pub(super) fn file_tiles(html: &str) -> Vec<FileTile> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = html[from..].find("<a class=\"bbcode-file\"") {
+        let start = from + at;
+        let Some(end) = html[start..].find('>') else { break };
+        let tag = &html[start..start + end];
+        from = start + end;
+        let (Some(uuid), Some(href)) = (protocol::attr(tag, "data-attachment-uuid"), protocol::attr(tag, "href")) else { continue };
+        out.push(FileTile {
+            uuid: uuid.to_ascii_lowercase(),
+            label: protocol::attr(tag, "title").map(|t| protocol::unescape_html(&t)).unwrap_or_default(),
+            kind: protocol::attr(tag, "data-file-kind").unwrap_or_else(|| "file".into()),
+            href: protocol::unescape_html(&href),
+        });
+    }
+    out
+}
+
+/// Writes every `[file=<id>]label[/file]` in a body as whatever `with` says for
+/// it, and leaves the rest as it was.
+pub(super) fn replace_file_tags(body: &str, mut with: impl FnMut(&str, &str) -> String) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("[file=") {
+        let after = &rest[at + 6..];
+        let parsed = after.find(']').and_then(|close| {
+            let id = &after[..close];
+            let tail = &after[close + 1..];
+            let end = tail.find("[/file]")?;
+            (id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| (id, &tail[..end], &tail[end + 7..]))
+        });
+        match parsed {
+            Some((id, label, remainder)) => {
+                out.push_str(&rest[..at]);
+                out.push_str(&with(id, label));
+                rest = remainder;
+            }
+            None => {
+                out.push_str(&rest[..at + 6]);
+                rest = &rest[at + 6..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A body with its file tags written as their labels - what is shown until the
+/// files themselves have been fetched, and for any that cannot be.
+pub(super) fn file_tags_as_labels(body: &str) -> String {
+    replace_file_tags(body, |_, label| label.to_string())
+}
+
+/// The file extension a label ends in, lower-cased, if it looks like one.
+fn label_extension(label: &str) -> Option<String> {
+    let ext = label.rsplit_once('.')?.1.to_ascii_lowercase();
+    (!ext.is_empty() && ext.len() <= 8 && ext.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(ext)
+}
+
+/// Fetches the files a message carries and attaches them.
+///
+/// Like `spawn_attachment_resolve`, its own task: the message is shown at once
+/// with the files' names, and gets its attachments a moment later. A file that
+/// cannot be fetched stays as its name, which is the honest thing to show.
+pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: &str, buffer_id: String, msg_id: String, body: String, tiles: Vec<FileTile>) {
+    if tiles.is_empty() {
+        return;
+    }
+    let host = host.to_string();
+    tokio::spawn(async move {
+        let dir = attachment_cache_dir();
+        let mut attachments = Vec::new();
+        let mut kept = std::collections::HashSet::new();
+        for tile in &tiles {
+            let kind = match tile.kind.as_str() {
+                "image" | "video" | "audio" => tile.kind.as_str(),
+                _ => "file",
+            };
+            let ext = label_extension(&tile.label);
+            // A cached copy, whatever it was named by.
+            let mut local: Option<std::path::PathBuf> = None;
+            let mut found = tokio::fs::read_dir(&dir).await.ok();
+            while let Some(entries) = found.as_mut() {
+                match entries.next_entry().await {
+                    Ok(Some(e)) if e.file_name().to_string_lossy().starts_with(&format!("{}.", tile.uuid)) => {
+                        local = Some(e.path());
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            if local.is_none() {
+                let url = format!("https://{host}{}", tile.href);
+                match tokio::time::timeout(std::time::Duration::from_secs(90), http.get_bytes(&url)).await {
+                    Ok(Ok((status, bytes))) if is_content(status) && !bytes.is_empty() => {
+                        // What the bytes are, not what the label says: the chat's
+                        // own file is checked the way any attachment is, for
+                        // pictures and video, and kept by its label's extension
+                        // otherwise.
+                        let ext = match kind {
+                            "image" | "video" if !is_attachment_media(&bytes) => {
+                                tracing::info!("sneedchat: file {} was not the media it claimed", tile.uuid);
+                                continue;
+                            }
+                            "image" | "video" => sniff_image_ext(&bytes).map(str::to_string).or(ext).unwrap_or_else(|| "bin".into()),
+                            _ => ext.unwrap_or_else(|| "bin".into()),
+                        };
+                        let path = dir.join(format!("{}.{ext}", tile.uuid));
+                        if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
+                            local = Some(path);
+                        }
+                    }
+                    Ok(Ok((status, _))) => tracing::info!("sneedchat: file {} answered HTTP {status}", tile.uuid),
+                    Ok(Err(e)) => tracing::info!("sneedchat: fetching file {}: {e}", tile.uuid),
+                    Err(_) => tracing::info!("sneedchat: file {} fetch timed out", tile.uuid),
+                }
+            }
+            let Some(path) = local else { continue };
+            kept.insert(tile.uuid.clone());
+            attachments.push(crate::model::Attachment {
+                kind: kind.to_string(),
+                filename: Some(tile.label.clone()),
+                path: Some(format!("file://{}", path.display())),
+                ..Default::default()
+            });
+        }
+        if attachments.is_empty() {
+            return;
+        }
+        // The names of what is now attached leave the text; any that could not
+        // be fetched stay in it.
+        let text = replace_file_tags(&body, |id, label| if kept.contains(&id.to_ascii_lowercase()) { String::new() } else { label.to_string() });
+        let text = text.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+        state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, text.trim());
+        if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
+            tracing::debug!("sneedchat: recording files for {msg_id}: {e}");
+            return;
+        }
+        state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "attachments": attachments }));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,5 +1316,37 @@ mod tests {
         assert_eq!(versioned(&gone).await, format!("file://{}#0", gone.display()));
         assert_eq!(avatar_key(&dir, "7"), dir.join("7"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const TILE_ROW: &str = r#"<div class="chat-body"><a class="bbcode-file" title="slobbermutt doggo.png" data-attachment-uuid="01a1f9da-f862-76ba-96aa-cd33035ff4b0" data-file-kind="image" href="/chat/files/01a1f9da-f862-76ba-96aa-cd33035ff4b0.TkL7jNdGgTyvIDRNkh5Zjw/view"><img src="/chat/files/x/thumb"></a> <a class="bbcode-file" title="clip.mp4" data-attachment-uuid="01A1F9C7-4210-73C2-8FAF-3C03D900F209" data-file-kind="video" href="/chat/files/01a1f9c7-4210-73c2-8faf-3c03d900f209.sig/video"><img src="/chat/files/y/poster"></a></div>"#;
+
+    #[test]
+    fn a_rendered_row_lists_its_hosted_files() {
+        let tiles = file_tiles(TILE_ROW);
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(tiles[0].uuid, "01a1f9da-f862-76ba-96aa-cd33035ff4b0");
+        assert_eq!(tiles[0].label, "slobbermutt doggo.png");
+        assert_eq!(tiles[0].kind, "image");
+        assert_eq!(tiles[0].href, "/chat/files/01a1f9da-f862-76ba-96aa-cd33035ff4b0.TkL7jNdGgTyvIDRNkh5Zjw/view");
+        assert_eq!(tiles[1].kind, "video");
+        assert_eq!(tiles[1].uuid, "01a1f9c7-4210-73c2-8faf-3c03d900f209");
+        assert!(file_tiles("<div>nothing</div>").is_empty());
+    }
+
+    #[test]
+    fn file_tags_read_as_their_labels_until_fetched() {
+        let body = "[file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]doggo.png[/file] [color=#b5bd68]>mfw[/color]";
+        assert_eq!(file_tags_as_labels(body), "doggo.png [color=#b5bd68]>mfw[/color]");
+        assert_eq!(file_tags_as_labels("no tags [file=nope]x[/file] here"), "no tags [file=nope]x[/file] here");
+        assert_eq!(file_tags_as_labels("[file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]unclosed"), "[file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]unclosed");
+        let two = "[file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]a.png[/file] [file=01a1f9c7-4210-73c2-8faf-3c03d900f209]b.mp4[/file]";
+        assert_eq!(file_tags_as_labels(two), "a.png b.mp4");
+    }
+
+    #[test]
+    fn a_label_says_its_extension() {
+        assert_eq!(label_extension("Report.PDF").as_deref(), Some("pdf"));
+        assert_eq!(label_extension("noextension"), None);
+        assert_eq!(label_extension("weird.ext with space"), None);
     }
 }

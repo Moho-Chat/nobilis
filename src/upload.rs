@@ -132,6 +132,11 @@ pub enum Host {
     /// Images only, 20MB. Not offered to Sneedchat, where an imgur link does
     /// not embed.
     Imgur,
+    /// The chat's own file hosting, which Ephyra Chat (Kiwi Farms) added: the
+    /// file is stored by the site and posted as a `[file]` tile. Sneedchat's
+    /// default, and meaningless anywhere else - it needs the account's
+    /// signed-in session, so it never goes through `upload_reporting`.
+    Native,
 }
 
 impl Host {
@@ -142,6 +147,7 @@ impl Host {
             "postimg" => Some(Host::Postimg),
             "ibb" | "imgbb" => Some(Host::Ibb),
             "imgur" => Some(Host::Imgur),
+            "native" => Some(Host::Native),
             _ => None,
         }
     }
@@ -153,6 +159,7 @@ impl Host {
             Host::Postimg => "postimg",
             Host::Ibb => "ibb",
             Host::Imgur => "imgur",
+            Host::Native => "native",
         }
     }
 
@@ -163,6 +170,7 @@ impl Host {
             Host::Postimg => "postimg.cc (permanent, images only)",
             Host::Ibb => "ibb.co (permanent, images only, avif and heic too, 32MB)",
             Host::Imgur => "imgur.com (images only, 20MB - removes unused anonymous uploads)",
+            Host::Native => "Kiwi Farms chat's own hosting (any file the chat takes, 25MB)",
         }
     }
 
@@ -208,6 +216,9 @@ impl Host {
             // imgur's own anonymous image cap, from its upload page's script
             // (`R=20971520`).
             Host::Imgur => 20 * 1024 * 1024,
+            // The page states the cap (`data-chat-upload-max-bytes`); this is
+            // what it says today, and the daemon asks the page before sending.
+            Host::Native => 25 * 1024 * 1024,
         }
     }
 
@@ -220,6 +231,8 @@ impl Host {
     pub fn not_for(self) -> &'static [&'static str] {
         match self {
             Host::Imgur => &["sneedchat"],
+            // Only Sneedchat has a hosting of its own to put a file on.
+            Host::Native => &["irc"],
             _ => &[],
         }
     }
@@ -233,7 +246,7 @@ impl Host {
 /// Every host a frontend can offer, so the list of choices lives in one place
 /// rather than being spelled out again in each client that draws a menu.
 pub fn hosts() -> Vec<serde_json::Value> {
-    [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur]
+    [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur, Host::Native]
         .iter()
         .map(|h| {
             serde_json::json!({
@@ -315,6 +328,7 @@ async fn upload_inner(
         Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg_reporting(path, progress).await?.direct),
         Host::Ibb => ibb(file_name, bytes, progress).await,
         Host::Imgur => imgur(file_name, bytes, progress).await,
+        Host::Native => bail!("the chat's own hosting is only for Sneedchat - choose another host"),
     }
 }
 
@@ -672,9 +686,12 @@ mod tests {
         assert_eq!(catbox["imagesOnly"], false);
         let ibb = listed.iter().find(|h| h["id"] == "ibb").expect("ibb listed");
         assert_eq!(ibb["imagesOnly"], true);
-        assert_eq!(listed.len(), 5);
-        // imgur is the one host a service is kept from: Sneedchat does not
-        // embed it.
+        assert_eq!(listed.len(), 6);
+        // The chat's own hosting takes anything and is Sneedchat's alone.
+        let native = listed.iter().find(|h| h["id"] == "native").expect("native listed");
+        assert_eq!(native["imagesOnly"], false);
+        assert_eq!(native["notFor"], serde_json::json!(["irc"]));
+        // imgur is kept from a service too: Sneedchat does not embed it.
         let imgur = listed.iter().find(|h| h["id"] == "imgur").expect("imgur listed");
         assert_eq!(imgur["notFor"], serde_json::json!(["sneedchat"]));
         assert_eq!(catbox["notFor"], serde_json::json!([]));
@@ -682,7 +699,7 @@ mod tests {
 
     #[test]
     fn host_names_round_trip() {
-        for h in [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur] {
+        for h in [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur, Host::Native] {
             assert_eq!(Host::parse(h.id()), Some(h));
         }
         assert_eq!(Host::parse("nowhere"), None);
