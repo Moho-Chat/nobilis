@@ -160,28 +160,6 @@ pub(super) fn remember_session(state: &AppState, account_id: &str, session: &Ses
     }
 }
 
-/// What to say when there is no way in.
-///
-/// The forum's login form carries a verification widget that a client without
-/// a browser cannot answer, so a stored password is no longer a way in by
-/// itself. Said plainly and pointed at the thing that does work, because the
-/// site's own wording ("you did not complete the CAPTCHA verification
-/// properly") reads like something the person did wrong.
-pub(super) fn no_way_in(e: anyhow::Error) -> anyhow::Error {
-    let text = format!("{e:#}");
-    // The captcha on the sign-in form is answered rather than surrendered to
-    // (see captcha.rs), so this is no longer "moho cannot do this" - it is
-    // one attempt that did not work. Which still needs saying in a sentence
-    // that names the way out, because the way out is the same one.
-    if text.to_lowercase().contains("captcha") {
-        return anyhow::anyhow!(
-            "could not get past the sign-in captcha ({text}) - if this keeps happening, \
-             use \"Sign in with a browser\" in Accounts to complete it yourself"
-        );
-    }
-    e
-}
-
 /// How this account's requests reach the site through the web helper:
 /// directly, or by the SOCKS5 address Tor or the proxy listens on.
 ///
@@ -208,15 +186,13 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     let route = browser_route(state, config, account_id).await?;
     let host = config.site_host();
     let session = Session::via_browser(route, format!("https://{host}"));
-    let two_factor = match &config.totp_secret {
-        Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?),
-        None => TwoFactor::None,
-    };
-    let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
 
-    state.runtime.report_progress(state, account_id, "logging in...");
+    state.runtime.report_progress(state, account_id, "signing in...");
     restore_session(&session, config);
-    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
+    if config.cookies.is_empty() {
+        bail!("{}", auth::SIGN_IN_AGAIN);
+    }
+    session.ensure_signed_in().await.context("signing in")?;
     if config.use_tor {
         state.tor.note_success().await;
     }
@@ -237,70 +213,6 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
         }
     }
     let _forget = Forget(account_id.to_string());
-    super::chat::run_connection(state, account_id, &session, &host, &creds, &two_factor).await
+    super::chat::run_connection(state, account_id, &session, &host).await
 }
 
-/// Kicks off a fresh account's first login in the background - unlike
-/// spawn() (used for accounts that already have saved credentials and are
-/// reconnecting), this is what addSneedChatAccount calls, since Tor
-/// bootstrap + login + a possible proof-of-work solve can take anywhere
-/// from instant to over a minute and must not block the RPC response.
-/// Progress/result arrive via sneedChatLoginStatus/sneedChatLoginResult
-/// events tagged with `login_id`, mirroring backend::discord::start_qr_login.
-pub fn start_login(state: AppState, login_id: String, config: SneedChatAccountConfig) {
-    tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_login(&state, &login_id, &config)).catch_unwind().await;
-        let error = match result {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => format!("{e:#}"),
-            Err(_) => "internal error (see nobilis logs)".to_string(),
-        };
-        tracing::warn!("sneedchat login[{login_id}]: {error}");
-        state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
-    });
-}
-
-pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedChatAccountConfig) -> Result<()> {
-    let emit_progress = |msg: &str| {
-        state.events.emit("sneedChatLoginStatus", serde_json::json!({ "loginId": login_id, "detail": msg }));
-    };
-
-    // Saved before anything can fail, not after everything has succeeded.
-    //
-    // This used to persist only on the far side of a successful login, so a
-    // wrong password - or a Tor bootstrap that never completed - threw the
-    // account away along with everything typed into the form. The next
-    // attempt started from an empty form, which is the worst moment to ask
-    // somebody to retype a password: they have just been told it might be
-    // wrong.
-    //
-    // The account id is derived from the username, so re-adding the same
-    // account updates it in place rather than accumulating duplicates, and a
-    // corrected password simply overwrites the stored one. What lands here is
-    // an account that exists, holds what was entered, and is disconnected -
-    // which is exactly the state Connect knows how to retry.
-    state.accounts.add_sneedchat(config.clone())?;
-
-    emit_progress("starting...");
-    let route = browser_route(state, config, &config.account_id()).await?;
-    let session = Session::via_browser(route, format!("https://{}", config.site_host()));
-    let two_factor = match &config.totp_secret {
-        Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?),
-        None => TwoFactor::None,
-    };
-    let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
-
-    emit_progress("logging in...");
-    restore_session(&session, config);
-    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
-
-    let mut saved_config = config.clone();
-    saved_config.cookies = session.http.jar.snapshot();
-    saved_config.user_id = session.user_id();
-    let saved = state.accounts.add_sneedchat(saved_config)?;
-    let account = crate::accounts::sneedchat_account_to_json(&saved, "connecting");
-    spawn(state.clone(), saved);
-
-    state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
-    Ok(())
-}

@@ -428,7 +428,7 @@ pub(super) async fn api_get(session: &Session, host: &str, path: &str) -> Result
 /// Keeps the account's chat connection up, for as long as this task lives:
 /// admitted, connected, its rooms joined - again after every interruption,
 /// refreshing the forum session when the chat stops recognising it.
-pub(super) async fn run_connection(state: &AppState, account_id: &str, session: &Session, host: &str, creds: &Credentials, two_factor: &TwoFactor) -> Result<()> {
+pub(super) async fn run_connection(state: &AppState, account_id: &str, session: &Session, host: &str) -> Result<()> {
     let chat = chat(account_id);
     *chat.session.lock().unwrap() = Some(session.clone());
     *chat.host.lock().unwrap() = host.to_string();
@@ -452,7 +452,7 @@ pub(super) async fn run_connection(state: &AppState, account_id: &str, session: 
             Err(e) => {
                 tracing::warn!("sneedchat[{account_id}]: chat connection: {e:#}");
                 if format!("{e:#}").contains("as a guest") {
-                    if let Err(re) = session.refresh(creds, two_factor).await {
+                    if let Err(re) = session.refresh().await {
                         tracing::warn!("sneedchat[{account_id}]: refreshing the forum session: {re:#}");
                     }
                 }
