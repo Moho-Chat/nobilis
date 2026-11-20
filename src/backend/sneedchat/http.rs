@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::header::{HeaderValue, LOCATION, SET_COOKIE};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -229,7 +231,16 @@ impl HttpClient {
     /// chat's own API, which takes JSON and is asked for JSON. Not redirected:
     /// an API that answers with a redirect has said no.
     pub async fn request(&self, method: Method, url: &str, body: Option<String>, content_type: Option<&str>, extra_headers: &[(&str, &str)]) -> Result<Response> {
-        let (status, headers, bytes) = self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, extra_headers).await?;
+        let (status, headers, bytes) = self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, extra_headers, None).await?;
+        Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
+    }
+
+    /// Like `request`, for a body that is bytes rather than text - a file.
+    ///
+    /// `progress` hears how much of the body has gone out, as it goes; a long
+    /// upload also gets a long wait rather than the helper's default.
+    pub async fn request_bytes(&self, method: Method, url: &str, body: Bytes, content_type: &str, extra_headers: &[(&str, &str)], progress: Option<crate::net::webhelper::UploadFn>) -> Result<Response> {
+        let (status, headers, bytes) = self.send_once_raw_bytes(method, url, Some(body), Some(content_type), extra_headers, progress).await?;
         Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
     }
 
@@ -240,7 +251,7 @@ impl HttpClient {
 
     async fn send_once_raw(&self, method: Method, url: &str, body: Option<String>) -> Result<(u16, hyper::HeaderMap, Bytes)> {
         let content_type = body.is_some().then_some("application/x-www-form-urlencoded");
-        self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, &[]).await
+        self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, &[], None).await
     }
 
     /// The actual connect/handshake/send/read path everything else in this
@@ -253,7 +264,7 @@ impl HttpClient {
     /// otherwise-identical request missing `Origin`/`Referer`, which
     /// Sneedchat's own site never needs, so it isn't part of the fixed
     /// header set below.
-    async fn send_once_raw_bytes(&self, method: Method, url: &str, body: Option<Bytes>, content_type: Option<&str>, extra_headers: &[(&str, &str)]) -> Result<(u16, hyper::HeaderMap, Bytes)> {
+    async fn send_once_raw_bytes(&self, method: Method, url: &str, body: Option<Bytes>, content_type: Option<&str>, extra_headers: &[(&str, &str)], progress: Option<crate::net::webhelper::UploadFn>) -> Result<(u16, hyper::HeaderMap, Bytes)> {
         let parsed = url::Url::parse(url).with_context(|| format!("parsing URL {url}"))?;
         let host = parsed.host_str().context("URL has no host")?.to_string();
         let tls = parsed.scheme() == "https";
@@ -276,7 +287,9 @@ impl HttpClient {
             for (k, v) in extra_headers {
                 headers.push(((*k).into(), (*v).into()));
             }
-            let resp = crate::net::webhelper::request(method.as_str(), url, &headers, body.as_deref(), route.proxy.as_deref()).await?;
+            // A file takes as long as it takes: minutes, not the helper's usual one.
+            let timeout = progress.is_some().then(|| Duration::from_secs(15 * 60));
+            let resp = crate::net::webhelper::request(method.as_str(), url, &headers, body.as_deref(), route.proxy.as_deref(), timeout, progress).await?;
             self.jar.absorb_headers(&resp.headers);
             return Ok((resp.status, resp.headers, resp.body));
         }
@@ -316,7 +329,21 @@ impl HttpClient {
             req = req.header(*name, HeaderValue::from_str(value)?);
         }
 
-        let req = req.body(Full::new(body.unwrap_or_default())).context("building request")?;
+        let body: BoxBody<Bytes, std::io::Error> = match (body, progress) {
+            // Handed over in pieces so each can be counted as it is taken.
+            (Some(bytes), Some(progress)) => {
+                let total = bytes.len() as u64;
+                let mut sent = 0u64;
+                let pieces: Vec<Bytes> = bytes.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
+                BodyExt::boxed(StreamBody::new(futures::stream::iter(pieces.into_iter().map(move |piece| {
+                    sent += piece.len() as u64;
+                    progress(sent, total);
+                    Ok::<_, std::io::Error>(Frame::data(piece))
+                }))))
+            }
+            (body, _) => BodyExt::boxed(Full::new(body.unwrap_or_default()).map_err(|never| match never {})),
+        };
+        let req = req.body(body).context("building request")?;
 
         let resp = sender.send_request(req).await.context("sending request")?;
         self.jar.absorb(&resp);
@@ -357,7 +384,7 @@ impl HttpClient {
         let mut url = url.to_string();
         let mut body_opt = Some(Bytes::from(body));
         for _ in 0..5 {
-            let (status, headers, resp_bytes) = self.send_once_raw_bytes(Method::POST, &url, body_opt.take(), Some(&content_type_header), extra_headers).await?;
+            let (status, headers, resp_bytes) = self.send_once_raw_bytes(Method::POST, &url, body_opt.take(), Some(&content_type_header), extra_headers, None).await?;
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             if !status_code.is_redirection() {
                 return Ok((status, resp_bytes));

@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "nobilis"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",

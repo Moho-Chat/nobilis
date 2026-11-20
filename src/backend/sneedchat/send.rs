@@ -342,8 +342,23 @@ pub async fn send_attachment(
     // the upload - the transport below is deliberately unrelated to it.
     state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
 
+    // The chat's own hosting is the default - nothing leaves the site, and it
+    // takes video, audio and other files too - but the site's front door
+    // refuses uploads for side rooms (whispers, group chats) with a bare 403.
+    // There the file goes to a shared host as it did before the chat hosted
+    // files: postimg for a picture it takes, catbox for anything else.
+    let host = match host {
+        None | Some(crate::upload::Host::Native) if super::chat::chat(account_id).is_side_room(buffer_name) => {
+            let name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            Some(if crate::upload::Host::Postimg.accepts(name) { crate::upload::Host::Postimg } else { crate::upload::Host::Catbox })
+        }
+        other => other,
+    };
     match host {
-        None | Some(crate::upload::Host::Postimg) => {}
+        None | Some(crate::upload::Host::Native) => {
+            return send_native(account_id, buffer_name, caption, file_path, progress).await;
+        }
+        Some(crate::upload::Host::Postimg) => {}
         Some(host) => {
             return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host, progress).await
         }
@@ -369,6 +384,29 @@ pub async fn send_attachment(
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.
     send_message(state, account_id, buffer_name, &text, None).await
+}
+
+/// Posting a file the chat hosts itself: stored under the room, then written
+/// into the message as the `[file]` tile the chat draws. The tile comes first
+/// and the caption after, as the site's own composer lays them out.
+async fn send_native(account_id: &str, buffer_name: &str, caption: &str, file_path: &str, progress: Option<&crate::upload::Progress>) -> Result<()> {
+    let result = async {
+        let chat = super::chat::chat(account_id);
+        let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+        // Before the upload rather than after it: a file stored for a room that
+        // cannot take the message is a file nobody will see.
+        if !chat.joined(&room) {
+            bail!("not in this room right now - it is still joining");
+        }
+        let stored = super::hosting::store(account_id, &room, file_path, progress).await?;
+        let text = if caption.trim().is_empty() { stored.tag } else { format!("{} {}", stored.tag, caption.trim()) };
+        Ok(text)
+    }
+    .await;
+    if let Some(progress) = progress {
+        progress.done(result.as_ref().err().map(|e: &anyhow::Error| format!("{e:#}")).as_deref());
+    }
+    post(account_id, buffer_name, &result?).await
 }
 
 /// Posting a file that went to one of the shared upload hosts.

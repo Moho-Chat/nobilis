@@ -94,9 +94,14 @@ pub enum WsEvent {
     Closed(u16, String),
 }
 
+/// Told how much of a request's body has gone out: sent so far, and the total.
+pub type UploadFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 struct Proc {
     writer: mpsc::UnboundedSender<String>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    /// Who hears how an upload is going, by the request's id.
+    uploads: Mutex<HashMap<u64, UploadFn>>,
     sockets: Mutex<HashMap<u64, mpsc::UnboundedSender<WsEvent>>>,
     /// Events for a socket the caller has not taken yet: its `open` follows
     /// the answer naming it straight away, before `ws_open` can register it.
@@ -110,17 +115,30 @@ impl Proc {
         *self.last_used.lock().unwrap() = Instant::now();
     }
 
-    async fn call(&self, mut msg: Value) -> Result<Value> {
+    async fn call(&self, msg: Value) -> Result<Value> {
+        self.call_with(msg, None).await
+    }
+
+    /// A call whose progress is reported: the helper says how far the body has
+    /// got as it goes, to `progress`.
+    async fn call_with(&self, mut msg: Value, progress: Option<UploadFn>) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         msg["id"] = json!(id);
+        if let Some(progress) = progress {
+            msg["progress"] = json!(true);
+            self.uploads.lock().unwrap().insert(id, progress);
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         self.touch();
         if self.writer.send(msg.to_string()).is_err() {
             self.pending.lock().unwrap().remove(&id);
+            self.uploads.lock().unwrap().remove(&id);
             bail!("the web helper has stopped");
         }
-        let answer = rx.await.map_err(|_| anyhow!("the web helper stopped before answering"))?;
+        let answer = rx.await.map_err(|_| anyhow!("the web helper stopped before answering"));
+        self.uploads.lock().unwrap().remove(&id);
+        let answer = answer?;
         self.touch();
         if answer["ok"].as_bool() != Some(true) {
             bail!("{}", answer["error"].as_str().unwrap_or("the web helper refused"));
@@ -174,6 +192,7 @@ async fn helper() -> Result<Arc<Proc>> {
     let proc = Arc::new(Proc {
         writer,
         pending: Mutex::new(HashMap::new()),
+        uploads: Mutex::new(HashMap::new()),
         sockets: Mutex::new(HashMap::new()),
         early: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
@@ -200,6 +219,12 @@ async fn helper() -> Result<Arc<Proc>> {
                 if let Some(id) = msg["id"].as_u64() {
                     if let Some(tx) = proc.pending.lock().unwrap().remove(&id) {
                         let _ = tx.send(msg);
+                    }
+                } else if let Some(req) = msg["req"].as_u64() {
+                    // How far a request's body has gone.
+                    let report = proc.uploads.lock().unwrap().get(&req).cloned();
+                    if let (Some(report), Some(current), Some(total)) = (report, msg["current"].as_u64(), msg["total"].as_u64()) {
+                        report(current, total);
                     }
                 } else if let Some(ws) = msg["ws"].as_u64() {
                     let event = match msg["event"].as_str() {
@@ -268,9 +293,22 @@ pub struct Response {
 }
 
 /// One HTTP request, cookies and all in `headers`, not following redirects.
-pub async fn request(method: &str, url: &str, headers: &[(String, String)], body: Option<&[u8]>, proxy: Option<&str>) -> Result<Response> {
+///
+/// `timeout` is how long the helper waits (a minute when none is given), and
+/// `progress` hears how much of the body has gone out, as it goes - for a file
+/// somebody is watching go.
+pub async fn request(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    proxy: Option<&str>,
+    timeout: Option<Duration>,
+    progress: Option<UploadFn>,
+) -> Result<Response> {
     let p = helper().await?;
     let msg = json!({
+        "timeoutMs": timeout.map(|t| t.as_millis() as u64),
         "op": "request",
         "method": method,
         "url": url,
@@ -278,7 +316,7 @@ pub async fn request(method: &str, url: &str, headers: &[(String, String)], body
         "body": body.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
         "proxy": proxy,
     });
-    let answer = p.call(msg).await.with_context(|| format!("{method} {url}"))?;
+    let answer = p.call_with(msg, progress).await.with_context(|| format!("{method} {url}"))?;
     let mut map = hyper::HeaderMap::new();
     for pair in answer["headers"].as_array().into_iter().flatten() {
         let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str()) else { continue };

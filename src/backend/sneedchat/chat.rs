@@ -54,6 +54,13 @@ pub(super) struct Chat {
     socket: Mutex<Option<WsSender>>,
     pub(super) session: Mutex<Option<Session>>,
     pub(super) host: Mutex<String>,
+    /// The edge's uploads bit: whether the chat's own file hosting is taking
+    /// files right now. None until the chat has said.
+    pub(super) uploads: Mutex<Option<bool>>,
+    /// Messages carrying a file the chat is still processing, by message, with
+    /// their text as the chat wrote it (file tags and all). Taken out when the
+    /// chat says the file is ready - on its `rendered` frame or on a re-read.
+    pending_files: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -304,6 +311,13 @@ impl Chat {
     /// Leaves the side room a conversation shows, if it is one: the chat is
     /// told, and the room is no longer tracked, so nothing in it reopens the
     /// conversation. Whether it was a side room.
+    /// Whether a conversation is a side room (a whisper or group chat) rather
+    /// than a listed channel. The chat's file hosting refuses side rooms.
+    pub(super) fn is_side_room(&self, buffer_name: &str) -> bool {
+        let Some(room) = self.room_of_buffer(buffer_name) else { return false };
+        self.rooms.lock().unwrap().get(&room).is_some_and(|r| r.kind == RoomKind::Side)
+    }
+
     pub(super) fn leave_side_room(&self, buffer_name: &str) -> bool {
         let uuid = {
             let mut rooms = self.rooms.lock().unwrap();
@@ -562,6 +576,9 @@ impl Ctx<'_> {
                 }
                 *chat.socket.lock().unwrap() = Some(self.sender.clone());
                 self.set_frozen(frame["link_state"].as_str() == Some("frozen"));
+                if let Some(available) = frame["uploads_available"].as_bool() {
+                    *chat.uploads.lock().unwrap() = Some(available);
+                }
                 super::health::recovered(account_id);
                 let rooms = state.accounts.get_sneedchat(account_id).map(|c| c.rooms).unwrap_or_default();
                 chat.want_rooms(&rooms);
@@ -576,6 +593,11 @@ impl Ctx<'_> {
             }
             "emoticons_changed" => self.refresh_emoticons(frame["emoticon_revision"].as_str().map(str::to_string)),
             "link_state" => self.set_frozen(frame["state"].as_str() == Some("frozen")),
+            "uploads" => {
+                if let Some(available) = frame["available"].as_bool() {
+                    *chat.uploads.lock().unwrap() = Some(available);
+                }
+            }
             "joined" => self.joined(frame),
             "left" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
@@ -628,12 +650,14 @@ impl Ctx<'_> {
                 }
             }
             "rendered" => {
-                // A row drawn again - its reactions are what can have changed.
+                // A row drawn again - its reactions, or a file that was processing, are what can have changed.
                 if let (Some(message), Some(html)) = (frame["chat_message_uuid"].as_str(), frame["html"].as_str()) {
                     let room = frame["chat_room_uuid"].as_str().map(str::to_string).or_else(|| chat.known(message).map(|k| k.room));
                     if let Some((name, _)) = room.and_then(|r| chat.buffer_of(&r)) {
                         let buffer_id = crate::model::buffer_id(account_id, &name);
                         self.set_reactions(&buffer_id, &message.to_lowercase(), html);
+                        // And a file that was still processing may be ready now.
+                        pending_file_ready(state, chat, self.http, self.host, &buffer_id, &message.to_lowercase(), html);
                     }
                 }
             }
@@ -898,8 +922,12 @@ impl Ctx<'_> {
                 let raw = protocol::mentions_to_names(&entry.body.clone().unwrap_or_default());
                 let (quoted, rest) = protocol::split_reply(&raw);
                 let reply = quoted.map(|q| crate::model::ReplyPreview { id: q.message, from: q.name, body: q.text, ..Default::default() });
-                let body = expand_attachment_paths(rest, self.host).into_owned();
-                if body.trim().is_empty() && reply.is_none() {
+                // Files the chat hosts arrive as tags; until they are fetched
+                // the message reads as their names.
+                let tiles = entry.html.as_deref().map(media::file_tiles).unwrap_or_default();
+                let rest_with_tags = rest.to_string();
+                let body = expand_attachment_paths(&media::file_tags_with_progress(rest, &tiles), self.host).into_owned();
+                if body.trim().is_empty() && reply.is_none() && tiles.is_empty() {
                     return;
                 }
                 let me = chat.me.lock().unwrap().clone().unwrap_or_default();
@@ -927,7 +955,8 @@ impl Ctx<'_> {
                     highlight,
                     avatar,
                     Vec::new(),
-                    Vec::new(),
+                    // A file still being processed holds its place until it is ready.
+                    tiles.iter().filter(|t| t.pending).map(media::processing_placeholder).collect(),
                     Some(author.uuid.clone()),
                     entry.at,
                     None,
@@ -938,14 +967,25 @@ impl Ctx<'_> {
                     self.set_reactions(&buffer_id, &message, html);
                 }
                 if is_new {
-                    spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
+                    if tiles.is_empty() {
+                        spawn_attachment_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, body);
+                    } else {
+                        // A file still being processed has no address yet: the
+                        // chat re-renders the row when it is ready, and this
+                        // also asks, in case that frame is missed.
+                        if tiles.iter().any(|t| t.pending) {
+                            chat.pending_files.lock().unwrap().insert(message.clone(), rest_with_tags.clone());
+                            watch_pending_file(state.clone(), chat.clone(), self.session.clone(), self.http.clone(), self.host.to_string(), buffer_id.clone(), message.clone());
+                        }
+                        spawn_file_resolve(state.clone(), self.http.clone(), self.host, buffer_id, message, rest_with_tags, tiles);
+                    }
                 }
             }
             "chat_message_revised" => {
                 if let Some(raw) = &entry.body {
                     let raw = protocol::mentions_to_names(raw);
                     let (_, rest) = protocol::split_reply(&raw);
-                    let body = expand_attachment_paths(rest, self.host).into_owned();
+                    let body = expand_attachment_paths(&media::file_tags_as_labels(rest), self.host).into_owned();
                     state.runtime.update_message(state, &buffer_id, &message, &body, &[], &[]);
                 }
             }
@@ -1042,6 +1082,44 @@ fn side_room_name(members: &[Principal], me: &str, uuid: &str) -> String {
     } else {
         others.join(", ")
     }
+}
+
+/// What to do with a message's re-rendered row when it carried a file that was
+/// still processing: once none is, fetch them and attach them.
+fn pending_file_ready(state: &AppState, chat: &Arc<Chat>, http: &http::HttpClient, host: &str, buffer_id: &str, message: &str, html: &str) {
+    let tiles = media::file_tiles(html);
+    if tiles.is_empty() || tiles.iter().any(|t| t.pending) {
+        return;
+    }
+    let Some(body) = chat.pending_files.lock().unwrap().remove(message) else { return };
+    spawn_file_resolve(state.clone(), http.clone(), host, buffer_id.to_string(), message.to_string(), body, tiles);
+}
+
+/// Asks the chat now and then whether a processing file is ready, the way the
+/// site's own page does (`GET /v1/messages/<id>`, 5 seconds after the row and
+/// then doubling), for the half hour after which a failed conversion is left as
+/// it is. The `rendered` frame usually gets there first, but it is sent once
+/// and never replayed, so a socket that was away would otherwise never hear.
+fn watch_pending_file(state: AppState, chat: Arc<Chat>, session: Session, http: http::HttpClient, host: String, buffer_id: String, message: String) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut wait = Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(60));
+            if !chat.pending_files.lock().unwrap().contains_key(&message) {
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(30 * 60) {
+                chat.pending_files.lock().unwrap().remove(&message);
+                return;
+            }
+            let Ok(read) = api_get(&session, &host, &format!("messages/{message}")).await else { continue };
+            if let Some(html) = read["html"].as_str() {
+                pending_file_ready(&state, &chat, &http, &host, &buffer_id, &message, html);
+            }
+        }
+    });
 }
 
 /// Reads the page of a room's log before the oldest entry held, as history:

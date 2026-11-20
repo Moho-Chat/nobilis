@@ -39,6 +39,7 @@ pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_
         // and on nothing else - so this says "somebody spoke" exactly where
         // Discord's flag does, and an .ogg deliberately attached stays a file.
         voice: !content["org.matrix.msc3245.voice"].is_null(),
+        processing: false,
         url: None,
     }
 }

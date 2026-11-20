@@ -773,6 +773,12 @@ pub struct Attachment {
     /// uploaded deliberately is an audio file and should be offered as one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub voice: bool,
+    /// The service is still converting this file: there is nothing to show yet,
+    /// but there will be, so the row keeps its place (`width` and `height`, as
+    /// the service will draw it) and says so. Replaced by the real attachment
+    /// when it is ready.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub processing: bool,
     /// Locally cached full-size media.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -1048,6 +1054,7 @@ mod tests {
             duration_secs: Some(12.4),
             waveform: Some("AAAI".into()),
             voice: true,
+            processing: false,
         };
         let v = serde_json::to_value(&a).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();

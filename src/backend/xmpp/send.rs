@@ -371,6 +371,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
                 duration_secs: voice,
                 waveform: None,
                 voice: voice.is_some(),
+                processing: false,
                 path: Some(format!("file://{path}")),
                 thumbnail_path: None,
                 url: Some(slot.get.clone()),
