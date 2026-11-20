@@ -41,6 +41,35 @@ pub fn set_command(command: Vec<String>) {
         return;
     }
     *command_slot().lock().unwrap() = Some(command);
+    command_known().notify_waiters();
+}
+
+fn command_known() -> &'static tokio::sync::Notify {
+    static KNOWN: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    KNOWN.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Whether a helper can be started, waiting up to `limit` for the client to
+/// say how.
+///
+/// At startup the daemon brings its accounts back before moho's window has
+/// connected and sent `setWebHelper`, so asking straight away found no
+/// helper: the account reported "needs the moho app open", and the health
+/// check that follows a failure then called the chat down - for the second
+/// or two until the window caught up. A window that is coming says so well
+/// inside the limit; a daemon with no window at all still hears "no".
+pub async fn available_within(limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        // Registered before checking, so a command set in between is not missed.
+        let known = command_known().notified();
+        if available() {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, known).await.is_err() {
+            return available();
+        }
+    }
 }
 
 /// Whether a helper can be started at all.
@@ -371,5 +400,23 @@ pub async fn ws_open(url: &str, protocols: &[&str], page: &str, cookies: &[Cooki
         Ok(Some(WsEvent::Closed(code, reason))) => bail!("{url} closed as it opened ({code} {reason})"),
         Ok(_) => bail!("{url} did not open"),
         Err(_) => bail!("{url} took too long to open"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A command that arrives while an account is already waiting - the window
+    // connecting a moment after the daemon started - is noticed, not missed.
+    #[tokio::test]
+    async fn a_command_sent_while_waiting_is_heard() {
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            set_command(vec!["moho".into(), "--moho-web-helper".into()]);
+        });
+        let started = Instant::now();
+        assert!(available_within(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(2), "it waited out the limit instead of hearing the command");
     }
 }

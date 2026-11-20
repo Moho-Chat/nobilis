@@ -143,6 +143,20 @@ pub(crate) fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Whether an HTTP status means the site sent what was asked for. 203 is
+/// inside 2xx, but it is the site's gate answering in the file's place.
+pub(super) fn is_content(status: u16) -> bool {
+    (200..300).contains(&status) && status != pow::GATE_STATUS
+}
+
+/// Whether these bytes are a picture or video the window will show - what an
+/// attachment has to be before it is cached under the attachment's name.
+pub(super) fn is_attachment_media(bytes: &[u8]) -> bool {
+    sniff_image_ext(bytes).is_some()
+        || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) // WebM, Matroska
+        || bytes.starts_with(b"BM")
+}
+
 /// Whether these bytes are an SVG document: text, opening with an XML
 /// declaration, a comment or the `<svg` element itself.
 pub(super) fn looks_like_svg(bytes: &[u8]) -> bool {
@@ -190,8 +204,13 @@ pub(super) async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> 
         match sniff_image_ext(&head[..n]) {
             // "jpeg" and "jpg" are the same thing under two names.
             Some(actual) if actual == ext || (actual == "jpg" && ext == "jpeg") => return Some(path),
-            // Unrecognised bytes: nothing better to go on, so keep it.
-            None => return Some(path),
+            // Not a picture at all - the site's gate page, kept by a client
+            // that once took any 2xx answer for the avatar. The window will
+            // not draw it, and its recorded URL matches, so kept it would
+            // never be fetched again: the avatar would be missing for good.
+            None => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
             Some(_) => {
                 let _ = tokio::fs::remove_file(&path).await;
             }
@@ -237,9 +256,9 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
         return None;
     };
     let bytes = match fetch {
-        Ok((status, bytes)) if (200..300).contains(&status) && !bytes.is_empty() => bytes,
+        Ok((status, bytes)) if is_content(status) && !bytes.is_empty() => bytes,
         Ok((status, _)) => {
-            tracing::debug!("sneedchat: avatar fetch for user {user_id} returned HTTP {status}");
+            tracing::info!("sneedchat: avatar fetch for user {user_id} returned HTTP {status}");
             return None;
         }
         Err(e) => {
@@ -257,14 +276,6 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
     // .jpg while the CDN transparently serves WebP, so trusting the URL wrote
     // WebP into a .jpg - which anything that dispatches on extension then
     // refuses to load.
-    let url_ext = url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .rsplit('.')
-        .next()
-        .filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or("jpg");
     // SVG - the chat's emoticons and reaction pictures - is drawn to PNG
     // here: the window shows no SVG from a file, since one can carry script.
     let bytes = match sniff_image_ext(&bytes) {
@@ -277,7 +288,13 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
         },
         _ => bytes,
     };
-    let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
+    // Only a picture is kept. Anything else is a page - the site's gate, an
+    // error - and named after the URL it would sit in the cache as the
+    // avatar, which the window refuses to draw and nothing ever replaces.
+    let Some(ext) = sniff_image_ext(&bytes) else {
+        tracing::info!("sneedchat: the avatar for user {user_id} came back as something other than a picture ({} bytes)", bytes.len());
+        return None;
+    };
     let path = dir.join(format!("{user_id}.{ext}"));
     // Unchanged bytes are not rewritten, so the version a window holds only
     // moves when the picture does.
@@ -377,8 +394,11 @@ pub async fn restore_cached(path: &std::path::Path) -> anyhow::Result<std::path:
     let (status, bytes) = tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&url))
         .await
         .context("the site took too long")??;
-    if !(200..300).contains(&status) || bytes.is_empty() {
+    if !is_content(status) || bytes.is_empty() {
         anyhow::bail!("the site answered HTTP {status} for that attachment");
+    }
+    if !is_attachment_media(&bytes) {
+        anyhow::bail!("the site sent something other than the attachment");
     }
     tokio::fs::create_dir_all(attachment_cache_dir()).await?;
     tokio::fs::write(path, &bytes).await?;
@@ -681,11 +701,27 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
         let dir = attachment_cache_dir();
         let path = dir.join(format!("{id}.{ext}"));
 
-        let local_url = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        // A file here that is not media is a page cached in the attachment's
+        // place by an older client; it is dropped and fetched again.
+        let head = async {
+            use tokio::io::AsyncReadExt;
+            let mut head = [0u8; 16];
+            let n = tokio::fs::File::open(&path).await?.read(&mut head).await?;
+            std::io::Result::Ok(head[..n].to_vec())
+        };
+        let cached = match head.await {
+            Ok(bytes) if is_attachment_media(&bytes) => true,
+            Ok(_) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                false
+            }
+            Err(_) => false,
+        };
+        let local_url = if cached {
             Some(format!("file://{}", path.display()))
         } else {
             match tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&fetch_url)).await {
-                Ok(Ok((status, bytes))) if (200..300).contains(&status) && !bytes.is_empty() => {
+                Ok(Ok((status, bytes))) if is_content(status) && !bytes.is_empty() && is_attachment_media(&bytes) => {
                     if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
                         Some(format!("file://{}", path.display()))
                     } else {
@@ -868,6 +904,19 @@ mod tests {
         assert!(cached_avatar_file(&dir, "42").await.is_none(), "kept a WebP named .jpg");
         assert!(!stale.exists(), "left the mislabelled file behind");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate answers 203 in a file's place, and an HTML page is no
+    /// attachment whatever status it came with.
+    #[test]
+    fn only_the_file_itself_is_kept() {
+        assert!(is_content(200));
+        assert!(!is_content(pow::GATE_STATUS));
+        assert!(!is_content(404));
+        assert!(is_attachment_media(b"\xff\xd8\xff\xe0 jfif"));
+        assert!(is_attachment_media(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0]));
+        assert!(!is_attachment_media(b"<!DOCTYPE html>"));
+        assert!(!is_attachment_media(b""));
     }
 
     #[tokio::test]
@@ -1084,9 +1133,12 @@ mod tests {
         std::fs::write(dir.join("3.jpg"), png).unwrap();
         assert_eq!(cached_avatar_file(&dir, "3").await, None);
         assert!(!dir.join("3.jpg").exists(), "the mislabelled file is gone");
-        // Bytes nobody recognises are kept - nothing better to go on.
-        std::fs::write(dir.join("4.png"), b"???").unwrap();
-        assert_eq!(cached_avatar_file(&dir, "4").await, Some(dir.join("4.png")));
+        // Not a picture - the site's gate page, cached by a client that took
+        // HTTP 203 for the avatar - is removed too, or it would stand in for
+        // the avatar for good: the window refuses it, and its URL matches.
+        std::fs::write(dir.join("4.jpg"), b"<!DOCTYPE html><html><head><title>Checking</title>").unwrap();
+        assert_eq!(cached_avatar_file(&dir, "4").await, None);
+        assert!(!dir.join("4.jpg").exists(), "the page is gone");
         // Somebody never cached, and somebody whose id only starts the same.
         assert_eq!(cached_avatar_file(&dir, "5").await, None);
         assert_eq!(cached_avatar_file(&dir, "").await, None);
