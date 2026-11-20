@@ -781,24 +781,43 @@ pub(super) struct FileTile {
     pub kind: String,
     /// The signed address on the chat's host, which is what a fetch needs: the
     /// signature is the site's, so it is read off the row and never built.
+    /// Empty while the file is still being processed.
     pub href: String,
+    /// The chat is still processing the file (a video is transcoded, a large
+    /// picture converted): its row carries a placeholder with no address, and
+    /// is re-rendered when the file is ready.
+    pub pending: bool,
 }
 
-/// Every hosted-file tile in a rendered row, in order.
+/// Every hosted-file tile in a rendered row, in order - the finished ones
+/// (`<a class="bbcode-file" href=...>`) and the ones still processing
+/// (`<span class="bbcode-file bbcode-file-pending">`, which has no address).
 pub(super) fn file_tiles(html: &str) -> Vec<FileTile> {
+    const DONE: &str = "<a class=\"bbcode-file\"";
+    const PENDING: &str = "<span class=\"bbcode-file bbcode-file-pending\"";
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(at) = html[from..].find("<a class=\"bbcode-file\"") {
-        let start = from + at;
+    loop {
+        let done = html[from..].find(DONE).map(|a| (from + a, false));
+        let pending = html[from..].find(PENDING).map(|a| (from + a, true));
+        let (start, is_pending) = match (done, pending) {
+            (Some(d), Some(p)) => if d.0 <= p.0 { d } else { p },
+            (Some(d), None) => d,
+            (None, Some(p)) => p,
+            (None, None) => break,
+        };
         let Some(end) = html[start..].find('>') else { break };
         let tag = &html[start..start + end];
         from = start + end;
-        let (Some(uuid), Some(href)) = (protocol::attr(tag, "data-attachment-uuid"), protocol::attr(tag, "href")) else { continue };
+        let Some(uuid) = protocol::attr(tag, "data-attachment-uuid") else { continue };
+        let href = if is_pending { Some(String::new()) } else { protocol::attr(tag, "href") };
+        let Some(href) = href else { continue };
         out.push(FileTile {
             uuid: uuid.to_ascii_lowercase(),
             label: protocol::attr(tag, "title").map(|t| protocol::unescape_html(&t)).unwrap_or_default(),
             kind: protocol::attr(tag, "data-file-kind").unwrap_or_else(|| "file".into()),
             href: protocol::unescape_html(&href),
+            pending: is_pending,
         });
     }
     out
@@ -839,6 +858,16 @@ pub(super) fn file_tags_as_labels(body: &str) -> String {
     replace_file_tags(body, |_, label| label.to_string())
 }
 
+/// As `file_tags_as_labels`, for what is shown while some of the files are
+/// still being processed: those read "Processing: name", as the site's own
+/// placeholder does.
+pub(super) fn file_tags_with_progress(body: &str, tiles: &[FileTile]) -> String {
+    replace_file_tags(body, |id, label| {
+        let waiting = tiles.iter().any(|t| t.pending && t.uuid.eq_ignore_ascii_case(id));
+        if waiting { format!("Processing: {label}") } else { label.to_string() }
+    })
+}
+
 /// The file extension a label ends in, lower-cased, if it looks like one.
 fn label_extension(label: &str) -> Option<String> {
     let ext = label.rsplit_once('.')?.1.to_ascii_lowercase();
@@ -860,6 +889,10 @@ pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: 
         let mut attachments = Vec::new();
         let mut kept = std::collections::HashSet::new();
         for tile in &tiles {
+            // Not there yet: its row is re-rendered when it is, which runs this again.
+            if tile.pending || tile.href.is_empty() {
+                continue;
+            }
             let kind = match tile.kind.as_str() {
                 "image" | "video" | "audio" => tile.kind.as_str(),
                 _ => "file",
@@ -918,7 +951,16 @@ pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: 
         }
         // The names of what is now attached leave the text; any that could not
         // be fetched stay in it.
-        let text = replace_file_tags(&body, |id, label| if kept.contains(&id.to_ascii_lowercase()) { String::new() } else { label.to_string() });
+        let text = replace_file_tags(&body, |id, label| {
+            let id = id.to_ascii_lowercase();
+            if kept.contains(&id) {
+                String::new()
+            } else if tiles.iter().any(|t| t.pending && t.uuid == id) {
+                format!("Processing: {label}")
+            } else {
+                label.to_string()
+            }
+        });
         let text = text.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
         state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, text.trim());
         if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
@@ -1331,6 +1373,18 @@ mod tests {
         assert_eq!(tiles[1].kind, "video");
         assert_eq!(tiles[1].uuid, "01a1f9c7-4210-73c2-8faf-3c03d900f209");
         assert!(file_tiles("<div>nothing</div>").is_empty());
+    }
+
+    #[test]
+    fn a_file_still_processing_is_a_tile_without_an_address() {
+        let row = r#"<div class="chat-body"><span class="bbcode-file bbcode-file-pending" title="motihoppe.webm" data-attachment-uuid="01a1f9e0-9c3e-72c6-ac3c-ce844e50f937" data-file-kind="video"><svg class="bbcode-file-box" width="560" height="315" viewBox="0 0 560 315" aria-hidden="true"></svg><span class="bbcode-file-name">Processing: motihoppe.webm</span></span> <a class="bbcode-file" title="a.png" data-attachment-uuid="01a1f9da-f862-76ba-96aa-cd33035ff4b0" data-file-kind="image" href="/chat/files/x.sig/view"></a></div>"#;
+        let tiles = file_tiles(row);
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles[0].pending && tiles[0].href.is_empty());
+        assert_eq!((tiles[0].kind.as_str(), tiles[0].label.as_str()), ("video", "motihoppe.webm"));
+        assert!(!tiles[1].pending);
+        let body = "[file=01a1f9e0-9c3e-72c6-ac3c-ce844e50f937]motihoppe.webm[/file] [file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]a.png[/file]";
+        assert_eq!(file_tags_with_progress(body, &tiles), "Processing: motihoppe.webm a.png");
     }
 
     #[test]
