@@ -342,9 +342,19 @@ pub async fn send_attachment(
     // the upload - the transport below is deliberately unrelated to it.
     state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
 
+    // The chat's own hosting is the default - nothing leaves the site, and it
+    // takes video, audio and other files too - but the site's front door
+    // refuses uploads for side rooms (whispers, group chats) with a bare 403.
+    // There the file goes to a shared host as it did before the chat hosted
+    // files: postimg for a picture it takes, catbox for anything else.
+    let host = match host {
+        None | Some(crate::upload::Host::Native) if super::chat::chat(account_id).is_side_room(buffer_name) => {
+            let name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            Some(if crate::upload::Host::Postimg.accepts(name) { crate::upload::Host::Postimg } else { crate::upload::Host::Catbox })
+        }
+        other => other,
+    };
     match host {
-        // The chat's own hosting is the default: nothing leaves the site, and
-        // it takes video, audio and other files too.
         None | Some(crate::upload::Host::Native) => {
             return send_native(account_id, buffer_name, caption, file_path, progress).await;
         }

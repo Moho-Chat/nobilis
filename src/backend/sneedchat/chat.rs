@@ -311,6 +311,13 @@ impl Chat {
     /// Leaves the side room a conversation shows, if it is one: the chat is
     /// told, and the room is no longer tracked, so nothing in it reopens the
     /// conversation. Whether it was a side room.
+    /// Whether a conversation is a side room (a whisper or group chat) rather
+    /// than a listed channel. The chat's file hosting refuses side rooms.
+    pub(super) fn is_side_room(&self, buffer_name: &str) -> bool {
+        let Some(room) = self.room_of_buffer(buffer_name) else { return false };
+        self.rooms.lock().unwrap().get(&room).is_some_and(|r| r.kind == RoomKind::Side)
+    }
+
     pub(super) fn leave_side_room(&self, buffer_name: &str) -> bool {
         let uuid = {
             let mut rooms = self.rooms.lock().unwrap();
