@@ -167,7 +167,7 @@ pub(super) fn remember_session(state: &AppState, account_id: &str, session: &Ses
 /// and nothing else, so even a Tor account's traffic is Chromium's, sent
 /// through the same relay everything else routed uses.
 pub(super) async fn browser_route(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<http::BrowserRoute> {
-    if !crate::net::webhelper::available() {
+    if !crate::net::webhelper::available_within(std::time::Duration::from_secs(30)).await {
         bail!("Sneedchat needs the moho app open: the site admits only a browser, and moho's own browser engine carries the connection");
     }
     let router = crate::net::route::router();
