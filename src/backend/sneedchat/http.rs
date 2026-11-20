@@ -205,13 +205,6 @@ impl HttpClient {
         bail!("too many redirects for {url}")
     }
 
-    /// Send exactly one request, without following redirects. Useful when
-    /// the redirect itself is the thing being read (e.g. a login POST's
-    /// 303, which encodes success/failure/2FA in its `Location`).
-    pub async fn send_no_redirect(&self, method: Method, url: &str, body: Option<String>) -> Result<Response> {
-        self.send_once(method, url, body).await
-    }
-
     /// Fetch raw bytes rather than text - for anything that isn't UTF-8,
     /// like an avatar image. `Response.body` is a `String` and would
     /// corrupt binary data via lossy UTF-8 conversion, so this bypasses it

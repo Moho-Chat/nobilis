@@ -4623,46 +4623,11 @@ pub async fn dispatch(
             }
         }
 
-        // Tor bootstrap + login (+ a possible proof-of-work solve) can take
-        // anywhere from instant to over a minute - same async-kickoff shape
-        // as addDiscordAccount, with progress/result arriving via
-        // sneedChatLoginStatus/sneedChatLoginResult events (see backend/
-        // sneedchat/mod.rs's start_login).
-        "addSneedChatAccount" => {
-            let (username, password) = match (p_str_opt(params, "username"), p_str_opt(params, "password")) {
-                (Some(u), Some(p)) => (u.to_string(), p.to_string()),
-                _ => return (None, Some("addSneedChatAccount requires \"username\" and \"password\"".to_string())),
-            };
-            let username_for_cookies = username.clone();
-            let config = crate::accounts::SneedChatAccountConfig {
-                username,
-                password,
-                totp_secret: p_str_opt(params, "totpSecret").map(String::from),
-                host: p_str_opt(params, "host").map(String::from).unwrap_or_else(|| backend::sneedchat::DEFAULT_ONION.to_string()),
-                tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| "embedded".to_string()),
-                // The open internet unless asked otherwise.
-                use_tor: p_bool(params, "useTor", false),
-                // Never strict at sign-in; the account store keeps an existing
-                // account's strict routing across a re-login.
-                strict_route: false,
-                proxy: p_str_opt(params, "proxy").map(String::from),
-                rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
-                rooms_chosen: false,
-                display_name: None,
-                user_id: None,
-                // Kept from a previous browser sign-in when this is the same
-                // account being re-added with a corrected password: a live
-                // session is the one thing here that still gets anybody in.
-                cookies: state
-                    .accounts
-                    .get_sneedchat(&format!("sneedchat:{username_for_cookies}"))
-                    .map(|old| old.cookies)
-                    .unwrap_or_default(),
-            };
-            let login_id = format!("sneedchat-login-{}", crate::model::next_message_id());
-            backend::sneedchat::start_login(state.clone(), login_id.clone(), config);
-            (Some(serde_json::json!({ "loginId": login_id })), None)
-        }
+        // Signing in with a username, password and TOTP code is gone: the
+        // forum's login form carries a CAPTCHA and its gate admits only a
+        // browser. An account is added by signing in with a browser
+        // (setSneedChatCookies); an older client asking this way is told so.
+        "addSneedChatAccount" => (None, Some("Sneedchat signs in with a browser now: use \"Sign in with a browser\"".to_string())),
 
         // A session obtained by signing in somewhere with a screen.
         //

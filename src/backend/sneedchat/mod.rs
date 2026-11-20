@@ -22,7 +22,7 @@
 //! - `send` - messages, whispers, edits, attachments
 //! - `media` - avatars and attachments, fetched through Tor and cached
 //! - `postimg` - the one upload host, for what the forum will not take
-//! - `auth`, `captcha`, `pow`, `totp` - getting past the door and staying in
+//! - `auth`, `pow` - getting past the door and staying in
 //! - `form`, `http`, `protocol`, `smilies` - the site's own shapes
 //! - `probes` - live checks against the real site, run by hand
 //!
@@ -46,21 +46,19 @@ pub use postimg::*;
 pub use rooms::*;
 pub use live::{leave_room, set_rooms};
 pub use send::*;
-pub mod captcha;
 pub mod form;
 pub mod health;
 pub mod http;
 pub mod pow;
 pub mod protocol;
 pub mod smilies;
-pub mod totp;
 
 use crate::accounts::{SneedChatAccountConfig, SneedChatRoom};
 use crate::net::tor::Transport;
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Context, Result};
-use auth::{Credentials, Session, TwoFactor};
+use auth::Session;
 use bytes::Bytes;
 use futures::FutureExt;
 use std::time::Duration;
