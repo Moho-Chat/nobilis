@@ -927,7 +927,7 @@ impl Ctx<'_> {
                 let tiles = entry.html.as_deref().map(media::file_tiles).unwrap_or_default();
                 let rest_with_tags = rest.to_string();
                 let body = expand_attachment_paths(&media::file_tags_with_progress(rest, &tiles), self.host).into_owned();
-                if body.trim().is_empty() && reply.is_none() {
+                if body.trim().is_empty() && reply.is_none() && tiles.is_empty() {
                     return;
                 }
                 let me = chat.me.lock().unwrap().clone().unwrap_or_default();
@@ -955,7 +955,8 @@ impl Ctx<'_> {
                     highlight,
                     avatar,
                     Vec::new(),
-                    Vec::new(),
+                    // A file still being processed holds its place until it is ready.
+                    tiles.iter().filter(|t| t.pending).map(media::processing_placeholder).collect(),
                     Some(author.uuid.clone()),
                     entry.at,
                     None,

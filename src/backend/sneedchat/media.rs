@@ -859,13 +859,33 @@ pub(super) fn file_tags_as_labels(body: &str) -> String {
 }
 
 /// As `file_tags_as_labels`, for what is shown while some of the files are
-/// still being processed: those read "Processing: name", as the site's own
-/// placeholder does.
+/// still being processed: those leave no text, because their placeholder
+/// (`processing_placeholder`) says what they are and that they are coming.
 pub(super) fn file_tags_with_progress(body: &str, tiles: &[FileTile]) -> String {
     replace_file_tags(body, |id, label| {
         let waiting = tiles.iter().any(|t| t.pending && t.uuid.eq_ignore_ascii_case(id));
-        if waiting { format!("Processing: {label}") } else { label.to_string() }
+        if waiting { String::new() } else { label.to_string() }
     })
+}
+
+/// What stands in a message for a file the chat is still processing: the box
+/// the finished one will fill, at the size the site gives it (a video is a
+/// 16:9 player, a picture its 160 px tile), saying so.
+pub(super) fn processing_placeholder(tile: &FileTile) -> crate::model::Attachment {
+    let (kind, width, height) = match tile.kind.as_str() {
+        "video" => ("video", 560, 315),
+        "audio" => ("audio", 560, 52),
+        "image" => ("image", 160, 160),
+        _ => ("file", 560, 52),
+    };
+    crate::model::Attachment {
+        kind: kind.to_string(),
+        filename: Some(tile.label.clone()),
+        width: Some(width),
+        height: Some(height),
+        processing: true,
+        ..Default::default()
+    }
 }
 
 /// The file extension a label ends in, lower-cased, if it looks like one.
@@ -889,8 +909,10 @@ pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: 
         let mut attachments = Vec::new();
         let mut kept = std::collections::HashSet::new();
         for tile in &tiles {
-            // Not there yet: its row is re-rendered when it is, which runs this again.
+            // Not there yet: its place is held, and its row is re-rendered when
+            // it is, which runs this again.
             if tile.pending || tile.href.is_empty() {
+                attachments.push(processing_placeholder(tile));
                 continue;
             }
             let kind = match tile.kind.as_str() {
@@ -953,10 +975,9 @@ pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: 
         // be fetched stay in it.
         let text = replace_file_tags(&body, |id, label| {
             let id = id.to_ascii_lowercase();
-            if kept.contains(&id) {
+            // Fetched, or still coming (its placeholder says so): no text.
+            if kept.contains(&id) || tiles.iter().any(|t| t.pending && t.uuid == id) {
                 String::new()
-            } else if tiles.iter().any(|t| t.pending && t.uuid == id) {
-                format!("Processing: {label}")
             } else {
                 label.to_string()
             }
@@ -1384,7 +1405,10 @@ mod tests {
         assert_eq!((tiles[0].kind.as_str(), tiles[0].label.as_str()), ("video", "motihoppe.webm"));
         assert!(!tiles[1].pending);
         let body = "[file=01a1f9e0-9c3e-72c6-ac3c-ce844e50f937]motihoppe.webm[/file] [file=01a1f9da-f862-76ba-96aa-cd33035ff4b0]a.png[/file]";
-        assert_eq!(file_tags_with_progress(body, &tiles), "Processing: motihoppe.webm a.png");
+        assert_eq!(file_tags_with_progress(body, &tiles).trim(), "a.png");
+        let held = processing_placeholder(&tiles[0]);
+        assert!(held.processing);
+        assert_eq!((held.kind.as_str(), held.width, held.height), ("video", Some(560), Some(315)));
     }
 
     #[test]

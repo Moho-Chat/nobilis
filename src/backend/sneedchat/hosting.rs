@@ -13,6 +13,7 @@
 
 use super::*;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// What the chat page says about uploading: where to send a file, and the
 /// size the site will take. Read from the page each time - the token in it
@@ -220,7 +221,24 @@ pub(super) async fn store(
     if let Some(progress) = progress {
         progress.at(Phase::Sending, bytes.len(), "native");
     }
-    let size = bytes.len();
+    // How far the body has gone, said at most every 150 ms: the window turns
+    // it into a percentage and a speed. When the last byte is out the wait is
+    // the chat's, and is said to be.
+    let counting = progress.cloned().map(|progress| {
+        let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        Arc::new(move |sent: u64, total: u64| {
+            let now = started.elapsed().as_millis() as u64;
+            let done = sent >= total;
+            if done {
+                progress.sent(total, total, "native");
+                progress.at(Phase::Waiting, total as usize, "native");
+            } else if now.saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed)) >= 150 {
+                last.store(now, std::sync::atomic::Ordering::Relaxed);
+                progress.sent(sent, total, "native");
+            }
+        }) as crate::net::webhelper::UploadFn
+    });
     let resp = session
         .http
         .request_bytes(
@@ -229,12 +247,10 @@ pub(super) async fn store(
             Bytes::from(bytes),
             content_type_of(&file_name),
             &[("X-XF-CSRF-Token", &hosting.token), ("Accept", "application/json"), ("Origin", &base)],
+            counting,
         )
         .await
         .context("uploading to the chat")?;
-    if let Some(progress) = progress {
-        progress.at(Phase::Waiting, size, "native");
-    }
     let retry = resp.headers.get("retry-after").and_then(|v| v.to_str().ok());
     match outcome(resp.status, &resp.body, retry) {
         Outcome::Stored { attachment } => Ok(Stored { tag: file_tag(&attachment, &label) }),
