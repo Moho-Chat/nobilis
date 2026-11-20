@@ -4330,7 +4330,12 @@ pub async fn dispatch(
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
+                        Err(e) => {
+                            // Said here as well as handed back: the window shows
+                            // the reason for a moment, and the log keeps it.
+                            tracing::warn!("sneedchat[{}]: sending to {} failed{}: {e:#}", buffer.account_id, buffer.name, if attachment_path.is_some() { " (with a file)" } else { "" });
+                            (None, Some(format!("{e:#}")))
+                        }
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
