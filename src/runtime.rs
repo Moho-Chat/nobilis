@@ -5053,6 +5053,8 @@ impl Runtime {
             crate::unfurl::youtube_later(state, account_id, &message.buffer_id, &message.id, &message.body);
             // And a link to a GIF, where nothing has said what it is.
             crate::gifs::gif_later(state, account_id, &message.buffer_id, &message.id, &message.body);
+            // And one to a file the Sneedchat uploader hosts, in a message from IRC or XMPP.
+            crate::backend::sneedchat::media::hosted_links_later(state, account_id, &message.buffer_id, &message.id, &message.body);
         }
 
         // Notify on every inbound DM regardless of content, or on a

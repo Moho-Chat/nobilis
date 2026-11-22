@@ -992,9 +992,179 @@ pub(super) fn spawn_file_resolve(state: AppState, http: http::HttpClient, host: 
     });
 }
 
+/// A link to a file the chat hosts, found in a message from somewhere else.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HostedLink {
+    /// The link as written, with any `<` `>` around it.
+    pub matched: String,
+    /// The file's id and signature as the site wrote them: `<uuid>.<signature>`.
+    pub token: String,
+    pub uuid: String,
+    /// What was said just before the link, if it is a file name, as a
+    /// forum client prints it: `picture.png <https://...>`.
+    pub label: Option<String>,
+}
+
+/// The chat's own file links - `https://kiwifarms.net/chat/files/<id>.<sig>/view`
+/// (or `/thumb`, `/video`, `/poster`) - in a body written in IRC or XMPP, where
+/// the chat's uploader leaves a bare address and nothing says what it is.
+pub(crate) fn find_hosted_links(body: &str) -> Vec<HostedLink> {
+    const HOSTS: [&str; 4] = ["kiwifarms.net", "kiwifarms.st", "www.kiwifarms.st", DEFAULT_ONION];
+    const VIEWS: [&str; 5] = ["view", "thumb", "video", "poster", "download"];
+    let mut out: Vec<HostedLink> = Vec::new();
+    let mut from = 0;
+    while let Some(at) = body[from..].find("/chat/files/") {
+        let at = from + at;
+        from = at + "/chat/files/".len();
+        let head = &body[..at];
+        let Some(scheme) = ["https://", "http://"].into_iter().find_map(|s| {
+            HOSTS.iter().find_map(|h| head.ends_with(&format!("{s}{h}")).then(|| s.len() + h.len()))
+        }) else {
+            continue;
+        };
+        let start = at - scheme;
+        let tail = &body[from..];
+        let len = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '[' | ']' | '"' | '\'' | ')')).unwrap_or(tail.len());
+        let path = tail[..len].split('?').next().unwrap_or("");
+        let mut parts = path.split('/');
+        let (Some(token), Some(view), None) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if !VIEWS.contains(&view) {
+            continue;
+        }
+        let Some((uuid, sig)) = token.split_once('.') else { continue };
+        if uuid.len() != 36 || !uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') || sig.is_empty() {
+            continue;
+        }
+        let end = from + len;
+        let (mstart, mend) = if body[..start].ends_with('<') && body[end..].starts_with('>') { (start - 1, end + 1) } else { (start, end) };
+        let label = body[..mstart]
+            .trim_end()
+            .rsplit(char::is_whitespace)
+            .next()
+            .filter(|w| label_extension(w).is_some() && w.len() > 2)
+            .map(str::to_string);
+        if out.iter().any(|l| l.uuid.eq_ignore_ascii_case(uuid)) {
+            continue;
+        }
+        out.push(HostedLink { matched: body[mstart..mend].to_string(), token: token.to_string(), uuid: uuid.to_ascii_lowercase(), label });
+    }
+    out
+}
+
+/// A picture or video the chat hosts, linked from a message on another service
+/// (IRC, XMPP), is fetched through a Sneedchat account's own session and shown
+/// as the media it is. The chat's gate turns away anything that is not a signed-in
+/// browser, so the window cannot look at the link itself; this is the content
+/// check, made where a session exists. With no Sneedchat account connected the
+/// link stays a link. Spawned: the message is already out.
+pub(crate) fn hosted_links_later(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, body: &str) {
+    if !body.contains("/chat/files/") {
+        return;
+    }
+    let links = find_hosted_links(body);
+    if links.is_empty() {
+        return;
+    }
+    let Some((http, host)) = ({
+        let map = clients().lock().unwrap();
+        // The Sneedchat account's own messages are handled by its own reader.
+        if map.contains_key(account_id) { None } else { map.values().next().cloned() }
+    }) else {
+        return;
+    };
+    let (state, buffer_id, msg_id, body) = (state.clone(), buffer_id.to_string(), msg_id.to_string(), body.to_string());
+    tokio::spawn(async move {
+        let dir = attachment_cache_dir();
+        let mut attachments = Vec::new();
+        let mut text = body.clone();
+        for link in links {
+            let mut found: Option<(std::path::PathBuf, &'static str)> = None;
+            let mut cached = tokio::fs::read_dir(&dir).await.ok();
+            while let Some(entries) = cached.as_mut() {
+                match entries.next_entry().await {
+                    Ok(Some(e)) if e.file_name().to_string_lossy().starts_with(&format!("{}.", link.uuid)) => {
+                        let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                        found = Some((e.path(), if matches!(ext.as_str(), "mp4" | "webm") { "video" } else { "image" }));
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            if found.is_none() {
+                // A picture is at /view and a video at /video; whichever answers with media is what it is.
+                for view in ["view", "video"] {
+                    let url = format!("https://{host}/chat/files/{}/{view}", link.token);
+                    let Ok(Ok((status, bytes))) = tokio::time::timeout(std::time::Duration::from_secs(90), http.get_bytes(&url)).await else {
+                        continue;
+                    };
+                    if !is_content(status) || !is_attachment_media(&bytes) {
+                        continue;
+                    }
+                    let ext = sniff_image_ext(&bytes).unwrap_or(if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) { "webm" } else { "bmp" });
+                    let path = dir.join(format!("{}.{ext}", link.uuid));
+                    if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
+                        found = Some((path, if matches!(ext, "mp4" | "webm") { "video" } else { "image" }));
+                    }
+                    break;
+                }
+            }
+            let Some((path, kind)) = found else { continue };
+            attachments.push(crate::model::Attachment {
+                kind: kind.to_string(),
+                filename: link.label.clone(),
+                path: Some(format!("file://{}", path.display())),
+                ..Default::default()
+            });
+            text = text.replace(&link.matched, "");
+            if let Some(label) = &link.label {
+                if let Some(at) = text.rfind(label.as_str()) {
+                    text.replace_range(at..at + label.len(), "");
+                }
+            }
+        }
+        if attachments.is_empty() {
+            return;
+        }
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, &text);
+        if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
+            tracing::debug!("hosted links: recording files for {msg_id}: {e}");
+            return;
+        }
+        state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "attachments": attachments }));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hosted_link_pasted_into_irc_is_found_with_its_file_name() {
+        let body = "ok but if i just take the url <autistic_integrity>\nbrave_dCnDywAQbw.png <https://kiwifarms.net/chat/files/01a20121-8d6d-7206-8819-e1a2c93fa812.j-t_jG5GmzsoH0E5-7CgUA/view>\nand change the world view to thumb it works";
+        let links = find_hosted_links(body);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uuid, "01a20121-8d6d-7206-8819-e1a2c93fa812");
+        assert_eq!(links[0].token, "01a20121-8d6d-7206-8819-e1a2c93fa812.j-t_jG5GmzsoH0E5-7CgUA");
+        assert_eq!(links[0].label.as_deref(), Some("brave_dCnDywAQbw.png"));
+        assert!(links[0].matched.starts_with("<https://") && links[0].matched.ends_with("/view>"));
+    }
+
+    #[test]
+    fn other_hosts_and_other_paths_are_not_hosted_links() {
+        for no in [
+            "https://example.com/chat/files/01a20121-8d6d-7206-8819-e1a2c93fa812.sig/view",
+            "https://kiwifarms.net/chat/files/not-a-uuid.sig/view",
+            "https://kiwifarms.net/chat/files/01a20121-8d6d-7206-8819-e1a2c93fa812.sig/other",
+            "nothing here",
+        ] {
+            assert!(find_hosted_links(no).is_empty(), "{no}");
+        }
+        // The same file by two of its views is one file.
+        let two = "https://kiwifarms.net/chat/files/01a20121-8d6d-7206-8819-e1a2c93fa812.s/thumb https://kiwifarms.net/chat/files/01a20121-8d6d-7206-8819-e1a2c93fa812.s/view";
+        assert_eq!(find_hosted_links(two).len(), 1);
+    }
 
     #[test]
     fn matches_the_real_reported_url() {
