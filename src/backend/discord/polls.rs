@@ -170,6 +170,31 @@ pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, m
     Ok(())
 }
 
+/// Ends a poll now rather than at its expiry.
+///
+/// `POST .../polls/{message}/expire` is what the official client sends; Discord
+/// allows it to the poll's author only and says so otherwise. The finalised
+/// tally comes back as a MESSAGE_UPDATE, which redraws the card as ended.
+pub async fn end_poll(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this conversation")?;
+    let resp = send_write(
+        http_client_for(&cfg.token)
+            .post(format!("{API_BASE}/channels/{channel_id}/polls/{message_id}/expire"))
+            .header("Authorization", &cfg.token),
+    )
+    .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "ending the poll"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

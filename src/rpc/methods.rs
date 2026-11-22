@@ -7629,6 +7629,15 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             }
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("discord:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("ending a Discord poll needs its \"pollId\"".to_string()));
+                };
+                return match backend::discord::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
