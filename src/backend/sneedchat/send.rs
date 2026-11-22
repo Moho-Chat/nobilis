@@ -53,6 +53,7 @@ pub async fn send_message(state: &AppState, account_id: &str, buffer_name: &str,
 /// the chat reads them, and waits for its echo.
 async fn post(account_id: &str, buffer_name: &str, text: &str) -> Result<()> {
     let chat = super::chat::chat(account_id);
+    let original = text;
     let text = protocol::names_to_mentions(text, &chat.known_names());
     if text.is_empty() {
         return Ok(());
@@ -65,7 +66,18 @@ async fn post(account_id: &str, buffer_name: &str, text: &str) -> Result<()> {
         bail!("not in this room right now - it is still joining");
     }
     let nonce = protocol::post_nonce();
-    chat.command(&nonce, json!({ "t": "send", "chat_room_uuid": room, "body": text, "client_nonce": nonce })).await
+    let sent = chat.command(&nonce, json!({ "t": "send", "chat_room_uuid": room, "body": text, "client_nonce": nonce })).await;
+    // A message that carried mention tags and was refused for a reason the
+    // chat has no word for goes again with the names as plain text: said
+    // without the ping beats not said at all.
+    match sent {
+        Err(e) if text != original && e.to_string().starts_with("the chat refused it") => {
+            tracing::warn!("sneedchat[{account_id}]: the chat refused a message with mentions ({e:#}); sending it with plain names");
+            let nonce = protocol::post_nonce();
+            chat.command(&nonce, json!({ "t": "send", "chat_room_uuid": room, "body": original, "client_nonce": nonce })).await
+        }
+        other => other,
+    }
 }
 
 /// Who a typed whisper is for and what it says: the longest name the chat

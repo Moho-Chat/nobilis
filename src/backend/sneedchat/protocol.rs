@@ -181,10 +181,21 @@ pub fn mentions_to_names(body: &str) -> String {
     out
 }
 
+/// A name as the BBCode body can carry it: no brackets, no line breaks, one
+/// space between words.
+fn markup_name(name: &str) -> String {
+    name.replace(['[', ']'], "").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// `@Name` written the way the chat reads a mention, for every name it knows:
 /// the longest known name wins, so "@Ryo Ma" is not taken for "@Ryo".
 pub fn names_to_mentions(body: &str, people: &[(String, String)]) -> String {
-    let mut known: Vec<&(String, String)> = people.iter().filter(|(_, name)| !name.is_empty()).collect();
+    // What the site's own composer writes and the chat's parser reads: a
+    // principal's uuid, and a name with no brackets (which would open tags)
+    // or line breaks in it. Anybody whose uuid is not one - a placeholder for
+    // an author the chat has not described - cannot be mentioned at all.
+    // Matched on the name as typed, written as the markup-safe one.
+    let mut known: Vec<&(String, String)> = people.iter().filter(|(uuid, name)| is_uuid(uuid) && !markup_name(name).is_empty()).collect();
     known.sort_by_key(|(_, name)| std::cmp::Reverse(name.chars().count()));
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -205,7 +216,7 @@ pub fn names_to_mentions(body: &str, people: &[(String, String)]) -> String {
             .flatten();
         match hit {
             Some((uuid, name)) => {
-                out.push_str(&format!("[user={uuid}]{name}[/user]"));
+                out.push_str(&format!("[user={}]{}[/user]", uuid.to_lowercase(), markup_name(name)));
                 rest = &after[name.len()..];
             }
             None => {
@@ -503,10 +514,18 @@ mod tests {
     fn mentions_go_both_ways() {
         assert_eq!(mentions_to_names("hi [user=019e-1]Ryo Ma[/user], ok"), "hi @Ryo Ma, ok");
         assert_eq!(mentions_to_names("[user=broken"), "[user=broken");
-        let people = vec![("u1".to_string(), "Ryo".to_string()), ("u2".to_string(), "Ryo Ma".to_string())];
-        assert_eq!(names_to_mentions("@ryo ma hello @Ryo!", &people), "[user=u2]Ryo Ma[/user] hello [user=u1]Ryo[/user]!");
+        const U1: &str = "019e6198-a12a-72d2-936c-a7c55c2993fb";
+        const U2: &str = "019e6198-a12a-72d2-936c-a7c55c2993fc";
+        let people = vec![(U1.to_string(), "Ryo".to_string()), (U2.to_string(), "Ryo Ma".to_string())];
+        assert_eq!(names_to_mentions("@ryo ma hello @Ryo!", &people), format!("[user={U2}]Ryo Ma[/user] hello [user={U1}]Ryo[/user]!"));
         // Not a mention: inside a word, or nobody of that name.
         assert_eq!(names_to_mentions("mail me@ryo and @Nobody", &people), "mail me@ryo and @Nobody");
+        // A name with brackets is written without them, as the site's own composer does,
+        // and somebody with no real uuid is not mentionable.
+        let odd = vec![(U1.to_string(), "[Cool] Guy".to_string()), ("someone".to_string(), "Ghost".to_string())];
+        assert_eq!(names_to_mentions("@[Cool] Guy and @Ghost", &odd), format!("[user={U1}]Cool Guy[/user] and @Ghost"));
+        let odd = vec![(U1.to_uppercase(), "Cool  Guy".to_string())];
+        assert_eq!(names_to_mentions("@Cool  Guy", &odd), format!("[user={U1}]Cool Guy[/user]"));
         // "@Ryox" is not "@Ryo".
         assert_eq!(names_to_mentions("@Ryox", &people), "@Ryox");
     }
