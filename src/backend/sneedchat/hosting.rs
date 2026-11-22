@@ -182,8 +182,13 @@ pub(super) async fn store(
 ) -> Result<Stored> {
     use crate::upload::Phase;
     let chat = super::chat::chat(account_id);
+    // The chat's uploads bit is only a hint: it says "away" while the chat's
+    // core is, and is not always updated when it comes back (a reconnect
+    // keeps the last word until the next frame). Refusing on it turned a
+    // moment's absence into a failed send; the site's own answer to the
+    // upload is the one that counts, and says the same thing if it is true.
     if *chat.uploads.lock().unwrap() == Some(false) {
-        bail!("the chat's file hosting is unavailable right now");
+        tracing::info!("sneedchat[{account_id}]: the chat says its uploads are away; trying anyway");
     }
     let session = chat.session.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the chat right now"))?;
     let host = chat.host.lock().unwrap().clone();

@@ -47,7 +47,12 @@ pub struct Powers {
 impl Powers {
     pub fn from_bits(bits: &str) -> Self {
         let on = |i: usize| bits.as_bytes().get(i) == Some(&b'1');
-        Self { post: on(0), react: on(1), whisper: on(2), moderate: bits.bytes().skip(3).any(|b| b == b'1') }
+        // The six after those are the moderation powers. The string has grown
+        // since (an ordinary member's now reads "11100000010": the page added
+        // positions for things every member does, uploads among them), so a
+        // later position is not evidence of anything - counting any "1" after
+        // the third made every member a moderator, with the menu to match.
+        Self { post: on(0), react: on(1), whisper: on(2), moderate: bits.bytes().skip(3).take(6).any(|b| b == b'1') }
     }
 }
 
@@ -306,6 +311,11 @@ mod tests {
         assert_eq!(Powers::from_bits("111000000"), Powers { post: true, react: true, whisper: true, moderate: false });
         assert_eq!(Powers::from_bits("000000000"), Powers::default());
         assert!(Powers::from_bits("111010000").moderate);
+        // What the site gives an ordinary member now: nothing to moderate with.
+        assert!(!Powers::from_bits("11100000010").moderate);
+        assert!(!Powers::from_bits("11100000011").moderate);
+        // Moderation is still there when one of its six is granted, whatever follows.
+        assert!(Powers::from_bits("11100100010").moderate);
     }
 
     #[test]
