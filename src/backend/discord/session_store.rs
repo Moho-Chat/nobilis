@@ -139,6 +139,43 @@ impl SessionFile {
         }
     }
 
+    /// Keeps a mid-session `CHANNEL_CREATE` / `CHANNEL_UPDATE` in the saved
+    /// guild snapshot so a resumed restart does not drop channels created
+    /// before the restart.
+    pub fn channel_upsert(&mut self, guild_id: &str, channel: &Value) {
+        let Some(state) = self.state.as_mut() else { return };
+        if let Some(g) = state.guilds.get_mut(guild_id) {
+            super::guilds::upsert_guild_channel(g, channel.clone());
+            self.state_dirty = true;
+            return;
+        }
+        if let Some(guilds) = state.ready["guilds"].as_array_mut() {
+            if let Some(g) = guilds.iter_mut().find(|g| g["id"].as_str() == Some(guild_id)) {
+                super::guilds::upsert_guild_channel(g, channel.clone());
+                self.state_dirty = true;
+            }
+        }
+    }
+
+    /// Drops a deleted channel from the saved guild snapshot so a resumed
+    /// restart does not resurrect it.
+    pub fn channel_remove(&mut self, guild_id: &str, channel_id: &str) {
+        let Some(state) = self.state.as_mut() else { return };
+        if let Some(g) = state.guilds.get_mut(guild_id) {
+            if super::guilds::remove_guild_channel(g, channel_id) {
+                self.state_dirty = true;
+            }
+            return;
+        }
+        if let Some(guilds) = state.ready["guilds"].as_array_mut() {
+            if let Some(g) = guilds.iter_mut().find(|g| g["id"].as_str() == Some(guild_id)) {
+                if super::guilds::remove_guild_channel(g, channel_id) {
+                    self.state_dirty = true;
+                }
+            }
+        }
+    }
+
     /// A heartbeat was acknowledged: the session is alive as of now, and has seen events up to `seq`.
     pub fn acked(&mut self, seq: u64) {
         let Some(position) = self.position.as_mut() else { return };
@@ -300,5 +337,31 @@ mod tests {
         assert!(!token_hash("tok").contains("tok"));
         assert_eq!(token_hash("tok"), token_hash("tok"));
         assert_ne!(token_hash("tok"), token_hash("tok2"));
+    }
+
+    #[test]
+    fn mid_session_channel_changes_survive_a_resumed_restart() {
+        let dir = Scratch::new("channel_changes");
+        let mut first = in_dir(dir.path());
+        first.ready(
+            "s",
+            "wss://x",
+            3,
+            json!({ "session_id": "s", "guilds": [{ "id": "g1", "channels": [{ "id": "v1", "type": 2, "name": "VC-1" }] }] }),
+        );
+        first.channel_upsert("g1", &json!({ "id": "v2", "type": 2, "name": "booting up GTA VI (on linux)" }));
+        first.acked(10);
+
+        let (_, replay) = in_dir(dir.path()).load("tok", chrono::Utc::now().timestamp()).expect("fresh");
+        let chans = replay[0]["d"]["guilds"][0]["channels"].as_array().unwrap();
+        assert_eq!(chans.len(), 2);
+        assert_eq!(chans[1]["id"], "v2");
+
+        first.channel_remove("g1", "v2");
+        first.acked(11);
+        let (_, replay) = in_dir(dir.path()).load("tok", chrono::Utc::now().timestamp()).expect("fresh");
+        let chans = replay[0]["d"]["guilds"][0]["channels"].as_array().unwrap();
+        assert_eq!(chans.len(), 1);
+        assert_eq!(chans[0]["id"], "v1");
     }
 }

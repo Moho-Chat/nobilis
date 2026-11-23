@@ -20,16 +20,14 @@
 /// packets; erring large costs every packet that crosses a smaller link.
 pub const MAX_PAYLOAD: usize = 1100;
 
-/// The RTP payload type Discord uses for VP8.
-///
-/// VP8 rather than H.264 because Chromium's encoder always has it in
-/// software, on every machine this runs on - the H.264 one depends on the
-/// platform, and a screen share that works on one desktop and not the next is
-/// worse than one that is a little larger on the wire.
+/// The RTP payload types Discord uses for video streams.
+pub const PAYLOAD_TYPE_H264: u8 = 101;
 pub const PAYLOAD_TYPE_VP8: u8 = 103;
+pub const PAYLOAD_TYPE_VP9: u8 = 105;
 
-/// Opus, as every Discord voice connection negotiates it.
+/// Opus, as Discord's voice and WebRTC connections negotiate it.
 pub const PAYLOAD_TYPE_OPUS: u8 = 120;
+pub const PAYLOAD_TYPE_OPUS_WEBRTC: u8 = 111;
 
 /// Opus runs at 48kHz and Discord sends it in 20ms frames: 960 samples per
 /// channel, which is also how far the RTP timestamp moves per packet.

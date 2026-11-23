@@ -229,6 +229,7 @@ pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountC
     // that merely used to be, a difference channel_map cannot make since it
     // remembers what was registered rather than what is permitted.
     let visible = register_guild_channels(state, config, &guild, channel_map).await;
+    announce_voice_membership(state, &account_id, Some(guild_id), None);
 
     // Anything this guild used to have and no longer offers. Deleted, or
     // still there and no longer ours to read - which look the same from
@@ -396,6 +397,73 @@ pub(super) fn can_send_in_channel(is_owner: bool, guild_id: &str, roles: &[Value
     channel_permissions(is_owner, guild_id, roles, member_role_ids, user_id, channel) & PERM_SEND_MESSAGES != 0
 }
 
+/// Keeps a guild's cached `channels` array in sync with a live `CHANNEL_CREATE`
+/// or `CHANNEL_UPDATE` dispatch, replacing the channel with the same id or
+/// appending it when new.
+pub(super) fn upsert_guild_channel(guild: &mut Value, channel: Value) {
+    let Some(id) = channel["id"].as_str().map(str::to_string) else { return };
+    match guild["channels"].as_array_mut() {
+        Some(list) => {
+            if let Some(slot) = list.iter_mut().find(|c| c["id"].as_str() == Some(id.as_str())) {
+                *slot = channel;
+            } else {
+                list.push(channel);
+            }
+        }
+        None => guild["channels"] = Value::Array(vec![channel]),
+    }
+}
+
+/// Drops a deleted channel from a guild's cached `channels` array, reporting
+/// whether anything was actually removed.
+pub(super) fn remove_guild_channel(guild: &mut Value, channel_id: &str) -> bool {
+    let Some(list) = guild["channels"].as_array_mut() else { return false };
+    let before = list.len();
+    list.retain(|c| c["id"].as_str() != Some(channel_id));
+    list.len() != before
+}
+
+/// The voice (type 2) and stage (type 13) channels in `channels` that this
+/// account may see, ordered by Discord's category and channel position.
+pub(super) fn collect_voice_channels(
+    channels: &[Value],
+    is_owner: bool,
+    guild_id: &str,
+    roles: &[Value],
+    member_role_ids: &[String],
+    user_id: &str,
+) -> Vec<crate::runtime::VoiceChannelEntry> {
+    let categories: HashMap<&str, i64> = channels
+        .iter()
+        .filter(|c| c["type"].as_i64() == Some(4))
+        .filter_map(|c| Some((c["id"].as_str()?, c["position"].as_i64().unwrap_or(0))))
+        .collect();
+    let mut ranked: Vec<(i64, crate::runtime::VoiceChannelEntry)> = channels
+        .iter()
+        .filter(|c| matches!(c["type"].as_i64(), Some(2) | Some(13)))
+        .filter(|c| can_view_channel(is_owner, guild_id, roles, member_role_ids, user_id, c))
+        .filter_map(|c| {
+            let id = c["id"].as_str()?.to_string();
+            let pos = c["position"].as_i64().unwrap_or(0);
+            let sort = match c["parent_id"].as_str().and_then(|p| categories.get(p)) {
+                Some(&cat_pos) => (cat_pos + 1) * 10_000 + pos,
+                None => pos,
+            };
+            Some((
+                sort,
+                crate::runtime::VoiceChannelEntry {
+                    id,
+                    name: c["name"].as_str().unwrap_or("voice").to_string(),
+                    user_limit: c["user_limit"].as_u64().unwrap_or(0),
+                    stage: c["type"].as_i64() == Some(13),
+                },
+            ))
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    ranked.into_iter().map(|(_, entry)| entry).collect()
+}
+
 /// Shared by both READY's embedded `guilds` array and live GUILD_CREATE
 /// dispatches - same per-guild JSON shape either way (id, name, channels,
 /// roles, members). A guild with no `channels` array (an "unavailable"
@@ -455,18 +523,7 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
     // and listened to from the audience. Recorded rather than made into
     // buffers - there is no conversation to show - so a client can list them
     // and join.
-    let voice: Vec<crate::runtime::VoiceChannelEntry> = channels
-        .iter()
-        .filter(|c| matches!(c["type"].as_i64(), Some(2) | Some(13)))
-        .filter_map(|c| {
-            Some(crate::runtime::VoiceChannelEntry {
-                id: c["id"].as_str()?.to_string(),
-                name: c["name"].as_str().unwrap_or("voice").to_string(),
-                user_limit: c["user_limit"].as_u64().unwrap_or(0),
-                stage: c["type"].as_i64() == Some(13),
-            })
-        })
-        .collect();
+    let voice = collect_voice_channels(channels, is_owner, guild_id, &roles, &member_role_ids, &config.user_id);
     // A stage already live when we connect: its topic is in the guild
     // payload, and no STAGE_INSTANCE_CREATE will come for it.
     for stage in guild["stage_instances"].as_array().into_iter().flatten() {
@@ -474,9 +531,7 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             state.runtime.set_discord_stage_topic(&config.account_id(), channel, stage["topic"].as_str());
         }
     }
-    if !voice.is_empty() {
-        state.runtime.set_discord_voice_channels(&account_id, guild_id, voice);
-    }
+    state.runtime.set_discord_voice_channels(&account_id, guild_id, voice);
 
     // Whatever the guild told us about who its people are. Recorded before
     // the voice states below, so anyone already in a channel has a name.
@@ -1319,5 +1374,89 @@ mod merged_member_tests {
         assert!(guild_with_own_member(&guild, Some(&json!([{ "user_id": "someone-else" }])), "me").is_none());
         let with = guild_with_own_member(&guild, Some(&json!([{ "user_id": "me" }])), "me").unwrap();
         assert_eq!(with["members"][0]["user"]["id"], "me");
+    }
+}
+
+#[cfg(test)]
+mod voice_channel_tests {
+    use super::*;
+
+    const GUILD: &str = "g1";
+
+    fn roles(everyone_perms: u64) -> Vec<Value> {
+        vec![json!({ "id": GUILD, "permissions": everyone_perms.to_string() })]
+    }
+
+    #[test]
+    fn voice_and_stage_channels_respect_permissions_and_discord_order() {
+        let r = roles(PERM_VIEW_CHANNEL);
+        let channels = vec![
+            json!({ "id": "cat_b", "type": 4, "name": "Stages", "position": 2 }),
+            json!({ "id": "cat_a", "type": 4, "name": "Voice", "position": 1 }),
+            json!({ "id": "v2", "type": 2, "name": "VC-2", "parent_id": "cat_a", "position": 2 }),
+            json!({ "id": "stage1", "type": 13, "name": "Town Hall", "parent_id": "cat_b", "position": 0 }),
+            json!({ "id": "v1", "type": 2, "name": "VC-1", "parent_id": "cat_a", "position": 1 }),
+            json!({ "id": "top", "type": 2, "name": "Lobby", "position": 0 }),
+            json!({
+                "id": "secret",
+                "type": 2,
+                "name": "Mods Only",
+                "parent_id": "cat_a",
+                "position": 0,
+                "permission_overwrites": [{ "id": GUILD, "type": 0, "allow": "0", "deny": PERM_VIEW_CHANNEL.to_string() }]
+            }),
+            json!({ "id": "txt", "type": 0, "name": "general", "position": 0 }),
+        ];
+
+        let listed = collect_voice_channels(&channels, false, GUILD, &r, &[], "me");
+        let names: Vec<(&str, bool)> = listed.iter().map(|c| (c.name.as_str(), c.stage)).collect();
+        assert_eq!(
+            names,
+            vec![("Lobby", false), ("VC-1", false), ("VC-2", false), ("Town Hall", true)]
+        );
+
+        // The guild owner sees the restricted channel too, in its position before VC-1.
+        let owned = collect_voice_channels(&channels, true, GUILD, &r, &[], "me");
+        assert!(owned.iter().any(|c| c.id == "secret"));
+    }
+
+    #[test]
+    fn live_channel_upsert_and_remove_preserve_siblings() {
+        let r = roles(PERM_VIEW_CHANNEL);
+        let mut guild = json!({
+            "id": GUILD,
+            "channels": [
+                { "id": "cat", "type": 4, "name": "Voice Channels", "position": 1 },
+                { "id": "v1", "type": 2, "name": "VC-1", "parent_id": "cat", "position": 0 },
+                { "id": "v2", "type": 2, "name": "VC-2", "parent_id": "cat", "position": 1 }
+            ]
+        });
+
+        // A dynamic voice channel created mid-session is added alongside existing ones.
+        upsert_guild_channel(
+            &mut guild,
+            json!({ "id": "v3", "type": 2, "name": "booting up GTA VI (on linux)", "parent_id": "cat", "position": 2 }),
+        );
+        let listed = collect_voice_channels(guild["channels"].as_array().unwrap(), false, GUILD, &r, &[], "me");
+        assert_eq!(
+            listed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["VC-1", "VC-2", "booting up GTA VI (on linux)"]
+        );
+
+        // Renaming it updates in place without duplicating.
+        upsert_guild_channel(
+            &mut guild,
+            json!({ "id": "v3", "type": 2, "name": "GTA VI live", "parent_id": "cat", "position": 2 }),
+        );
+        let listed = collect_voice_channels(guild["channels"].as_array().unwrap(), false, GUILD, &r, &[], "me");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[2].name, "GTA VI live");
+
+        // Deleting it removes only that channel; deleting the rest empties the list.
+        assert!(remove_guild_channel(&mut guild, "v3"));
+        assert!(!remove_guild_channel(&mut guild, "v3"));
+        assert!(remove_guild_channel(&mut guild, "v1"));
+        assert!(remove_guild_channel(&mut guild, "v2"));
+        assert!(collect_voice_channels(guild["channels"].as_array().unwrap(), false, GUILD, &r, &[], "me").is_empty());
     }
 }

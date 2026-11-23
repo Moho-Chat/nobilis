@@ -829,7 +829,14 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             let merged = d["merged_members"].as_array();
                             for (i, g) in guilds.iter().enumerate() {
                                 let with_me = guild_with_own_member(g, merged.and_then(|m| m.get(i)), &config.user_id);
-                                register_guild_channels(state, config, with_me.as_ref().unwrap_or(g), channel_map).await;
+                                let full = with_me.as_ref().unwrap_or(g);
+                                register_guild_channels(state, config, full, channel_map).await;
+                                // Kept just as GUILD_CREATE keeps it: for accounts whose guilds arrive in READY,
+                                // GUILD_CREATE never fires, so later CHANNEL_CREATE / THREAD_CREATE / role events
+                                // need the guild context recorded here.
+                                if let Some(guild_id) = full["id"].as_str() {
+                                    guild_context.insert(guild_id.to_string(), full.clone());
+                                }
                             }
                         }
 
@@ -977,13 +984,16 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             // permission check are the same code that ran at
                             // connect rather than a second copy of it.
                             Some(guild_id) => {
-                                let Some(guild) = guild_context.get(guild_id).cloned() else { continue };
+                                let Some(guild) = guild_context.get_mut(guild_id) else { continue };
+                                upsert_guild_channel(guild, d.clone());
+                                let updated = guild.clone();
+                                persist.channel_upsert(guild_id, d);
                                 // A rename has to drop the old buffer first:
                                 // the buffer's identity is its name, so the
                                 // new one would otherwise appear alongside
                                 // the old rather than replace it.
                                 if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
-                                    let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
+                                    let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", updated["name"].as_str().unwrap_or("guild")));
                                     if new_name.as_deref() == Some(old_name.as_str()) {
                                         // Nothing to re-register, but the topic is edited
                                         // in place and arrives this way.
@@ -999,9 +1009,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                     state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
                                     channel_map.remove(channel_id);
                                 }
-                                let mut one = guild.clone();
-                                one["channels"] = serde_json::Value::Array(vec![d.clone()]);
-                                register_guild_channels(state, config, &one, channel_map).await;
+                                register_guild_channels(state, config, &updated, channel_map).await;
+                                if matches!(d["type"].as_i64(), Some(2) | Some(13)) {
+                                    announce_voice_membership(state, &account_id, Some(guild_id), Some(channel_id));
+                                }
                                 // A channel made while connected inherits its
                                 // guild's mute, which is already known - so
                                 // it arrives quiet rather than becoming quiet
@@ -1128,6 +1139,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let Some(channel_id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(channel_id) {
                             state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
+                        }
+                        if let Some(guild_id) = d["guild_id"].as_str() {
+                            persist.channel_remove(guild_id, channel_id);
+                            if let Some(guild) = guild_context.get_mut(guild_id) {
+                                let removed = remove_guild_channel(guild, channel_id);
+                                if removed && matches!(d["type"].as_i64(), Some(2) | Some(13)) {
+                                    let updated = guild.clone();
+                                    state.runtime.set_discord_stage_topic(&account_id, channel_id, None);
+                                    register_guild_channels(state, config, &updated, channel_map).await;
+                                    announce_voice_membership(state, &account_id, Some(guild_id), Some(channel_id));
+                                }
+                            }
                         }
                     }
 
