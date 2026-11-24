@@ -176,6 +176,24 @@ impl SessionFile {
         }
     }
 
+    /// Merges a freshly-fetched guild snapshot (channels, roles, own member)
+    /// into the saved session so a resumed restart does not replay stale
+    /// permissions or resurrect channels that were hidden.
+    pub fn guild_sync(&mut self, guild_id: &str, refreshed: &Value) {
+        let Some(state) = self.state.as_mut() else { return };
+        if let Some(g) = state.guilds.get_mut(guild_id) {
+            super::guilds::merge_guild_snapshot(g, refreshed);
+            self.state_dirty = true;
+            return;
+        }
+        if let Some(guilds) = state.ready["guilds"].as_array_mut() {
+            if let Some(g) = guilds.iter_mut().find(|g| g["id"].as_str() == Some(guild_id)) {
+                super::guilds::merge_guild_snapshot(g, refreshed);
+                self.state_dirty = true;
+            }
+        }
+    }
+
     /// A heartbeat was acknowledged: the session is alive as of now, and has seen events up to `seq`.
     pub fn acked(&mut self, seq: u64) {
         let Some(position) = self.position.as_mut() else { return };
@@ -363,5 +381,52 @@ mod tests {
         let chans = replay[0]["d"]["guilds"][0]["channels"].as_array().unwrap();
         assert_eq!(chans.len(), 1);
         assert_eq!(chans[0]["id"], "v1");
+    }
+
+    #[test]
+    fn guild_sync_updates_saved_channels_roles_and_own_member() {
+        let dir = Scratch::new("guild_sync");
+        let mut first = in_dir(dir.path());
+        first.ready(
+            "s",
+            "wss://x",
+            3,
+            json!({
+                "session_id": "s",
+                "guilds": [{
+                    "id": "g1",
+                    "name": "chasm server",
+                    "channels": [
+                        { "id": "c1", "type": 0, "name": "announcements" },
+                        { "id": "c2", "type": 0, "name": "general" }
+                    ],
+                    "roles": [{ "id": "g1", "permissions": "1024" }],
+                    "members": [{ "user": { "id": "7" }, "roles": ["r1"] }],
+                    "voice_states": [{ "user_id": "9", "channel_id": "v1" }]
+                }]
+            }),
+        );
+        first.guild_sync(
+            "g1",
+            &json!({
+                "id": "g1",
+                "name": "chasm server",
+                "channels": [
+                    { "id": "c1", "type": 0, "name": "announcements" }
+                ],
+                "roles": [{ "id": "g1", "permissions": "0" }],
+                "members": [{ "user": { "id": "7" }, "roles": [] }]
+            }),
+        );
+        first.acked(12);
+
+        let (_, replay) = in_dir(dir.path()).load("tok", chrono::Utc::now().timestamp()).expect("fresh");
+        let guild = &replay[0]["d"]["guilds"][0];
+        assert_eq!(guild["channels"].as_array().unwrap().len(), 1);
+        assert_eq!(guild["channels"][0]["id"], "c1");
+        assert_eq!(guild["roles"][0]["permissions"], "0");
+        assert_eq!(guild["members"][0]["roles"], json!([]));
+        // Gateway-only fields not returned by REST are preserved.
+        assert_eq!(guild["voice_states"][0]["user_id"], "9");
     }
 }

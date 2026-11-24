@@ -295,6 +295,67 @@ pub(super) const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(4);
 
 pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
+/// Target time for one full background sweep across every guild's channel list,
+/// catching any channel or permission change whose gateway event was missed or
+/// replayed stale across a resumed restart.
+pub(super) const CHANNEL_POLL_SWEEP: Duration = Duration::from_secs(5 * 60);
+
+/// Never poll more than one guild every five seconds during background sweeps,
+/// keeping REST traffic gentle even for accounts in many servers.
+pub(super) const CHANNEL_POLL_MIN_GAP: Duration = Duration::from_secs(5);
+
+/// Poll at least one guild per minute even for accounts in very few servers.
+pub(super) const CHANNEL_POLL_MAX_GAP: Duration = Duration::from_secs(60);
+
+/// Short per-guild pacing right after a resumed session (`RESUMED`), so a
+/// restart that replayed a cached guild snapshot catches up with current
+/// server channels and permissions within seconds.
+pub(super) const RESUME_POLL_GAP: Duration = Duration::from_secs(2);
+
+/// Schedules round-robin guild channel-list polls on the gateway loop.
+#[derive(Default)]
+pub(super) struct GuildPoller {
+    queue: std::collections::VecDeque<String>,
+    fast_remaining: usize,
+}
+
+impl GuildPoller {
+    pub(super) fn schedule_resume_sweep(&mut self, guild_ids: impl IntoIterator<Item = String>) {
+        let mut ids: Vec<String> = guild_ids.into_iter().collect();
+        ids.sort();
+        self.fast_remaining = ids.len();
+        self.queue = ids.into();
+    }
+
+    pub(super) fn next_delay(&self, guild_count: usize) -> Duration {
+        if self.fast_remaining > 0 {
+            return RESUME_POLL_GAP;
+        }
+        if guild_count == 0 {
+            return CHANNEL_POLL_MAX_GAP;
+        }
+        (CHANNEL_POLL_SWEEP / (guild_count as u32)).clamp(CHANNEL_POLL_MIN_GAP, CHANNEL_POLL_MAX_GAP)
+    }
+
+    pub(super) fn next_guild(&mut self, known_guilds: &HashMap<String, Value>) -> Option<String> {
+        while let Some(id) = self.queue.pop_front() {
+            if self.fast_remaining > 0 {
+                self.fast_remaining -= 1;
+            }
+            if known_guilds.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        if known_guilds.is_empty() {
+            return None;
+        }
+        let mut ids: Vec<String> = known_guilds.keys().cloned().collect();
+        ids.sort();
+        self.queue = ids.into();
+        self.queue.pop_front()
+    }
+}
+
 /// Keeps re-establishing the gateway connection for as long as this task
 /// lives - a fresh attempt (after a backoff wait, past the first) on every
 /// disconnect: a network blip, Discord requesting a reconnect (op 7), an
@@ -625,6 +686,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // two apart in the log afterwards.
     let mut tally: HashMap<String, u32> = HashMap::new();
     let mut tally_since = std::time::Instant::now();
+    let mut poller = GuildPoller::default();
+    let mut next_poll = tokio::time::Instant::now() + CHANNEL_POLL_MAX_GAP;
 
     loop {
         // What a resume does not send comes first, from the last run; `replaying` says so to the handlers.
@@ -637,6 +700,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 let msg = tokio::select! {
                     result = next_json_inflating(&mut stream, Some(&mut inflater)) => result?,
                     _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
+                    _ = tokio::time::sleep_until(next_poll), if !guild_context.is_empty() => {
+                        if let Some(guild_id) = poller.next_guild(guild_context) {
+                            resync_guild(state, config, &guild_id, channel_map, guild_context, persist).await;
+                        }
+                        next_poll = tokio::time::Instant::now() + poller.next_delay(guild_context.len());
+                        continue;
+                    }
                 };
                 (msg, false)
             }
@@ -677,6 +747,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "RESUMED" => {
                         state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
                         tracing::info!("discord[{account_id}]: resumed");
+                        // A resumed session replays a cached guild snapshot
+                        // rather than fresh READY/GUILD_CREATE payloads. Sweep
+                        // the guild channel lists shortly after resume so any
+                        // permission or channel changes missed or saved stale
+                        // are corrected right away.
+                        if !guild_context.is_empty() {
+                            poller.schedule_resume_sweep(guild_context.keys().cloned());
+                            next_poll = tokio::time::Instant::now() + RESUME_POLL_GAP;
+                        }
                     }
                     "READY" => {
                         // A new login has missed what the last one did not: what was asked about is asked afresh.
@@ -830,14 +909,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             for (i, g) in guilds.iter().enumerate() {
                                 let with_me = guild_with_own_member(g, merged.and_then(|m| m.get(i)), &config.user_id);
                                 let full = with_me.as_ref().unwrap_or(g);
-                                register_guild_channels(state, config, full, channel_map).await;
+                                let visible = register_guild_channels(state, config, full, channel_map).await;
                                 // Kept just as GUILD_CREATE keeps it: for accounts whose guilds arrive in READY,
                                 // GUILD_CREATE never fires, so later CHANNEL_CREATE / THREAD_CREATE / role events
                                 // need the guild context recorded here.
                                 if let Some(guild_id) = full["id"].as_str() {
+                                    prune_guild_buffers(state, &account_id, guild_id, &visible, channel_map);
                                     guild_context.insert(guild_id.to_string(), full.clone());
                                 }
                             }
+                        }
+                        if !replaying && !guild_context.is_empty() {
+                            next_poll = tokio::time::Instant::now() + poller.next_delay(guild_context.len());
                         }
 
                         // READY's own private_channels array isn't reliably
@@ -907,7 +990,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         if let (false, Some(id)) = (replaying, d["id"].as_str()) {
                             persist.guild(id, d);
                         }
-                        register_guild_channels(state, config, d, channel_map).await;
+                        let visible = register_guild_channels(state, config, d, channel_map).await;
                         // The channels this guild's settings were about now
                         // exist. READY carried the mutes before any of them
                         // did, so this is where most of them actually land.
@@ -918,6 +1001,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // need the guild's roles and our own membership,
                         // which arrive only here.
                         if let Some(guild_id) = d["id"].as_str() {
+                            prune_guild_buffers(state, &account_id, guild_id, &visible, channel_map);
                             // Kept in the runtime as well as here: the
                             // gateway task owns this map, and a profile
                             // asked for from an RPC needs the same roles to
@@ -985,6 +1069,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             // connect rather than a second copy of it.
                             Some(guild_id) => {
                                 let Some(guild) = guild_context.get_mut(guild_id) else { continue };
+                                let prev = guild["channels"]
+                                    .as_array()
+                                    .and_then(|list| list.iter().find(|c| c["id"].as_str() == Some(channel_id)))
+                                    .cloned();
+                                let structure_changed = channel_structure_changed(prev.as_ref(), d);
                                 upsert_guild_channel(guild, d.clone());
                                 let updated = guild.clone();
                                 persist.channel_upsert(guild_id, d);
@@ -1004,12 +1093,20 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                         if let Some(seconds) = d["rate_limit_per_user"].as_u64() {
                                             super::send_guard::set_slowmode(&crate::model::buffer_id(&account_id, &old_name), seconds);
                                         }
-                                        continue;
+                                        // Only skip the full visibility/resync pass when nothing
+                                        // affecting permissions, category, order, or kind changed:
+                                        // hiding a channel via permission_overwrites keeps the same
+                                        // name and must remove the buffer.
+                                        if !structure_changed {
+                                            continue;
+                                        }
+                                    } else {
+                                        state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
+                                        channel_map.remove(channel_id);
                                     }
-                                    state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
-                                    channel_map.remove(channel_id);
                                 }
-                                register_guild_channels(state, config, &updated, channel_map).await;
+                                let visible = register_guild_channels(state, config, &updated, channel_map).await;
+                                prune_guild_buffers(state, &account_id, guild_id, &visible, channel_map);
                                 if matches!(d["type"].as_i64(), Some(2) | Some(13)) {
                                     announce_voice_membership(state, &account_id, Some(guild_id), Some(channel_id));
                                 }
@@ -1024,7 +1121,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 // a channel, which the single-channel path
                                 // above cannot do.
                                 if t == "CHANNEL_UPDATE" {
-                                    resync_guild(state, config, guild_id, channel_map).await;
+                                    resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
                                 }
                             }
                             // A DM or group DM opened from another client.
@@ -1165,7 +1262,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" => {
                         let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         if guild_context.contains_key(guild_id) {
-                            resync_guild(state, config, guild_id, channel_map).await;
+                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
                         }
                     }
 
@@ -1197,7 +1294,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let roles_now: Vec<String> = d["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(String::from)).collect();
                         let roles_changed = state.runtime.set_discord_own_roles(&guild_group_id(&account_id, guild_id), roles_now);
                         if was_gated || roles_changed {
-                            resync_guild(state, config, guild_id, channel_map).await;
+                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
                         }
                     }
 
@@ -1427,7 +1524,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
                         let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         if guild_context.contains_key(guild_id) {
-                            resync_guild(state, config, guild_id, channel_map).await;
+                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
                         }
                     }
 
@@ -1853,5 +1950,36 @@ mod close_code_tests {
         assert!(closed_with(4004).await.downcast_ref::<GatewayAuthFailed>().is_some());
         let plain = closed_with(1000).await;
         assert!(plain.downcast_ref::<GatewayRateLimited>().is_none() && plain.downcast_ref::<GatewayAuthFailed>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod guild_poller_tests {
+    use super::*;
+
+    #[test]
+    fn poller_cycles_guilds_and_prioritizes_resume_sweep() {
+        let mut known = HashMap::new();
+        known.insert("g2".to_string(), json!({}));
+        known.insert("g1".to_string(), json!({}));
+        known.insert("g3".to_string(), json!({}));
+
+        let mut poller = GuildPoller::default();
+        assert_eq!(poller.next_delay(3), CHANNEL_POLL_MAX_GAP);
+        assert_eq!(poller.next_delay(100), CHANNEL_POLL_MIN_GAP);
+        assert_eq!(poller.next_delay(10), Duration::from_secs(30));
+
+        poller.schedule_resume_sweep(known.keys().cloned());
+        assert_eq!(poller.next_delay(3), RESUME_POLL_GAP);
+        assert_eq!(poller.next_guild(&known).as_deref(), Some("g1"));
+        assert_eq!(poller.next_delay(3), RESUME_POLL_GAP);
+        // Removing a guild before its turn skips it cleanly.
+        known.remove("g2");
+        assert_eq!(poller.next_guild(&known).as_deref(), Some("g3"));
+        // Resume sweep is done, back to normal cadence.
+        assert_eq!(poller.next_delay(2), CHANNEL_POLL_MAX_GAP);
+        // Next round-robin cycle starts from the remaining known guilds.
+        assert_eq!(poller.next_guild(&known).as_deref(), Some("g1"));
+        assert_eq!(poller.next_guild(&known).as_deref(), Some("g3"));
     }
 }
