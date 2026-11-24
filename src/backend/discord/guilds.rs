@@ -69,6 +69,12 @@ pub(super) const PERM_KICK_MEMBERS: u64 = 1 << 1;
 
 pub(super) const PERM_BAN_MEMBERS: u64 = 1 << 2;
 
+pub(super) const PERM_MUTE_MEMBERS: u64 = 1 << 22;
+
+pub(super) const PERM_DEAFEN_MEMBERS: u64 = 1 << 23;
+
+pub(super) const PERM_MOVE_MEMBERS: u64 = 1 << 24;
+
 pub(super) const PERM_MANAGE_ROLES: u64 = 1 << 28;
 
 /// Discord's own name for putting somebody in timeout.
@@ -179,7 +185,14 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
 /// comes from the rail entry rather than either: it is the order somebody
 /// dragged their servers into, which REST does not know and which would
 /// silently reshuffle the column if rebuilt as zero.
-pub(super) async fn resync_guild(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+pub(super) async fn resync_guild(
+    state: &AppState,
+    config: &DiscordAccountConfig,
+    guild_id: &str,
+    channel_map: &mut HashMap<String, (String, String)>,
+    guild_context: &mut HashMap<String, Value>,
+    persist: &mut super::session_store::SessionFile,
+) {
     let account_id = config.account_id();
     let group_id = guild_group_id(&account_id, guild_id);
     // A burst - one event per channel while a server is rearranged - becomes
@@ -188,25 +201,123 @@ pub(super) async fn resync_guild(state: &AppState, config: &DiscordAccountConfig
         return;
     }
     loop {
-        resync_guild_once(state, config, guild_id, channel_map).await;
+        resync_guild_once(state, config, guild_id, channel_map, guild_context, persist).await;
         if !state.runtime.finish_guild_resync(&group_id) {
             return;
         }
     }
 }
 
-pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+/// Merges authoritative fields from a REST guild resync into an existing
+/// cached guild snapshot, keeping gateway-only fields (`voice_states`,
+/// `threads`, `stage_instances`, `presences`) that REST does not return.
+pub(super) fn merge_guild_snapshot(existing: &mut Value, refreshed: &Value) {
+    let Some(dst) = existing.as_object_mut() else { return };
+    let Some(src) = refreshed.as_object() else { return };
+    for key in ["channels", "roles", "name", "owner_id", "emojis", "stickers", "position"] {
+        if let Some(v) = src.get(key) {
+            if !v.is_null() {
+                dst.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(icon) = src.get("icon") {
+        dst.insert("icon".to_string(), icon.clone());
+    }
+    if let Some(src_members) = src.get("members").and_then(Value::as_array) {
+        let dst_members = dst.entry("members").or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(list) = dst_members.as_array_mut() {
+            for m in src_members {
+                let uid = m["user"]["id"].as_str().or_else(|| m["user_id"].as_str());
+                if let Some(uid) = uid {
+                    if let Some(slot) = list.iter_mut().find(|e| e["user"]["id"].as_str() == Some(uid) || e["user_id"].as_str() == Some(uid)) {
+                        *slot = m.clone();
+                    } else {
+                        list.push(m.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether a `CHANNEL_UPDATE` changed anything that affects visibility,
+/// category placement, ordering, or channel kind - as opposed to an in-place
+/// metadata edit like topic, slowmode, or `last_message_id`.
+pub(super) fn channel_structure_changed(prev: Option<&Value>, next: &Value) -> bool {
+    let Some(prev) = prev else { return true };
+    prev.get("permission_overwrites") != next.get("permission_overwrites")
+        || prev.get("parent_id") != next.get("parent_id")
+        || prev.get("position") != next.get("position")
+        || prev.get("type") != next.get("type")
+        || prev.get("name") != next.get("name")
+}
+
+/// Removes any buffer belonging to `guild_id` that is no longer in `visible`
+/// (deleted, hidden by a permission or role change, or restored from the last
+/// run's layout and no longer permitted).
+pub(super) fn prune_guild_buffers(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    visible: &std::collections::HashSet<String>,
+    channel_map: &mut HashMap<String, (String, String)>,
+) {
+    let group_id = guild_group_id(account_id, guild_id);
+    let mut to_remove: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for buffer_id in state.runtime.discord_buffers_in_guild(account_id, guild_id) {
+        let channel_id = state.runtime.get_discord_channel(&buffer_id);
+        if channel_id.as_deref().is_some_and(|cid| visible.contains(cid)) {
+            continue;
+        }
+        if seen.insert(buffer_id.clone()) {
+            to_remove.push((buffer_id, channel_id));
+        }
+    }
+
+    for buf in state.runtime.list_buffers() {
+        if buf.account_id != account_id || buf.group_id.as_deref() != Some(group_id.as_str()) {
+            continue;
+        }
+        let channel_id = state.runtime.get_discord_channel(&buf.id);
+        if channel_id.as_deref().is_some_and(|cid| visible.contains(cid)) {
+            continue;
+        }
+        if seen.insert(buf.id.clone()) {
+            to_remove.push((buf.id, channel_id));
+        }
+    }
+
+    for (buffer_id, channel_id) in to_remove {
+        if let Some(cid) = channel_id {
+            channel_map.remove(&cid);
+        }
+        state.runtime.remove_buffer(state, &buffer_id);
+    }
+}
+
+pub(super) async fn resync_guild_once(
+    state: &AppState,
+    config: &DiscordAccountConfig,
+    guild_id: &str,
+    channel_map: &mut HashMap<String, (String, String)>,
+    guild_context: &mut HashMap<String, Value>,
+    persist: &mut super::session_store::SessionFile,
+) {
     let account_id = config.account_id();
     let fetch = |path: String| async move {
-        http_client_for(&config.token)
+        let resp = http_client_for(&config.token)
             .get(format!("{API_BASE}/{path}"))
             .header("Authorization", &config.token)
             .send_paced()
             .await
-            .ok()?
-            .json::<Value>()
-            .await
-            .ok()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
     };
     let (Some(mut guild), Some(channels)) = (
         fetch(format!("guilds/{guild_id}")).await,
@@ -215,13 +326,25 @@ pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountC
         tracing::debug!("discord: could not re-read guild {guild_id}");
         return;
     };
+    if guild["id"].as_str() != Some(guild_id) {
+        tracing::debug!("discord: guild {guild_id} returned unexpected payload");
+        return;
+    }
     let Some(list) = channels.as_array().cloned() else {
         tracing::debug!("discord: guild {guild_id} returned no channel list");
         return;
     };
-    guild["channels"] = Value::Array(list.clone());
+    guild["channels"] = Value::Array(list);
     if let Some(group) = state.runtime.get_buffer_group(&guild_group_id(&account_id, guild_id)) {
         guild["position"] = serde_json::json!(group.position);
+    }
+    // Carry known threads forward so active threads under still-visible
+    // channels survive a resync, while threads under hidden channels are
+    // dropped because their parent is no longer visible.
+    if let Some(existing) = guild_context.get(guild_id) {
+        if let Some(threads) = existing.get("threads").filter(|t| t.is_array()) {
+            guild["threads"] = threads.clone();
+        }
     }
 
     // Adds whatever is newly visible and reports everything it judged
@@ -230,18 +353,30 @@ pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountC
     // remembers what was registered rather than what is permitted.
     let visible = register_guild_channels(state, config, &guild, channel_map).await;
     announce_voice_membership(state, &account_id, Some(guild_id), None);
+    mutes::apply(state, &account_id);
 
     // Anything this guild used to have and no longer offers. Deleted, or
     // still there and no longer ours to read - which look the same from
     // here and want the same answer.
-    for buffer_id in state.runtime.discord_buffers_in_guild(&account_id, guild_id) {
-        let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) else { continue };
-        if visible.contains(&channel_id) {
-            continue;
+    prune_guild_buffers(state, &account_id, guild_id, &visible, channel_map);
+
+    // Keep guild_context and the persisted session snapshot in sync with the
+    // refreshed guild, channels, roles, and own membership so a resumed
+    // restart does not replay stale permissions.
+    if let Some(me) = state.runtime.discord_member(guild_id, &config.user_id) {
+        let mut me = me;
+        if me["user"]["id"].is_null() {
+            me["user"] = json!({ "id": config.user_id });
         }
-        channel_map.remove(&channel_id);
-        state.runtime.remove_buffer(state, &buffer_id);
+        guild["members"] = json!([me]);
     }
+    match guild_context.get_mut(guild_id) {
+        Some(existing) => merge_guild_snapshot(existing, &guild),
+        None => {
+            guild_context.insert(guild_id.to_string(), guild.clone());
+        }
+    }
+    persist.guild_sync(guild_id, &guild);
 }
 
 /// This account's own member object out of READY's `merged_members`, which lists, for each guild in the order READY
@@ -633,25 +768,6 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         visible.insert(channel_id.to_string());
         let chan_name = ch["name"].as_str().unwrap_or("channel");
         let name = format!("{guild_name}/#{chan_name}");
-        // Said on the conversation, so the window can put a banner where the
-        // message box would be. Re-asked every time the guild is read, since
-        // permissions change under a channel that is already registered.
-        let permissions = channel_permissions(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch);
-        let read_only = (permissions & PERM_SEND_MESSAGES == 0).then_some(NO_SEND_PERMISSION);
-        if channel_map.contains_key(channel_id) {
-            let existing = crate::model::buffer_id(&account_id, &name);
-            super::send_guard::note_channel(state, &existing, ch, permissions, is_owner);
-            super::send_guard::set_permission(state, &account_id, &existing, read_only);
-            continue;
-        }
-        let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
-        // The guild is known before the reason is worked out: the lock is the guild's.
-        state.runtime.set_discord_channel(state, &buf.id, channel_id);
-        state.runtime.set_discord_guild(&buf.id, guild_id);
-        super::send_guard::note_channel(state, &buf.id, ch, permissions, is_owner);
-        super::send_guard::set_permission(state, &account_id, &buf.id, read_only);
-        state.runtime.set_buffer_group(state, &buf.id, &group_id);
-
         // Where Discord itself puts this channel. Uncategorised channels sit
         // above every heading, which is where Discord shows them, so they take
         // a category rank below any real one.
@@ -661,6 +777,36 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             Some((_, cat_pos)) => (cat_pos + 1) * 10_000 + channel_pos,
             None => channel_pos,
         };
+        // Always record the parent so active threads under already-registered
+        // channels remain visible across resyncs.
+        parents.insert(channel_id.to_string(), (chan_name.to_string(), sort));
+        // Said on the conversation, so the window can put a banner where the
+        // message box would be. Re-asked every time the guild is read, since
+        // permissions change under a channel that is already registered.
+        let permissions = channel_permissions(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch);
+        let read_only = (permissions & PERM_SEND_MESSAGES == 0).then_some(NO_SEND_PERMISSION);
+        if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
+            if old_name == name {
+                let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
+                state.runtime.set_discord_channel(state, &buf.id, channel_id);
+                state.runtime.set_discord_guild(&buf.id, guild_id);
+                state.runtime.set_buffer_group(state, &buf.id, &group_id);
+                state.runtime.set_buffer_category(state, &buf.id, parent.map(|(n, _)| *n), sort);
+                state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
+                super::send_guard::note_channel(state, &buf.id, ch, permissions, is_owner);
+                super::send_guard::set_permission(state, &account_id, &buf.id, read_only);
+                continue;
+            }
+            state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
+            channel_map.remove(channel_id);
+        }
+        let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
+        // The guild is known before the reason is worked out: the lock is the guild's.
+        state.runtime.set_discord_channel(state, &buf.id, channel_id);
+        state.runtime.set_discord_guild(&buf.id, guild_id);
+        super::send_guard::note_channel(state, &buf.id, ch, permissions, is_owner);
+        super::send_guard::set_permission(state, &account_id, &buf.id, read_only);
+        state.runtime.set_buffer_group(state, &buf.id, &group_id);
         state.runtime.set_buffer_category(state, &buf.id, parent.map(|(name, _)| *name), sort);
         // What the channel says it is for, which Discord sends with the channel.
         state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
@@ -686,7 +832,6 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             state.runtime.set_discord_buffer_emojis(&buf.id, usable);
         }
         channel_map.insert(channel_id.to_string(), (name, "channel".to_string()));
-        parents.insert(channel_id.to_string(), (chan_name.to_string(), sort));
         new_channels.push((buf.id, channel_id.to_string()));
     }
 
@@ -737,6 +882,12 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         {
             visible.insert(thread_id.clone());
             new_channels.push((buffer_id, thread_id));
+        } else if let (Some(thread_id), Some(parent_id)) = (thread["id"].as_str(), thread["parent_id"].as_str()) {
+            // Already registered under a parent that is still visible: keep it
+            // in `visible` so resync pruning does not drop live threads.
+            if parents.contains_key(parent_id) && channel_map.contains_key(thread_id) {
+                visible.insert(thread_id.to_string());
+            }
         }
     }
 
@@ -931,12 +1082,28 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
 /// way: Discord re-checks every action and refuses it in its own words, so
 /// the worst this can be wrong about is which menu entries are offered.
 pub fn guild_powers(state: &AppState, account_id: &str, buffer_id: &str) -> Value {
-    let nothing = json!({ "canKick": false, "canBan": false, "canMute": false, "canAssignRoles": false });
+    let nothing = json!({
+        "canKick": false,
+        "canBan": false,
+        "canMute": false,
+        "canAssignRoles": false,
+        "canVoiceMute": false,
+        "canVoiceDeafen": false,
+        "canVoiceMove": false,
+    });
     let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) else { return nothing };
     let Some(cfg) = state.accounts.get_discord(account_id) else { return nothing };
     // Owning the place is the permission that outranks every role.
     if state.runtime.discord_guild_owner(&guild_id).as_deref() == Some(cfg.user_id.as_str()) {
-        return json!({ "canKick": true, "canBan": true, "canMute": true, "canAssignRoles": true });
+        return json!({
+            "canKick": true,
+            "canBan": true,
+            "canMute": true,
+            "canAssignRoles": true,
+            "canVoiceMute": true,
+            "canVoiceDeafen": true,
+            "canVoiceMove": true,
+        });
     }
     let roles = state.runtime.discord_guild_roles(&guild_id);
     let mine = state
@@ -961,6 +1128,9 @@ pub fn guild_powers(state: &AppState, account_id: &str, buffer_id: &str) -> Valu
         // Timeout, which is what "mute" means on Discord.
         "canMute": may(PERM_MODERATE_MEMBERS),
         "canAssignRoles": may(PERM_MANAGE_ROLES),
+        "canVoiceMute": may(PERM_MUTE_MEMBERS),
+        "canVoiceDeafen": may(PERM_DEAFEN_MEMBERS),
+        "canVoiceMove": may(PERM_MOVE_MEMBERS),
     })
 }
 
@@ -1038,6 +1208,31 @@ pub async fn moderate_member(
             http.patch(format!("{base}/members/{user_id}"))
                 .json(&json!({ "communication_disabled_until": Value::Null })),
             "lifting the timeout",
+        ),
+        "voice_mute" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "mute": true })),
+            "server-muting them in voice",
+        ),
+        "voice_unmute" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "mute": false })),
+            "server-unmuting them in voice",
+        ),
+        "voice_deafen" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "deaf": true })),
+            "server-deafening them in voice",
+        ),
+        "voice_undeafen" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "deaf": false })),
+            "server-undeafening them in voice",
+        ),
+        "voice_disconnect" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "channel_id": Value::Null })),
+            "disconnecting them from voice",
         ),
         other => bail!("moho does not know how to {other} somebody on Discord"),
     };
@@ -1458,5 +1653,74 @@ mod voice_channel_tests {
         assert!(remove_guild_channel(&mut guild, "v1"));
         assert!(remove_guild_channel(&mut guild, "v2"));
         assert!(collect_voice_channels(guild["channels"].as_array().unwrap(), false, GUILD, &r, &[], "me").is_empty());
+    }
+
+    #[test]
+    fn channel_structure_change_distinguishes_permissions_from_metadata() {
+        let base = json!({
+            "id": "c1",
+            "type": 0,
+            "name": "general",
+            "parent_id": "cat1",
+            "position": 1,
+            "topic": "old",
+            "rate_limit_per_user": 0,
+            "permission_overwrites": []
+        });
+        let topic_only = json!({
+            "id": "c1",
+            "type": 0,
+            "name": "general",
+            "parent_id": "cat1",
+            "position": 1,
+            "topic": "new topic",
+            "rate_limit_per_user": 5,
+            "permission_overwrites": []
+        });
+        assert!(!channel_structure_changed(Some(&base), &topic_only));
+
+        let hidden = json!({
+            "id": "c1",
+            "type": 0,
+            "name": "general",
+            "parent_id": "cat1",
+            "position": 1,
+            "topic": "old",
+            "permission_overwrites": [{ "id": GUILD, "type": 0, "allow": "0", "deny": PERM_VIEW_CHANNEL.to_string() }]
+        });
+        assert!(channel_structure_changed(Some(&base), &hidden));
+        assert!(channel_structure_changed(None, &base));
+    }
+
+    #[test]
+    fn merge_guild_snapshot_updates_rest_fields_and_keeps_gateway_fields() {
+        let mut existing = json!({
+            "id": GUILD,
+            "name": "old",
+            "channels": [{ "id": "c1" }, { "id": "c2" }],
+            "roles": [{ "id": GUILD, "permissions": "1024" }],
+            "members": [
+                { "user": { "id": "me" }, "roles": ["r1"] },
+                { "user": { "id": "other" }, "roles": ["r2"] }
+            ],
+            "threads": [{ "id": "t1" }],
+            "voice_states": [{ "user_id": "other", "channel_id": "v1" }]
+        });
+        let refreshed = json!({
+            "id": GUILD,
+            "name": "new",
+            "channels": [{ "id": "c1" }],
+            "roles": [{ "id": GUILD, "permissions": "0" }],
+            "members": [{ "user": { "id": "me" }, "roles": [] }]
+        });
+        merge_guild_snapshot(&mut existing, &refreshed);
+        assert_eq!(existing["name"], "new");
+        assert_eq!(existing["channels"].as_array().unwrap().len(), 1);
+        assert_eq!(existing["roles"][0]["permissions"], "0");
+        assert_eq!(existing["members"].as_array().unwrap().len(), 2);
+        assert_eq!(existing["members"][0]["roles"], json!([]));
+        assert_eq!(existing["members"][1]["user"]["id"], "other");
+        assert_eq!(existing["threads"][0]["id"], "t1");
+        assert_eq!(existing["voice_states"][0]["user_id"], "other");
     }
 }

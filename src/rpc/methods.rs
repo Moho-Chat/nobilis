@@ -8542,6 +8542,32 @@ pub async fn dispatch(
             }
         }
 
+        // Fetches a Go Live stream's preview thumbnail for hover cards in the
+        // voice channel rail, without needing to join the channel first.
+        "getDiscordStreamPreview" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("getDiscordStreamPreview requires \"accountId\"".to_string()));
+            };
+            let built = match (p_str_opt(params, "userId"), p_str_opt(params, "channelId")) {
+                (Some(user_id), Some(channel_id)) => Some(
+                    backend::discord::golive::StreamKey {
+                        guild_id: p_str_opt(params, "guildId").map(str::to_string),
+                        channel_id: channel_id.to_string(),
+                        user_id: user_id.to_string(),
+                    }
+                    .to_wire(),
+                ),
+                _ => None,
+            };
+            let Some(stream_key) = p_str_opt(params, "streamKey").map(str::to_string).or(built) else {
+                return (None, Some("getDiscordStreamPreview requires \"streamKey\", or \"userId\" and \"channelId\"".to_string()));
+            };
+            match backend::discord::golive::fetch_stream_preview(state, account_id, &stream_key).await {
+                Ok(url) => (Some(serde_json::json!({ "url": url, "streamKey": stream_key })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Watching somebody else's stream, which is a different act from
         // hosting one: no capture, no encoder, and a connection that reads
         // rather than writes. The frames arrive as `discordStreamFrame`

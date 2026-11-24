@@ -76,7 +76,7 @@ pub fn voice_members(handle: &Handle, channel: &str) -> Vec<Value> {
     list.iter()
         .map(|m| {
             let avatar = world.users.get(&m.user).and_then(|u| u.avatar.clone()).and_then(|h| media::asset_url(&handle.instance, "avatars", &m.user, &h)).map(|u| media::cached(&handle.account_id, media::AVATARS, &u, None, Some("image/webp")));
-            json!({ "userId": m.user, "name": world.name_in(guild.as_deref(), &m.user), "avatarUrl": avatar, "camera": m.camera, "screen": m.screen, "muted": m.muted })
+            json!({ "userId": m.user, "name": world.name_in(guild.as_deref(), &m.user), "avatarUrl": avatar, "camera": m.camera, "screen": m.screen, "muted": m.muted, "isSelf": m.user == world.own_id })
         })
         .collect()
 }
