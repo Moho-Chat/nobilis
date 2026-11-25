@@ -54,9 +54,24 @@ async fn pace() {
     }
 }
 
-/// Where every read waits its turn: when Discord has said how long to hold off - a 429, or a bucket that ran out - no
-/// request of any kind goes out before then.
+/// Where every request waits its turn when Discord has said to hold off everything: a 429 it calls global. Nothing of
+/// any kind goes out before then.
 static HOLD_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The same, for one route: a bucket that ran out, or a 429 that was about that route alone. Discord counts each route
+/// on its own, as arikawa does, so a channel's history running dry does not stop a message being sent - which, held
+/// for everything, it did, for up to half a minute at a time.
+static ROUTE_HOLDS: std::sync::Mutex<Option<HashMap<String, std::time::Instant>>> = std::sync::Mutex::new(None);
+
+/// The key a route's hold is kept under: the login, the method and the path. Buckets are per login.
+fn route_key(who: &Option<(String, String, String)>) -> Option<String> {
+    who.as_ref().map(|(token, method, path)| format!("{token} {method} {path}"))
+}
+
+/// The route, for a log line: without the login.
+fn route_label(key: &str) -> &str {
+    key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
+}
 
 /// What is added to a bucket's reset time, as in arikawa's limiter: Discord's own clock and ours do not agree to the
 /// millisecond, and arriving on the boundary is arriving early.
@@ -65,33 +80,79 @@ const BUCKET_SLACK: Duration = Duration::from_millis(250);
 /// How many times a read that was rate limited is made again, waiting as long as it was told to.
 const READ_RETRIES: usize = 2;
 
-fn hold_for(wait: Duration) {
+/// Holds `route` for `wait`, or everything when there is no route to hold.
+fn hold_for(route: Option<&str>, wait: Duration) {
     let until = std::time::Instant::now() + wait;
-    let mut held = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-    if held.is_none_or(|at| at < until) {
-        *held = Some(until);
+    match route {
+        Some(route) => {
+            let mut holds = ROUTE_HOLDS.lock().unwrap_or_else(|e| e.into_inner());
+            let holds = holds.get_or_insert_with(HashMap::new);
+            let now = std::time::Instant::now();
+            holds.retain(|_, at| *at > now);
+            let at = holds.entry(route.to_string()).or_insert(until);
+            if *at < until {
+                *at = until;
+            }
+        }
+        None => {
+            let mut held = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_none_or(|at| at < until) {
+                *held = Some(until);
+            }
+        }
     }
 }
 
-async fn wait_out_hold() {
+/// How much longer `route` is held at `now`: by everything being held, or by its own.
+fn held_for(route: Option<&str>, now: std::time::Instant) -> Duration {
+    let global = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).map(|at| at.saturating_duration_since(now)).unwrap_or_default();
+    let own = route
+        .and_then(|r| ROUTE_HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|h| h.get(r).copied()))
+        .map(|at| at.saturating_duration_since(now))
+        .unwrap_or_default();
+    global.max(own)
+}
+
+/// Waits until neither everything nor `route` is held. A wait long enough to be felt is said in the log.
+async fn wait_out_hold(route: Option<&str>) {
+    let started = std::time::Instant::now();
     loop {
-        let wait = {
-            let held = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-            held.map(|at| at.saturating_duration_since(std::time::Instant::now())).unwrap_or_default()
-        };
+        let wait = held_for(route, std::time::Instant::now());
         if wait.is_zero() {
-            return;
+            break;
         }
         tokio::time::sleep(wait).await;
     }
+    let waited = started.elapsed();
+    if waited >= Duration::from_secs(1) {
+        tracing::info!("discord: {} waited {}ms for a rate limit", route.map(route_label).unwrap_or("a request"), waited.as_millis());
+    }
 }
 
-/// Notes what a response says about the bucket it counted against: with none left, nothing goes out until it resets.
-fn note_bucket(resp: &reqwest::Response) {
+/// Whether a 429 is Discord's global limit, which is about every route, rather than one route's.
+fn is_global(resp: &reqwest::Response) -> bool {
+    is_global_headers(resp.headers())
+}
+
+fn is_global_headers(headers: &reqwest::header::HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    header("x-ratelimit-global").is_some_and(|v| v.eq_ignore_ascii_case("true")) || header("x-ratelimit-scope") == Some("global")
+}
+
+/// Holds what a 429 says to: everything when it is global or when the route is not known, else the route.
+fn hold_after_429(route: Option<&str>, resp: &reqwest::Response, pause: Duration) {
+    let route = if is_global(resp) { None } else { route };
+    tracing::info!("discord: rate limited ({}), holding for {}ms", route.map(route_label).unwrap_or("everything"), pause.as_millis());
+    hold_for(route, pause);
+}
+
+/// Notes what a response says about the bucket it counted against: with none left, nothing more goes to that route
+/// until it resets (to anything at all, when the route is not known).
+fn note_bucket(route: Option<&str>, resp: &reqwest::Response) {
     let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
     if header("x-ratelimit-remaining") == Some("0") {
         if let Some(reset) = header("x-ratelimit-reset-after").and_then(|v| v.parse::<f64>().ok()) {
-            hold_for(Duration::from_secs_f64(reset.clamp(0.0, 30.0)) + BUCKET_SLACK);
+            hold_for(route, Duration::from_secs_f64(reset.clamp(0.0, 30.0)) + BUCKET_SLACK);
         }
     }
 }
@@ -255,24 +316,25 @@ pub(super) trait SendPaced {
 impl SendPaced for reqwest::RequestBuilder {
     async fn send_paced(self) -> Result<reqwest::Response> {
         let who = inspect(&self);
+        let route = route_key(&who);
+        let route = route.as_deref();
         preflight(&who)?;
-        wait_out_hold().await;
+        wait_out_hold(route).await;
         let mut pending = Some(self);
         for attempt in 0..=READ_RETRIES {
             let Some(current) = pending.take() else { break };
             // A body that cannot be copied is sent once.
             let again = current.try_clone();
             let resp = current.send().await.context("talking to Discord")?;
-            note_bucket(&resp);
+            note_bucket(route, &resp);
             note_status(&who, resp.status());
             if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == READ_RETRIES {
                 return Ok(resp);
             }
             let Some(again) = again else { return Ok(resp) };
             let pause = retry_after(&resp);
-            tracing::debug!("discord: rate limited on a read, waiting {}ms", pause.as_millis());
-            hold_for(pause);
-            wait_out_hold().await;
+            hold_after_429(route, &resp, pause);
+            wait_out_hold(route).await;
             pending = Some(again);
         }
         unreachable!("the last attempt returns")
@@ -285,18 +347,23 @@ pub(super) async fn send_write_rebuilt<F>(mut build: F) -> Result<reqwest::Respo
 where
     F: FnMut() -> Result<reqwest::RequestBuilder>,
 {
-    wait_out_hold().await;
+    // The route, from a copy built only to read it: a streamed body cannot be copied, so this is the URL alone.
+    let route = build().ok().and_then(|b| b.build().ok()).and_then(|r| {
+        let token = r.headers().get("authorization")?.to_str().ok()?.to_string();
+        route_key(&Some((token, r.method().as_str().to_string(), r.url().path().to_string())))
+    });
+    let route = route.as_deref();
+    wait_out_hold(route).await;
     pace().await;
     for attempt in 0..=RATE_LIMIT_RETRIES {
         let resp = build()?.send().await.context("talking to Discord")?;
-        note_bucket(&resp);
+        note_bucket(route, &resp);
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
         let pause = retry_after(&resp);
-        tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
-        hold_for(pause);
-        wait_out_hold().await;
+        hold_after_429(route, &resp, pause);
+        wait_out_hold(route).await;
     }
     bail!("Discord kept rate-limiting that request")
 }
@@ -314,8 +381,10 @@ where
 /// on is what it sends.
 pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     let who = inspect(&request);
+    let route = route_key(&who);
+    let route = route.as_deref();
     preflight(&who)?;
-    wait_out_hold().await;
+    wait_out_hold(route).await;
     pace().await;
 
     let mut pending = Some(request);
@@ -325,7 +394,7 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
         // that cannot be cloned is one this cannot retry, and is sent once.
         let again = current.try_clone();
         let resp = current.send().await.context("talking to Discord")?;
-        note_bucket(&resp);
+        note_bucket(route, &resp);
         note_status(&who, resp.status());
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
@@ -339,9 +408,11 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
         }
         let pause = pause_for(headers.get("retry-after").and_then(|v| v.to_str().ok()));
         let Some(again) = again else { return Ok(rebuilt(status, headers, body)) };
-        tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
-        hold_for(pause);
-        wait_out_hold().await;
+        let global = is_global_headers(&headers);
+        let held = if global { None } else { route };
+        tracing::info!("discord: rate limited ({}), holding for {}ms", held.map(route_label).unwrap_or("everything"), pause.as_millis());
+        hold_for(held, pause);
+        wait_out_hold(route).await;
         pending = Some(again);
     }
     bail!("Discord kept rate-limiting that request")
@@ -605,5 +676,20 @@ mod error_tests {
         assert!(is_slowmode(br#"{"message":"The resource is being rate limited.","retry_after":3.5,"code":20016}"#));
         assert!(!is_slowmode(br#"{"message":"You are being rate limited.","retry_after":1.2,"global":false}"#));
         assert!(!is_slowmode(b"not json"));
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    #[test]
+    fn a_route_that_ran_dry_holds_only_itself() {
+        let history = "tok-route-test GET /api/v10/channels/1/messages";
+        let send = "tok-route-test POST /api/v10/channels/1/messages";
+        hold_for(Some(history), Duration::from_secs(20));
+        let now = std::time::Instant::now();
+        assert!(held_for(Some(history), now) > Duration::from_secs(19));
+        assert!(held_for(Some(send), now).is_zero(), "another route goes out at once");
     }
 }
