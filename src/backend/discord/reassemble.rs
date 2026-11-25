@@ -89,6 +89,7 @@ pub struct Reassembler {
 }
 
 impl Reassembler {
+    #[cfg(test)]
     pub fn new(window: usize) -> Self {
         Self::with_codec(window, VideoCodec::Vp8)
     }

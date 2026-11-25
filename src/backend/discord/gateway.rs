@@ -398,6 +398,12 @@ pub(super) struct GatewaySession {
     /// What a resumed session is not sent again - READY and the GUILD_CREATEs saved from the last run - to be handled
     /// as though they had just arrived, before anything is read from the socket.
     pending: std::collections::VecDeque<Value>,
+    /// The guilds above came from disk, saved by the last run, and have not
+    /// been read afresh since. Only then is a resume followed by a sweep of
+    /// every guild: within one run the maps are kept current by the events
+    /// themselves, and sweeping after every reconnect is many requests each
+    /// time for nothing.
+    snapshot_from_disk: bool,
 }
 
 /// Enough to pick a session back up: what it was called, where to reconnect,
@@ -470,6 +476,7 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         tracing::info!("discord[{account_id}]: resuming the session from before the restart");
         session.resume = Some(Resume { session_id: position.session_id, url: position.url, seq: position.seq });
         session.pending = replay.into();
+        session.snapshot_from_disk = true;
     }
     // A login Discord has already refused is not tried again: the person signs in afresh, which is a new token.
     if token_is_halted(&config.token) {
@@ -564,7 +571,7 @@ async fn hold_for_login_budget(state: &AppState, account_id: &str) {
 pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &mut GatewaySession) -> Result<()> {
     // Disjoint borrows, so the resume state can be updated while the maps
     // are being passed around mutably.
-    let GatewaySession { resume, channel_map, guild_context, persist, pending } = session;
+    let GatewaySession { resume, channel_map, guild_context, persist, pending, snapshot_from_disk } = session;
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
     let connect_url = compressed(&resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string()));
@@ -687,6 +694,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     let mut tally: HashMap<String, u32> = HashMap::new();
     let mut tally_since = std::time::Instant::now();
     let mut poller = GuildPoller::default();
+    // Guild re-reads run beside this loop and come back here: see ResyncInbox.
+    let (resync_tx, mut resync_inbox) = super::guilds::ResyncInbox::new(state, &account_id);
     let mut next_poll = tokio::time::Instant::now() + CHANNEL_POLL_MAX_GAP;
 
     loop {
@@ -702,9 +711,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
                     _ = tokio::time::sleep_until(next_poll), if !guild_context.is_empty() => {
                         if let Some(guild_id) = poller.next_guild(guild_context) {
-                            resync_guild(state, config, &guild_id, channel_map, guild_context, persist).await;
+                            resync_guild(state, config, &guild_id, &resync_tx);
                         }
                         next_poll = tokio::time::Instant::now() + poller.next_delay(guild_context.len());
+                        continue;
+                    }
+                    Some(result) = resync_inbox.rx.recv() => {
+                        super::guilds::finish_guild_resync(state, config, result, channel_map, guild_context, persist, &resync_tx).await;
                         continue;
                     }
                 };
@@ -752,7 +765,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // the guild channel lists shortly after resume so any
                         // permission or channel changes missed or saved stale
                         // are corrected right away.
-                        if !guild_context.is_empty() {
+                        // Only for a snapshot saved by the last run: see
+                        // snapshot_from_disk.
+                        if *snapshot_from_disk && !guild_context.is_empty() {
+                            *snapshot_from_disk = false;
                             poller.schedule_resume_sweep(guild_context.keys().cloned());
                             next_poll = tokio::time::Instant::now() + RESUME_POLL_GAP;
                         }
@@ -761,6 +777,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // A new login has missed what the last one did not: what was asked about is asked afresh.
                         if !replaying {
                             super::history::forget_asked(&account_id);
+                            // Everything is about to arrive afresh.
+                            *snapshot_from_disk = false;
                         }
                         // Kept as it came (it is what a resume replays), and read with its users put back: see
                         // ready_shape. A READY that was not dehydrated is read as it is.
@@ -1121,7 +1139,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 // a channel, which the single-channel path
                                 // above cannot do.
                                 if t == "CHANNEL_UPDATE" {
-                                    resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
+                                    resync_guild(state, config, guild_id, &resync_tx);
                                 }
                             }
                             // A DM or group DM opened from another client.
@@ -1262,7 +1280,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" => {
                         let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         if guild_context.contains_key(guild_id) {
-                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
+                            resync_guild(state, config, guild_id, &resync_tx);
                         }
                     }
 
@@ -1294,7 +1312,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let roles_now: Vec<String> = d["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(String::from)).collect();
                         let roles_changed = state.runtime.set_discord_own_roles(&guild_group_id(&account_id, guild_id), roles_now);
                         if was_gated || roles_changed {
-                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
+                            resync_guild(state, config, guild_id, &resync_tx);
                         }
                     }
 
@@ -1524,7 +1542,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
                         let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         if guild_context.contains_key(guild_id) {
-                            resync_guild(state, config, guild_id, channel_map, guild_context, persist).await;
+                            resync_guild(state, config, guild_id, &resync_tx);
                         }
                     }
 

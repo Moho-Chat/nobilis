@@ -185,26 +185,79 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
 /// comes from the rail entry rather than either: it is the order somebody
 /// dragged their servers into, which REST does not know and which would
 /// silently reshuffle the column if rebuilt as zero.
-pub(super) async fn resync_guild(
+pub(super) fn resync_guild(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, inbox: &ResyncSender) {
+    // A burst - one event per channel while a server is rearranged - becomes
+    // one pass and at most one more that sees the settled result.
+    if !state.runtime.try_start_guild_resync(&guild_group_id(&config.account_id(), guild_id)) {
+        return;
+    }
+    spawn_guild_fetch(state.clone(), config.clone(), guild_id.to_string(), inbox.clone());
+}
+
+/// A guild read back over REST, for the gateway loop to apply: the guild id,
+/// and what was read (`None` when it could not be).
+pub(super) type ResyncResult = (String, Option<Value>);
+pub(super) type ResyncSender = tokio::sync::mpsc::UnboundedSender<ResyncResult>;
+
+/// Where a connection's guild re-reads come back to. The reading happens in
+/// a task of its own, never on the gateway loop: three paced requests can
+/// wait out a rate limit for a minute or more, and a loop waiting on them is
+/// not reading the socket - heartbeat acks included, so the connection was
+/// declared zombied and dropped every minute or two.
+///
+/// Dropped with its connection. Anything read but not yet applied, or still
+/// being read, gives its claim back so the next connection can read it again.
+pub(super) struct ResyncInbox {
+    pub(super) rx: tokio::sync::mpsc::UnboundedReceiver<ResyncResult>,
+    state: AppState,
+    account_id: String,
+}
+
+impl ResyncInbox {
+    pub(super) fn new(state: &AppState, account_id: &str) -> (ResyncSender, Self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, ResyncInbox { rx, state: state.clone(), account_id: account_id.to_string() })
+    }
+}
+
+impl Drop for ResyncInbox {
+    fn drop(&mut self) {
+        // Closed first, so a read finishing after this fails to send and
+        // gives its own claim back; what was sent before is drained here.
+        self.rx.close();
+        while let Ok((guild_id, _)) = self.rx.try_recv() {
+            self.state.runtime.finish_guild_resync(&guild_group_id(&self.account_id, &guild_id));
+        }
+    }
+}
+
+fn spawn_guild_fetch(state: AppState, config: DiscordAccountConfig, guild_id: String, inbox: ResyncSender) {
+    tokio::spawn(async move {
+        let snapshot = fetch_guild_snapshot(&config, &guild_id).await;
+        if let Err(tokio::sync::mpsc::error::SendError((guild_id, _))) = inbox.send((guild_id, snapshot)) {
+            state.runtime.finish_guild_resync(&guild_group_id(&config.account_id(), &guild_id));
+        }
+    });
+}
+
+/// Applies a re-read guild on the gateway loop, then reads it once more if
+/// anything about it changed while it was being read.
+pub(super) async fn finish_guild_resync(
     state: &AppState,
     config: &DiscordAccountConfig,
-    guild_id: &str,
+    result: ResyncResult,
     channel_map: &mut HashMap<String, (String, String)>,
     guild_context: &mut HashMap<String, Value>,
     persist: &mut super::session_store::SessionFile,
+    inbox: &ResyncSender,
 ) {
-    let account_id = config.account_id();
-    let group_id = guild_group_id(&account_id, guild_id);
-    // A burst - one event per channel while a server is rearranged - becomes
-    // one pass and at most one more that sees the settled result.
-    if !state.runtime.try_start_guild_resync(&group_id) {
-        return;
+    let (guild_id, snapshot) = result;
+    // A guild left while it was being read is not put back.
+    if let Some(guild) = snapshot.filter(|_| guild_context.contains_key(&guild_id)) {
+        apply_guild_snapshot(state, config, &guild_id, guild, channel_map, guild_context, persist).await;
     }
-    loop {
-        resync_guild_once(state, config, guild_id, channel_map, guild_context, persist).await;
-        if !state.runtime.finish_guild_resync(&group_id) {
-            return;
-        }
+    if state.runtime.finish_guild_resync(&guild_group_id(&config.account_id(), &guild_id)) {
+        resync_guild(state, config, &guild_id, inbox);
     }
 }
 
@@ -298,15 +351,10 @@ pub(super) fn prune_guild_buffers(
     }
 }
 
-pub(super) async fn resync_guild_once(
-    state: &AppState,
-    config: &DiscordAccountConfig,
-    guild_id: &str,
-    channel_map: &mut HashMap<String, (String, String)>,
-    guild_context: &mut HashMap<String, Value>,
-    persist: &mut super::session_store::SessionFile,
-) {
-    let account_id = config.account_id();
+/// The guild, its channels and this account's membership, read over REST.
+/// The membership is read here rather than left to `register_guild_channels`
+/// to look up, so that applying the result never waits on the network.
+async fn fetch_guild_snapshot(config: &DiscordAccountConfig, guild_id: &str) -> Option<Value> {
     let fetch = |path: String| async move {
         let resp = http_client_for(&config.token)
             .get(format!("{API_BASE}/{path}"))
@@ -319,22 +367,40 @@ pub(super) async fn resync_guild_once(
         }
         resp.json::<Value>().await.ok()
     };
-    let (Some(mut guild), Some(channels)) = (
+    let (Some(mut guild), Some(channels), Some(mut me)) = (
         fetch(format!("guilds/{guild_id}")).await,
         fetch(format!("guilds/{guild_id}/channels")).await,
+        fetch(format!("users/@me/guilds/{guild_id}/member")).await,
     ) else {
         tracing::debug!("discord: could not re-read guild {guild_id}");
-        return;
+        return None;
     };
     if guild["id"].as_str() != Some(guild_id) {
         tracing::debug!("discord: guild {guild_id} returned unexpected payload");
-        return;
+        return None;
     }
     let Some(list) = channels.as_array().cloned() else {
         tracing::debug!("discord: guild {guild_id} returned no channel list");
-        return;
+        return None;
     };
     guild["channels"] = Value::Array(list);
+    if me["user"]["id"].is_null() {
+        me["user"] = json!({ "id": config.user_id });
+    }
+    guild["members"] = json!([me]);
+    Some(guild)
+}
+
+async fn apply_guild_snapshot(
+    state: &AppState,
+    config: &DiscordAccountConfig,
+    guild_id: &str,
+    mut guild: Value,
+    channel_map: &mut HashMap<String, (String, String)>,
+    guild_context: &mut HashMap<String, Value>,
+    persist: &mut super::session_store::SessionFile,
+) {
+    let account_id = config.account_id();
     if let Some(group) = state.runtime.get_buffer_group(&guild_group_id(&account_id, guild_id)) {
         guild["position"] = serde_json::json!(group.position);
     }
