@@ -1846,6 +1846,7 @@ impl Runtime {
             read_only: None,
             slowmode_secs: 0,
             forum: false,
+            age_restricted: false,
             unread_seed: 0,
             mentions_seed: 0,
         };
@@ -3433,6 +3434,23 @@ impl Runtime {
     }
 
     /// Marks a buffer as a forum: a list of posts rather than a conversation.
+    /// Marks a conversation as age-restricted by its service, or not.
+    pub fn set_buffer_age_restricted(&self, state: &AppState, buffer_id: &str, restricted: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.age_restricted != restricted => {
+                    b.age_restricted = restricted;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn set_buffer_forum(&self, state: &AppState, buffer_id: &str, forum: bool) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();

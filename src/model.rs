@@ -413,6 +413,9 @@ pub struct Buffer {
     /// posts, each of which is a thread. Opened as a pane of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forum: bool,
+    /// Marked by the service as for adults only (a Fluxer or Discord channel's age restriction), so it is marked here.
+    #[serde(rename = "ageRestricted", default, skip_serializing_if = "std::ops::Not::not")]
+    pub age_restricted: bool,
     /// How many messages the service itself counts as unread here, where it keeps a count a client could not work
     /// out from the messages it has: a Telegram topic of a group that was never opened here. A starting point for
     /// the window's own count, which then follows live messages; absent when there is none.
@@ -1113,6 +1116,7 @@ mod tests {
             read_only: None,
             slowmode_secs: 0,
             forum: false,
+            age_restricted: false,
             unread_seed: 0,
             mentions_seed: 0,
         }

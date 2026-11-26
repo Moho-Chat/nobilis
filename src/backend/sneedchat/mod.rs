@@ -54,6 +54,7 @@ pub mod http;
 pub mod pow;
 pub mod protocol;
 pub mod smilies;
+pub mod stream;
 
 use crate::accounts::{SneedChatAccountConfig, SneedChatRoom};
 use crate::net::tor::Transport;

@@ -19,6 +19,8 @@ pub struct Principal {
     pub name: String,
     pub avatar: Option<String>,
     pub badges: Vec<String>,
+    /// Watching the room's featured stream (a `presence` entry's `watching`).
+    pub watching: bool,
 }
 
 impl Principal {
@@ -28,7 +30,7 @@ impl Principal {
         let name = v["display_name"].as_str().filter(|n| !n.is_empty())?.to_string();
         let avatar = v["avatar_url"].as_str().filter(|a| !a.is_empty()).map(str::to_string);
         let badges = v["badges"].as_array().map(|b| b.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-        Some(Self { uuid, name, avatar, badges })
+        Some(Self { uuid, name, avatar, badges, watching: v["watching"].as_bool() == Some(true) })
     }
 }
 

@@ -170,7 +170,7 @@ pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient,
         .map(|p| {
             // Whatever picture they already had stays until a new one is fetched.
             let known = before.get(&p.uuid).and_then(|(_, a, _)| a.clone());
-            (p.uuid.clone(), (p.name.clone(), known, super::catalogue::member_group(&p.badges)))
+            (p.uuid.clone(), (p.name.clone(), known, member_section(p)))
         })
         .collect();
     publish_roster(state, &buffer_id, &by_id);
@@ -185,6 +185,34 @@ pub(super) fn publish_presence(state: &AppState, http: &super::http::HttpClient,
     if !wanted.is_empty() {
         tokio::spawn({
             let (state, http, host) = (state.clone(), http.clone(), host.to_string());
+            async move { add_pictures(&state, &http, &host, &buffer_id, wanted).await }
+        });
+    }
+}
+
+/// Where somebody is listed: under their highest badge, else among those
+/// watching the room's featured stream (`watching`), else with everybody.
+pub(super) fn member_section(p: &Principal) -> Option<String> {
+    super::catalogue::member_group(&p.badges).or_else(|| p.watching.then(|| WATCHING.to_string()))
+}
+
+/// The section of the member list for those watching the featured stream.
+pub(super) const WATCHING: &str = "watching";
+
+/// Somebody's public profile changed (`principal_changed`): every roster
+/// they are on shows the new name and badge at once, and the new picture
+/// once it is fetched. Where they watch from stays as it was.
+pub(super) fn update_member(state: &AppState, http: &super::http::HttpClient, host: &str, buffer_id: &str, p: &Principal) {
+    let mut roster = published_roster(state, buffer_id);
+    let Some(entry) = roster.get_mut(&p.uuid) else { return };
+    let watching = entry.2.as_deref() == Some(WATCHING);
+    entry.0 = p.name.clone();
+    entry.2 = member_section(&Principal { watching, ..p.clone() });
+    publish_roster(state, buffer_id, &roster);
+    if let Some(avatar) = p.avatar.as_deref() {
+        let wanted = vec![(p.uuid.clone(), super::chat::mirrored(avatar, host))];
+        tokio::spawn({
+            let (state, http, host, buffer_id) = (state.clone(), http.clone(), host.to_string(), buffer_id.to_string());
             async move { add_pictures(&state, &http, &host, &buffer_id, wanted).await }
         });
     }
@@ -232,7 +260,12 @@ async fn add_pictures(state: &AppState, http: &super::http::HttpClient, host: &s
 /// then by name - the order the site's own list has.
 fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, Member>) {
     let groups = super::catalogue::member_groups();
-    let rank = |g: &Option<String>| g.as_ref().and_then(|g| groups.iter().position(|x| x == g)).unwrap_or(groups.len());
+    // The page's badge groups first, then those watching the stream, then everybody else.
+    let rank = |g: &Option<String>| match g.as_deref() {
+        Some(WATCHING) => groups.len(),
+        Some(g) => groups.iter().position(|x| x == g).unwrap_or(groups.len() + 1),
+        None => groups.len() + 1,
+    };
     let mut members: Vec<(&String, &Member)> = by_id.iter().collect();
     members.sort_by(|(_, (a, _, ga)), (_, (b, _, gb))| rank(ga).cmp(&rank(gb)).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members

@@ -57,9 +57,12 @@ fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &st
 /// and its category, and told whether the account may write in it.
 pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, place: i64, heading: Option<(&str, i64)>) {
     let account_id = &handle.account_id;
-    // Categories are headings and a link channel is only a link. A voice channel is a conversation too: it has a call,
-    // and messages beside it. A forum is a list of posts; a thread is a conversation once this account has joined it.
-    if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Other(_)) || (channel.kind == Kind::Thread && !channel.joined) {
+    // Categories are headings; a link channel opens its URL from the list. A voice channel is a conversation too: it has
+    // a call, and messages beside it. A forum is a list of posts; a thread is a conversation once this account has joined it.
+    if matches!(channel.kind, Kind::Category | Kind::Other(_))
+        || (channel.kind == Kind::Thread && !channel.joined)
+        || (channel.kind == Kind::Link && !channel.url.as_deref().is_some_and(|u| u.starts_with("http://") || u.starts_with("https://")))
+    {
         return;
     }
     let (title, read_only, slowmode, avatar, unread) = {
@@ -116,17 +119,21 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
     }
     state.runtime.set_buffer_read_only(state, &buffer.id, read_only);
     state.runtime.set_buffer_slowmode(state, &buffer.id, slowmode);
-    if let Some(topic) = &channel.topic {
+    if let Some(url) = channel.url.as_deref().filter(|_| channel.kind == Kind::Link) {
+        state.runtime.set_buffer_topic(state, &buffer.id, url);
+    } else if let Some(topic) = &channel.topic {
         state.runtime.set_buffer_topic(state, &buffer.id, topic);
     }
     let icon = match channel.kind {
         Kind::Announcement => Some("campaign"),
         Kind::Voice => Some("volume_up"),
         Kind::Thread => Some("forum"),
+        Kind::Link => Some("open_in_new"),
         _ => None,
     };
     state.runtime.set_buffer_name_icon(state, &buffer.id, icon);
     state.runtime.set_buffer_forum(state, &buffer.id, channel.kind == Kind::Forum);
+    state.runtime.set_buffer_age_restricted(state, &buffer.id, channel.nsfw);
     if let Some(url) = avatar {
         state.runtime.set_buffer_avatar(state, &buffer.id, &media::cached(account_id, media::AVATARS, &url, None, Some("image/webp")));
     }
