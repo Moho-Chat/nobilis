@@ -30,6 +30,19 @@ fn register_guild(state: &AppState, handle: &Handle, guild: &world::Guild, posit
     );
 }
 
+/// Puts this account's guilds in the order `user_settings.guild_folders` gives, with any unlisted guilds after them.
+pub fn apply_guild_order(state: &AppState, handle: &Handle, order: &[String]) {
+    let guilds: Vec<world::Guild> = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list: Vec<world::Guild> = world.guilds.values().cloned().collect();
+        list.sort_by_key(|g| (order.iter().position(|id| id == &g.id).unwrap_or(usize::MAX), g.name.to_lowercase()));
+        list
+    };
+    for (position, guild) in guilds.iter().enumerate() {
+        register_guild(state, handle, guild, position as i64);
+    }
+}
+
 /// What a channel is called in the list: its title, told apart from another of the same name by the end of its id.
 fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &str) -> String {
     let taken = state.runtime.list_buffers().into_iter().any(|b| b.account_id == account_id && b.name == wanted && b.remote_id.as_deref() != Some(channel_id));

@@ -51,6 +51,9 @@ fn noted(handle: &Handle, channel: &str, e: super::api::ApiError) -> String {
 /// `SPOILER_` name Discord uses: a file sent under that name alone was shown uncovered (seen on fluxer.com, 2026-11-18).
 pub const IS_SPOILER: u64 = 1 << 3;
 
+/// Fluxer's message flag for a silent message (`SUPPRESS_NOTIFICATIONS`, `http-api/messages.mdx`).
+pub const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+
 /// What a file is called when it is sent; with `spoiler`, Discord's `SPOILER_` name as well (kept for the spoiler flag
 /// only to be read where the name is, and harmless where the flag is).
 pub fn sent_name(path: &str, spoiler: bool) -> String {
@@ -62,8 +65,8 @@ pub fn sent_name(path: &str, spoiler: bool) -> String {
     }
 }
 
-/// The message itself: the words with custom emoji named by id, a nonce, and the message answered.
-fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>) -> Value {
+/// The message itself: the words with custom emoji named by id, a nonce, the message answered, and flags.
+fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>, silent: bool) -> Value {
     let wire = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let guild = world.channels.get(channel).and_then(|c| c.guild.clone());
@@ -72,6 +75,9 @@ fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>) -
     let mut payload = json!({ "content": wire, "nonce": crate::model::next_message_id().to_string().chars().filter(char::is_ascii_alphanumeric).take(32).collect::<String>() });
     if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
         payload["message_reference"] = json!({ "message_id": reply, "channel_id": channel });
+    }
+    if silent {
+        payload["flags"] = json!(SUPPRESS_NOTIFICATIONS);
     }
     payload
 }
@@ -93,12 +99,12 @@ fn may_write(handle: &Handle, channel: &str) -> Result<(), String> {
 }
 
 /// Sends a message, in answer to another if `reply_to` names one.
-pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
+pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>, silent: bool) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
     may_write(&handle, &channel)?;
     check(body, handle.limits.message_length)?;
     slowed(&handle, &channel)?;
-    let payload = payload(&handle, &channel, body, reply_to);
+    let payload = payload(&handle, &channel, body, reply_to, silent);
     let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted(&handle, &channel, e))?;
     if buffer.slowmode_secs > 0 {
         handle.set_slow_until(&channel, chrono::Utc::now().timestamp() + buffer.slowmode_secs as i64);
@@ -109,9 +115,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
 }
 
 /// Sends files with a message, as one multipart request (`payload_json` and `files[n]`).
-pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, silent: bool, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
     if files.is_empty() {
-        return send(state, buffer, caption, reply_to).await;
+        return send(state, buffer, caption, reply_to, silent).await;
     }
     let (handle, channel) = handle_for(state, buffer)?;
     may_write(&handle, &channel)?;
@@ -197,7 +203,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
                     if !to_complete.is_empty() {
                         handle.api.post(&format!("/channels/{channel}/attachments/complete"), &json!({ "uploads": to_complete })).await.map_err(|e| noted(&handle, &channel, e))?;
                     }
-                    let mut payload = payload(&handle, &channel, caption, reply_to);
+                    let mut payload = payload(&handle, &channel, caption, reply_to, silent);
                     payload["attachments"] = json!(preuploaded);
                     let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted(&handle, &channel, e))?;
                     messages::record(state, &handle, &sent);
@@ -208,7 +214,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
             Err(e) => return Err(noted(&handle, &channel, e)),
         }
     }
-    let mut payload = payload(&handle, &channel, caption, reply_to);
+    let mut payload = payload(&handle, &channel, caption, reply_to, silent);
     payload["attachments"] = json!(listed);
     let sent = handle.api.multipart(Method::POST, &format!("/channels/{channel}/messages"), &payload, &parts).await.map_err(|e| noted(&handle, &channel, e))?;
     messages::record(state, &handle, &sent);
@@ -251,7 +257,7 @@ pub async fn send_sticker(state: &AppState, buffer: &Buffer, sticker_id: &str) -
 pub async fn edit(state: &AppState, buffer: &Buffer, message_id: &str, body: &str) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
     check(body, handle.limits.message_length)?;
-    let wire = payload(&handle, &channel, body, None)["content"].clone();
+    let wire = payload(&handle, &channel, body, None, false)["content"].clone();
     let edited = handle.api.patch(&format!("/channels/{channel}/messages/{message_id}"), &json!({ "content": wire })).await.map_err(|e| e.to_string())?;
     let text = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());

@@ -4223,7 +4223,8 @@ pub async fn dispatch(
                     };
                     let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
                     let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
-                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    let silent = params.get("silent").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, silent, progress).await;
                     if let Some(p) = progress {
                         if !files.is_empty() {
                             p.done(sent.as_ref().err().map(String::as_str));
@@ -8079,6 +8080,15 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
             }
+        }
+
+        "fluxerGuildFolders" => {
+            let mut by_account = serde_json::Map::new();
+            for handle in state.runtime.all_fluxer_handles() {
+                let folders = handle.guild_folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                by_account.insert(handle.account_id, serde_json::Value::Array(folders));
+            }
+            (Some(serde_json::Value::Object(by_account)), None)
         }
 
         // An account's chat folders, which the window shows as categories on the account's page, and the changes it

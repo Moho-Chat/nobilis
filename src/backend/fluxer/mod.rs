@@ -96,6 +96,8 @@ pub struct Handle {
     pub voice_media: Arc<Mutex<(bool, bool)>>,
     /// The private conversations whose call is ringing this account.
     pub ringing: Arc<Mutex<HashSet<String>>>,
+    /// Guild folders from `user_settings.guild_folders`, in the window's `RailFolder` shape.
+    pub guild_folders: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl Handle {
