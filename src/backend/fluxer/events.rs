@@ -358,7 +358,14 @@ fn edited(state: &AppState, handle: &Handle, data: &Value) {
         let body = {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
             let guild = world.channels.get(channel).and_then(|c| c.guild.clone());
-            messages::words(&world, Some(handle), guild.as_deref(), content)
+            // A call ending sends MESSAGE_UPDATE on the type-3 system message with empty content: keep the system card text.
+            if let Some(sys) = messages::system_text(&world, guild.as_deref(), data) {
+                sys
+            } else if content.is_empty() && state.store.get_message(&buffer.id, id).ok().flatten().is_some_and(|m| m.kind == "system") {
+                return;
+            } else {
+                messages::words(&world, Some(handle), guild.as_deref(), content)
+            }
         };
         state.runtime.update_message_body_only(state, &buffer.id, id, &body);
     }
