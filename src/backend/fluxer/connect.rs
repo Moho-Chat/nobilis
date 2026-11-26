@@ -135,7 +135,7 @@ pub fn gateway_address(gateway: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// What moho says of itself on Identify: the real system, and its own name.
+/// What moho says of itself on Identify: the real system, its own name, and that its call player speaks encrypted call media.
 pub fn properties() -> Value {
     let os = match std::env::consts::OS {
         "linux" => "Linux",
@@ -143,7 +143,7 @@ pub fn properties() -> Value {
         "macos" => "Mac OS X",
         other => other,
     };
-    json!({ "os": os, "browser": "moho", "device": "desktop" })
+    json!({ "os": os, "browser": "moho", "device": "desktop", "e2ee_capable": true })
 }
 
 async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, resume: &mut Resumable) -> Result<Ending> {
@@ -312,5 +312,6 @@ mod tests {
         let p = properties();
         assert_eq!(p["browser"], "moho");
         assert!(p["os"].as_str().is_some_and(|o| !o.is_empty()));
+        assert_eq!(p["e2ee_capable"], true);
     }
 }

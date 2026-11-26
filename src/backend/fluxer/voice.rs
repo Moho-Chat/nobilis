@@ -138,6 +138,7 @@ pub fn grant(handle: &Handle, v: &Value) {
 pub fn refused(handle: &Handle, v: &Value) -> bool {
     let words = match v["code"].as_str().unwrap_or("") {
         "VOICE_CHANNEL_FULL" => "That call is full".to_string(),
+        "VOICE_E2EE_REQUIRED" => "This call requires encrypted call media".to_string(),
         "VOICE_P2P_CONSENT_REQUIRED" => "That call is peer-to-peer (the people in it connect to each other directly), which moho does not join. Join it from Fluxer's own app".to_string(),
         "VOICE_P2P_UNAVAILABLE" => "Fluxer could not make that call peer-to-peer".to_string(),
         other => v["message"].as_str().map(str::to_string).unwrap_or_else(|| format!("Fluxer refused the call ({other})")),
