@@ -147,6 +147,10 @@ pub fn properties() -> Value {
 }
 
 async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, resume: &mut Resumable) -> Result<Ending> {
+    let router = crate::net::route::router();
+    if router.routed(account_id) {
+        router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.context("starting Tor or reaching the proxy")?;
+    }
     let origin = if config.instance.is_empty() { discovery::DEFAULT_ORIGIN } else { config.instance.as_str() };
     let instance = Arc::new(discovery::fetch(account_id, origin).await?);
     let api = Arc::new(Api::new(account_id, &instance.api, Some(config.token.clone())));

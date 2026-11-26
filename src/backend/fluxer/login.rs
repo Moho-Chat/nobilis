@@ -123,6 +123,10 @@ async fn flow(state: &AppState, login_id: &str, typed: &str, way: Way, mut rx: m
     let origin = discovery::normalize_origin(typed).ok_or_else(|| anyhow!("that does not look like the address of a Fluxer instance"))?;
     status(state, login_id, "Reaching the instance");
     let key = crate::net::route::pending_key("fluxer");
+    let router = crate::net::route::router();
+    if router.routed(&key) {
+        router.ready(|msg| status(state, login_id, msg)).await.map_err(|e| anyhow!("starting Tor or reaching the proxy: {e:#}"))?;
+    }
     let instance = discovery::fetch(&key, &origin).await?;
     let anonymous = Api::new(&key, &instance.api, None);
     let made_here = !matches!(way, Way::Token(_));

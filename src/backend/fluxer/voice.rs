@@ -169,6 +169,9 @@ fn place_of(handle: &Handle, buffer: &Buffer) -> Result<(String, Option<String>,
 /// key where there is one. Starting a call in a direct message or a group rings the others. It joins muted or deafened
 /// as the voice buttons stand, so the others never see a microphone that is not open.
 pub async fn join(handle: &Handle, buffer: &Buffer, video: bool, muted: bool, deafened: bool) -> Result<Value> {
+    if let Some(why) = crate::net::route::router().call_refusal(&handle.account_id) {
+        bail!("{why}");
+    }
     if !handle.instance.voice {
         bail!("This instance has calls turned off");
     }
