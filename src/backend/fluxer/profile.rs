@@ -38,6 +38,37 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
     if let Some(g) = &guild {
         query.push(("guild_id", g.clone()));
     }
+    // What is already known of them, so the card says who they are (and what can be done about them) even when Fluxer
+    // will not give the full profile - as it will not for somebody blocked who shares nothing with the account.
+    if let Some(user) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).users.get(&target).cloned() {
+        card["name"] = json!(user.shown());
+        if !user.username.is_empty() {
+            card["handle"] = json!(match Some(user.discriminator.as_str()).filter(|d| !d.is_empty() && d.chars().any(|c| c != '0')) {
+                Some(tag) => format!("{}#{tag}", user.username),
+                None => user.username.clone(),
+            });
+        }
+        let avatar = user.avatar.as_deref().and_then(|h| media::asset_url(&handle.instance, "avatars", &target, h)).map(|u| media::cached(account_id, media::AVATARS, &u, None, Some("image/webp")));
+        profile::set(&mut card, "avatarUrl", avatar.map(|u| json!(u)));
+    }
+    // What they are to this account, for the card's friend and block buttons.
+    {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let relation = if target == world.own_id {
+            None
+        } else if world.friends.contains(&target) {
+            Some("Friend")
+        } else if world.blocked.contains(&target) {
+            Some("Blocked")
+        } else if world.incoming.contains(&target) {
+            Some("Incoming")
+        } else if world.outgoing.contains(&target) {
+            Some("Outgoing")
+        } else {
+            Some("None")
+        };
+        profile::set(&mut card, "relationship", relation.map(|r| json!(r)));
+    }
     let Ok(full) = handle.api.get(&format!("/users/{target}/profile"), &query).await else { return card };
     let user = &full["user"];
     if let Some((id, parsed)) = super::world::parse_user(user) {
