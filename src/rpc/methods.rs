@@ -166,7 +166,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
-        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => Some("fluxer"),
+        "addFluxerAccount" | "addFluxerAccountToken" => Some("fluxer"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -5609,7 +5609,7 @@ pub async fn dispatch(
 
         // Signing in to Fluxer: an id now and the rest as events (backend/fluxer/login.rs). The instance is optional and
         // is the official one when it is left out.
-        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => {
+        "addFluxerAccount" | "addFluxerAccountToken" => {
             let instance = p_str(params, "instance", "").to_string();
             let login_id = format!("fluxer-{}", crate::model::next_message_id());
             match method {
@@ -5619,13 +5619,12 @@ pub async fn dispatch(
                     };
                     backend::fluxer::login::start(state.clone(), login_id.clone(), instance, login.to_string(), password.to_string());
                 }
-                "addFluxerAccountToken" => {
+                _ => {
                     let Some(token) = p_str_opt(params, "token") else {
                         return (None, Some("addFluxerAccountToken requires \"token\"".to_string()));
                     };
                     backend::fluxer::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
                 }
-                _ => backend::fluxer::login::start_handoff(state.clone(), login_id.clone(), instance),
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
