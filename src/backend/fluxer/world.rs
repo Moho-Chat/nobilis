@@ -376,7 +376,10 @@ impl World {
                     (true, false) => format!("{} and you", names.join(", ")),
                 }
             }
-            _ => channel.name.clone(),
+            _ => match channel.guild.as_ref().and_then(|g| self.guilds.get(g)) {
+                Some(guild) => format!("{}/{}", guild.name, channel.name),
+                None => channel.name.clone(),
+            },
         }
     }
 
@@ -514,6 +517,8 @@ mod tests {
         assert_eq!(w.title_of(&w.channels["5"]), "Ada L");
         w.put_channel(&json!({ "id": ME, "type": 999 }));
         assert_eq!(w.title_of(&w.channels[ME]), "Personal Notes");
+        w.put_guild(&json!({ "id": G, "properties": { "name": "Hall", "owner_id": ME }, "channels": [{ "id": "40", "type": 0, "name": "general" }] }));
+        assert_eq!(w.title_of(&w.channels["40"]), "Hall/general");
         assert_eq!(mask(&json!("9223372036854775807")), 9223372036854775807);
         assert_eq!(mask(&json!(1024)), 1024);
         assert_eq!(Kind::from(11), Kind::Thread);

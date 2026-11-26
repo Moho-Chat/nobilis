@@ -77,19 +77,31 @@ pub fn card(handle: &Handle, preview: &Value, link: &str) -> Option<Embed> {
                 ..Default::default()
             })
         }
-        None if preview["channel"].is_object() => Some(Embed {
-            kind: Some("invite".into()),
-            title: Some(preview["channel"]["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("A group").to_string()),
-            description: Some(match count {
-                Some(n) => format!("A group, {}", people_in(n)),
-                None => "A group".to_string(),
-            }),
-            url: Some(link.to_string()),
-            cta: Some(EmbedLink { label: "Join".into(), url: Some(link.to_string()) }),
-            ..Default::default()
-        }),
+        None if preview["channel"].is_object() => {
+            let channel = preview["channel"]["id"].as_str();
+            let joined = channel.is_some_and(|c| handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.contains_key(c));
+            Some(Embed {
+                kind: Some("invite".into()),
+                title: Some(preview["channel"]["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("A group").to_string()),
+                description: Some(match count {
+                    Some(n) => format!("A group, {}", people_in(n)),
+                    None => "A group".to_string(),
+                }),
+                url: Some(link.to_string()),
+                target: channel.map(str::to_string),
+                cta: Some(EmbedLink { label: if joined { "Joined" } else { "Join" }.into(), url: Some(link.to_string()) }),
+                ..Default::default()
+            })
+        }
         None => None,
     }
+}
+
+/// Drops any cached invite preview for a guild that was renamed or had its icon changed.
+pub fn invalidate_guild(guild_id: &str) {
+    PREVIEWS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, v)| {
+        v.as_ref().and_then(|p| p["guild"]["id"].as_str()) != Some(guild_id)
+    });
 }
 
 async fn preview(handle: &Handle, code: &str) -> Option<Value> {

@@ -541,6 +541,9 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             };
             if let Some(id) = id {
+                if kind == "GUILD_UPDATE" {
+                    super::invites::invalidate_guild(&id);
+                }
                 let guild = handle.world.lock().unwrap_or_else(|e| e.into_inner()).guilds.get(&id).cloned();
                 if let Some(guild) = guild {
                     register_guild(state, handle, &guild, 0);
