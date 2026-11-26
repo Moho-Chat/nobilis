@@ -1505,11 +1505,16 @@ pub(super) async fn older(state: &AppState, account_id: &str, buffer_name: &str)
 /// (`data-chat-image-origins`).
 pub(super) fn mirrored(url: &str, host: &str) -> String {
     // Through Tor the account is on the onion, which serves the forum's own
-    // files (pictures included) under its own name.
+    // files (pictures included) under its own name - its upload host too.
+    // A clearnet host is no use from there: our clearance is the onion's, so
+    // kiwifarms.net answers every request with its gate. About one avatar in
+    // six lives on uploads.kiwifarms.net.
     if host.ends_with(".onion") {
-        for clear in ["https://kiwifarms.net/", "https://kiwifarms.st/"] {
-            if let Some(rest) = url.strip_prefix(clear) {
-                return format!("https://{host}/{rest}");
+        for sub in ["", "uploads.", "no-cookie."] {
+            for clear in ["kiwifarms.net", "kiwifarms.st"] {
+                if let Some(rest) = url.strip_prefix(&format!("https://{sub}{clear}/")) {
+                    return format!("https://{sub}{host}/{rest}");
+                }
             }
         }
         return url.to_string();
@@ -1538,7 +1543,9 @@ mod tests {
         assert_eq!(mirrored("https://example.com/a.png", "kiwifarms.st"), "https://example.com/a.png");
         // Through Tor, the forum's own files come from the onion.
         assert_eq!(mirrored("https://kiwifarms.net/data/a.png", "abc.onion"), "https://abc.onion/data/a.png");
-        assert_eq!(mirrored("https://uploads.kiwifarms.net/a.png", "abc.onion"), "https://uploads.kiwifarms.net/a.png");
+        assert_eq!(mirrored("https://uploads.kiwifarms.net/data/avatars/m/63/63172.webp?1", "abc.onion"), "https://uploads.abc.onion/data/avatars/m/63/63172.webp?1");
+        assert_eq!(mirrored("https://uploads.kiwifarms.st/a.png", "abc.onion"), "https://uploads.abc.onion/a.png");
+        assert_eq!(mirrored("https://example.com/a.png", "abc.onion"), "https://example.com/a.png");
     }
 
     #[test]

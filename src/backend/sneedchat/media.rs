@@ -343,9 +343,46 @@ pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user
     // A different URL, or no picture here (never fetched, expired, or
     // cleared): fetch it. If that fails, the picture already here is still
     // the best there is.
-    match fetch_avatar(http, user_id, &url).await.or(cached) {
+    if recently_failed(user_id, &url) {
+        return match cached {
+            Some(path) => Some(versioned(&path).await),
+            None => None,
+        };
+    }
+    let fetched = fetch_avatar(http, user_id, &url).await;
+    note_outcome(user_id, &url, fetched.is_some());
+    match fetched.or(cached) {
         Some(path) => Some(versioned(&path).await),
         None => None,
+    }
+}
+
+/// How long a picture that would not come is left alone.
+const AVATAR_RETRY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Avatars that failed, by user: the URL and when.
+///
+/// The URL check above fetches whenever the cached picture is not the one the
+/// wire names, and a failure caches nothing - so a picture the site would not
+/// send was asked for again on every message and presence update from that
+/// person. On 2026-11-26 that was ninety people's avatars, each fetched
+/// every two seconds, some 850 requests a minute at the site's gate. A new
+/// URL is still fetched at once; the same one waits out AVATAR_RETRY.
+fn failed_avatars() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+    static FAILED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>> = std::sync::OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+fn recently_failed(user_id: &str, url: &str) -> bool {
+    failed_avatars().lock().unwrap().get(user_id).is_some_and(|(failed, at)| failed == url && at.elapsed() < AVATAR_RETRY)
+}
+
+fn note_outcome(user_id: &str, url: &str, fetched: bool) {
+    let mut failed = failed_avatars().lock().unwrap();
+    if fetched {
+        failed.remove(user_id);
+    } else {
+        failed.insert(user_id.to_string(), (url.to_string(), std::time::Instant::now()));
     }
 }
 
@@ -1139,6 +1176,16 @@ pub(crate) fn hosted_links_later(state: &AppState, account_id: &str, buffer_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_avatar_waits_and_a_new_url_does_not() {
+        note_outcome("u-failing", "https://a.onion/data/avatars/1.jpg", false);
+        assert!(recently_failed("u-failing", "https://a.onion/data/avatars/1.jpg"));
+        assert!(!recently_failed("u-failing", "https://a.onion/data/avatars/2.jpg"), "a new picture was held back by the old one failing");
+        assert!(!recently_failed("u-other", "https://a.onion/data/avatars/1.jpg"));
+        note_outcome("u-failing", "https://a.onion/data/avatars/1.jpg", true);
+        assert!(!recently_failed("u-failing", "https://a.onion/data/avatars/1.jpg"));
+    }
 
     #[test]
     fn a_hosted_link_pasted_into_irc_is_found_with_its_file_name() {
