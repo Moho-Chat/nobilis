@@ -106,11 +106,15 @@ fn hold_for(route: Option<&str>, wait: Duration) {
 /// How much longer `route` is held at `now`: by everything being held, or by its own.
 fn held_for(route: Option<&str>, now: std::time::Instant) -> Duration {
     let global = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).map(|at| at.saturating_duration_since(now)).unwrap_or_default();
-    let own = route
+    global.max(route_held_for(route, now))
+}
+
+/// How much longer `route` is held at `now` by its own hold alone.
+fn route_held_for(route: Option<&str>, now: std::time::Instant) -> Duration {
+    route
         .and_then(|r| ROUTE_HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|h| h.get(r).copied()))
         .map(|at| at.saturating_duration_since(now))
-        .unwrap_or_default();
-    global.max(own)
+        .unwrap_or_default()
 }
 
 /// Waits until neither everything nor `route` is held. A wait long enough to be felt is said in the log.
@@ -688,8 +692,10 @@ mod hold_tests {
         let history = "tok-route-test GET /api/v10/channels/1/messages";
         let send = "tok-route-test POST /api/v10/channels/1/messages";
         hold_for(Some(history), Duration::from_secs(20));
+        // Only the routes' own holds: other tests in this process hold everything now and then (a global 429), and
+        // that is not what is asked here.
         let now = std::time::Instant::now();
-        assert!(held_for(Some(history), now) > Duration::from_secs(19));
-        assert!(held_for(Some(send), now).is_zero(), "another route goes out at once");
+        assert!(route_held_for(Some(history), now) > Duration::from_secs(19));
+        assert!(route_held_for(Some(send), now).is_zero(), "another route goes out at once");
     }
 }
