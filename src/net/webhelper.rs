@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,11 @@ struct Proc {
     early: Mutex<HashMap<u64, Vec<WsEvent>>>,
     last_used: Mutex<Instant>,
     next_id: AtomicU64,
+    /// Set once the helper's output has ended. Its writer stays open until a
+    /// write fails, so it is no sign the helper is gone: a call made after
+    /// the helper died would go to the channel, and wait for an answer nobody
+    /// was left to read.
+    gone: AtomicBool,
 }
 
 impl Proc {
@@ -131,7 +136,10 @@ impl Proc {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         self.touch();
-        if self.writer.send(msg.to_string()).is_err() {
+        // Checked after the answer slot is in place: the reader marks the
+        // helper gone before it drops the slots, so a call either finds it
+        // gone here or has its slot dropped.
+        if self.gone.load(Ordering::SeqCst) || self.writer.send(msg.to_string()).is_err() {
             self.pending.lock().unwrap().remove(&id);
             self.uploads.lock().unwrap().remove(&id);
             bail!("the web helper has stopped");
@@ -156,7 +164,7 @@ fn current() -> &'static tokio::sync::Mutex<Option<Arc<Proc>>> {
 async fn helper() -> Result<Arc<Proc>> {
     let mut slot = current().lock().await;
     if let Some(p) = slot.as_ref() {
-        if !p.writer.is_closed() {
+        if !p.writer.is_closed() && !p.gone.load(Ordering::SeqCst) {
             return Ok(p.clone());
         }
     }
@@ -197,6 +205,7 @@ async fn helper() -> Result<Arc<Proc>> {
         early: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
         next_id: AtomicU64::new(1),
+        gone: AtomicBool::new(false),
     });
 
     // Writing. Ends when every sender is gone or the idle check closes it;
@@ -247,6 +256,7 @@ async fn helper() -> Result<Arc<Proc>> {
                 }
             }
             // Gone: whoever was waiting hears so rather than waiting forever.
+            proc.gone.store(true, Ordering::SeqCst);
             proc.pending.lock().unwrap().clear();
             for (_, tx) in proc.sockets.lock().unwrap().drain() {
                 let _ = tx.send(WsEvent::Closed(1006, "the web helper stopped".into()));
@@ -445,13 +455,39 @@ pub async fn ws_open(url: &str, protocols: &[&str], page: &str, cookies: &[Cooki
 mod tests {
     use super::*;
 
+    /// A helper that says it is ready and dies on its first instruction. Both
+    /// tests set this one, as the command is the daemon's single slot.
+    fn short_lived_helper() -> Vec<String> {
+        vec!["sh".into(), "-c".into(), r#"echo '{"event":"ready"}'; read line"#.into()]
+    }
+
+    // A helper that has died is noticed by the next call, which fails at once
+    // instead of waiting for an answer nobody will read - an account sat at
+    // "signing in..." for good after its helper was killed - and the next
+    // caller gets a new helper.
+    #[tokio::test]
+    async fn a_call_after_the_helper_died_fails_instead_of_hanging() {
+        set_command(short_lived_helper());
+        let p = helper().await.unwrap();
+        assert!(p.call(json!({ "op": "request" })).await.is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !p.gone.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the helper's death went unnoticed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let again = tokio::time::timeout(Duration::from_secs(5), p.call(json!({ "op": "request" }))).await;
+        assert!(matches!(again, Ok(Err(_))), "a call to a dead helper hung");
+        let next = helper().await.unwrap();
+        assert!(!Arc::ptr_eq(&p, &next), "a dead helper was handed out again");
+    }
+
     // A command that arrives while an account is already waiting - the window
     // connecting a moment after the daemon started - is noticed, not missed.
     #[tokio::test]
     async fn a_command_sent_while_waiting_is_heard() {
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            set_command(vec!["moho".into(), "--moho-web-helper".into()]);
+            set_command(short_lived_helper());
         });
         let started = Instant::now();
         assert!(available_within(Duration::from_secs(5)).await);
