@@ -469,6 +469,44 @@ pub async fn dispatch(
             _ => (None, Some("sneedchatInvite requires a Sneedchat \"accountId\"".to_string())),
         },
 
+        // A listed room's featured stream, and watching it with the room.
+        "getSneedchatStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => (Some(backend::sneedchat::stream(&buffer.account_id, &buffer.name)), None),
+            _ => (None, Some("getSneedchatStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        "sneedchatWatchStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::watch_stream(&buffer.account_id, &buffer.name, p_bool(params, "watching", true)) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatWatchStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        // A moderator features a stream (`url`) or takes it down (no `url`).
+        "sneedchatSetStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::set_stream(&buffer.account_id, &buffer.name, p_str_opt(params, "url")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatSetStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+
+        // A group chat's name, set or (no `title`) cleared, by its owner.
+        "sneedchatRenameGroup" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::rename_group(&buffer.account_id, &buffer.name, p_str_opt(params, "title")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRenameGroup requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        // Somebody taken out of a group chat, by its owner.
+        "sneedchatRemoveMember" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::remove_member(&buffer.account_id, &buffer.name, p_str(params, "who", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRemoveMember requires a Sneedchat \"bufferId\"".to_string())),
+        },
+
         // Bringing back a message that was taken down.
         "sneedchatRestore" => match (p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)), p_str_opt(params, "messageId")) {
             (Some(buffer), Some(msg)) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::restore(&buffer.account_id, msg).await {
@@ -1623,6 +1661,11 @@ pub async fn dispatch(
                     if let Err(e) = backend::stoat::send::mark_read(state, &buffer).await {
                         tracing::debug!("stoat read position: {e}");
                     }
+                    (Some(ok_node()), None)
+                }
+                // Sneedchat keeps one for each private conversation.
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
+                    backend::sneedchat::mark_read(&buffer.account_id, &buffer.name);
                     (Some(ok_node()), None)
                 }
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => {

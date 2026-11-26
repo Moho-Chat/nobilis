@@ -61,6 +61,10 @@ pub async fn send_message(state: &AppState, account_id: &str, buffer_name: &str,
             return send_whisper(state, account_id, &target, &text, Some(buffer_name)).await;
         }
     }
+    if let Some(rest) = trimmed.strip_prefix("/stream ").map(str::trim) {
+        let url = (!matches!(rest, "off" | "clear" | "none" | "stop")).then_some(rest);
+        return set_stream(account_id, buffer_name, url).await;
+    }
     for command in ["/topic ", "/subtitle "] {
         if let Some(rest) = trimmed.strip_prefix(command) {
             return set_subtitle(account_id, buffer_name, rest.trim()).await;
@@ -218,6 +222,76 @@ pub async fn set_subtitle(account_id: &str, buffer_name: &str, text: &str) -> Re
     chat.command(&op, json!({ "t": "subtitle", "chat_room_uuid": room, "chat_room_subtitle": text, "chat_operation_uuid": op })).await
 }
 
+/// The featured stream of the room a conversation shows, for the window.
+pub fn stream(account_id: &str, buffer_name: &str) -> serde_json::Value {
+    match super::chat::chat(account_id).stream_of_buffer(buffer_name) {
+        Some((s, watching)) => super::stream::stream_json(Some(&s), watching),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Starts or stops watching a room's featured stream, which the chat shows
+/// on the room's member list.
+pub fn watch_stream(account_id: &str, buffer_name: &str, watching: bool) -> Result<()> {
+    super::chat::chat(account_id).watch_stream(buffer_name, watching)
+}
+
+/// A moderator features a stream in a listed room (its address), or takes
+/// it down (None). Typed as `/stream <address>` or `/stream off`.
+pub async fn set_stream(account_id: &str, buffer_name: &str, url: Option<&str>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+    if chat.is_side_room(buffer_name) {
+        bail!("a stream is featured in a listed room, not a private conversation");
+    }
+    let url = url.map(str::trim);
+    if url.is_some_and(|u| u.is_empty() || u.len() > super::stream::STREAM_URL_MAX_BYTES) {
+        bail!("that isn't a stream address the chat takes - a YouTube, Twitch, Kick or Rumble link");
+    }
+    let op = protocol::operation_id();
+    chat.command(&op, json!({ "t": "stream", "chat_room_uuid": room, "stream_url": url, "chat_operation_uuid": op })).await
+}
+
+/// Says a side room has been read, for the site and the account's other clients.
+pub fn mark_read(account_id: &str, buffer_name: &str) {
+    super::chat::chat(account_id).mark_read(buffer_name);
+}
+
+/// Names a group chat (or, with None or nothing, clears its name, so it is
+/// called after the people in it again). Only its owner may.
+pub async fn rename_group(account_id: &str, buffer_name: &str, title: Option<&str>) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+    match chat.side_room_powers(buffer_name) {
+        None | Some((false, _)) => bail!("only a group chat can be given a name"),
+        Some((true, false)) => bail!("only the group's owner can rename it"),
+        Some((true, true)) => {}
+    }
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    chat.command(&format!("title:{room}"), json!({ "t": "side_room_title", "chat_room_uuid": room, "title": title })).await
+}
+
+/// Removes somebody (by principal uuid, or a name the chat has shown) from a
+/// group chat. Only its owner may.
+pub async fn remove_member(account_id: &str, buffer_name: &str, who: &str) -> Result<()> {
+    let chat = super::chat::chat(account_id);
+    let room = chat.room_of_buffer(buffer_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's rooms"))?;
+    match chat.side_room_powers(buffer_name) {
+        None | Some((false, _)) => bail!("people can only be removed from a group chat"),
+        Some((true, false)) => bail!("only the group's owner can remove people"),
+        Some((true, true)) => {}
+    }
+    let principal = if protocol::is_uuid(who) {
+        who.to_lowercase()
+    } else {
+        chat.person_named(who).map(|p| p.uuid).ok_or_else(|| anyhow!("nobody called {who} has been seen in this chat"))?
+    };
+    if !chat.in_room(&room, &principal) {
+        bail!("they aren't in this conversation");
+    }
+    chat.command(&format!("remove:{room}"), json!({ "t": "remove_member", "chat_room_uuid": room, "principal_uuid": principal })).await
+}
+
 /// Adds or takes back this account's reaction on a message. The chat holds
 /// one reaction per person per message: a new one replaces the old, and
 /// taking one back sends no reaction at all.
@@ -269,7 +343,8 @@ pub fn powers(account_id: &str, buffer_name: &str) -> serde_json::Value {
         Some(room) => super::catalogue::powers(&room),
         None => super::catalogue::Powers { post: true, react: true, whisper: true, moderate: false },
     };
-    json!({ "post": p.post, "react": p.react, "whisper": p.whisper, "moderate": p.moderate, "frozen": chat.frozen() })
+    let (group, runs) = chat.side_room_powers(buffer_name).unwrap_or((false, false));
+    json!({ "post": p.post, "react": p.react, "whisper": p.whisper, "moderate": p.moderate, "frozen": chat.frozen(), "group": group, "runGroup": runs })
 }
 
 /// A moderator's action on somebody: `mute` or `ban`, in this room or across

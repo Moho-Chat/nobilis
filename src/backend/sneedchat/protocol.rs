@@ -122,7 +122,7 @@ impl Entry {
                 badges.push(rest[..end].to_string());
             }
         }
-        Some(Principal { uuid, name, avatar, badges })
+        Some(Principal { uuid, name, avatar, badges, watching: false })
     }
 
     /// Whether the rendered row says this message has been taken down.
