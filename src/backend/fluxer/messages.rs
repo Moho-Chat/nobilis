@@ -303,7 +303,14 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": reactions }));
     }
     if recorded {
-        super::invites::cards_later(state, handle, &buffer.id, id, content);
+        // A link in a direct message or a group, from somebody else, is an invitation to this account as well as a card.
+        let sender = {
+            let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+            let private = buffer.remote_id.as_deref().and_then(|c| world.channels.get(c)).is_some_and(|c| matches!(c.kind, super::world::Kind::Direct | super::world::Kind::Group));
+            let author = message["author"]["id"].as_str().unwrap_or("");
+            (private && !author.is_empty() && author != world.own_id).then(|| (author.to_string(), world.name_in(None, author)))
+        };
+        super::invites::cards_later(state, handle, &buffer.id, id, content, sender);
     }
     recorded
 }

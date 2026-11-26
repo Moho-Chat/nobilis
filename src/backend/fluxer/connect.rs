@@ -135,7 +135,7 @@ pub fn gateway_address(gateway: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// What moho says of itself on Identify: the real system, and its own name.
+/// What moho says of itself on Identify: the real system, its own name, and that its call player speaks encrypted call media.
 pub fn properties() -> Value {
     let os = match std::env::consts::OS {
         "linux" => "Linux",
@@ -143,10 +143,14 @@ pub fn properties() -> Value {
         "macos" => "Mac OS X",
         other => other,
     };
-    json!({ "os": os, "browser": "moho", "device": "desktop" })
+    json!({ "os": os, "browser": "moho", "device": "desktop", "e2ee_capable": true })
 }
 
 async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, resume: &mut Resumable) -> Result<Ending> {
+    let router = crate::net::route::router();
+    if router.routed(account_id) {
+        router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.context("starting Tor or reaching the proxy")?;
+    }
     let origin = if config.instance.is_empty() { discovery::DEFAULT_ORIGIN } else { config.instance.as_str() };
     let instance = Arc::new(discovery::fetch(account_id, origin).await?);
     let api = Arc::new(Api::new(account_id, &instance.api, Some(config.token.clone())));
@@ -167,7 +171,7 @@ async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, r
         world.lock().unwrap_or_else(|e| e.into_inner()).users.insert(id, user);
     }
     let limits = instance.limits(if premium { &["premium"] } else { &[] });
-    let handle = Handle { account_id: account_id.to_string(), api: api.clone(), world: world.clone(), instance: instance.clone(), gateway, active: Arc::new(Mutex::new(HashSet::new())), limits: Arc::new(limits), slow: Arc::default(), notify: Arc::default(), voice: Arc::default(), voice_wait: Arc::default(), voice_here: Arc::default(), ringing: Arc::default() };
+    let handle = Handle { account_id: account_id.to_string(), api: api.clone(), world: world.clone(), instance: instance.clone(), gateway, active: Arc::new(Mutex::new(HashSet::new())), limits: Arc::new(limits), slow: Arc::default(), notify: Arc::default(), voice: Arc::default(), voice_wait: Arc::default(), voice_here: Arc::default(), voice_media: Arc::default(), ringing: Arc::default(), guild_folders: Arc::default() };
 
     let can_resume = !resume.session_id.is_empty() && resume.dropped.is_some_and(|d| d.elapsed() < RESUMABLE_FOR);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(3600));
@@ -308,5 +312,6 @@ mod tests {
         let p = properties();
         assert_eq!(p["browser"], "moho");
         assert!(p["os"].as_str().is_some_and(|o| !o.is_empty()));
+        assert_eq!(p["e2ee_capable"], true);
     }
 }

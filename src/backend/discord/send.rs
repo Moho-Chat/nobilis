@@ -283,6 +283,7 @@ pub async fn forward_message(
 }
 
 pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>, reply_ping: bool) -> Result<()> {
+    let started = std::time::Instant::now();
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
@@ -299,6 +300,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     // One send at a time to a channel, and each a moment after the last.
     let _turn = super::send_guard::channel_turn(&channel_id).await;
     super::send_guard::take_turn(&account_id, false).await;
+    let turn = started.elapsed();
     let resp = send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -307,6 +309,14 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         )
     .await
         .context("sending Discord message")?;
+    // A send slow enough to be felt says where the time went.
+    if started.elapsed() >= std::time::Duration::from_secs(2) {
+        tracing::info!(
+            "discord: a message took {}ms to send ({}ms before it was its turn: checks and the channel's queue)",
+            started.elapsed().as_millis(),
+            turn.as_millis()
+        );
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

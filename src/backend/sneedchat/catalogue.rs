@@ -35,7 +35,7 @@ pub struct Reaction {
 
 /// What a room lets this account do, from its tab's permission bits: the
 /// first three are posting, reacting and whispering (what a guest is told it
-/// cannot do), and any later bit is a moderator's.
+/// cannot do). Moderation is not read off the bits alone - see `moderate`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Powers {
     pub post: bool,
@@ -45,14 +45,22 @@ pub struct Powers {
 }
 
 impl Powers {
-    pub fn from_bits(bits: &str) -> Self {
+    /// `moderator_tools`: the page itself handed this account a moderator's
+    /// controls (`page_offers_moderation`). The bits' layout keeps changing
+    /// under us - "111000000", then "11100000010", now "1110000010", each
+    /// time with an ordinary member's "1" moving into what had been the
+    /// moderation positions - and every move put the moderation menu in
+    /// front of people with no power to use it. So a moderation bit counts
+    /// only when the page agrees.
+    pub fn from_bits(bits: &str, moderator_tools: bool) -> Self {
         let on = |i: usize| bits.as_bytes().get(i) == Some(&b'1');
         // The six after those are the moderation powers. The string has grown
         // since (an ordinary member's now reads "11100000010": the page added
         // positions for things every member does, uploads among them), so a
         // later position is not evidence of anything - counting any "1" after
         // the third made every member a moderator, with the menu to match.
-        Self { post: on(0), react: on(1), whisper: on(2), moderate: bits.bytes().skip(3).take(6).any(|b| b == b'1') }
+        let bit = bits.bytes().skip(3).take(6).any(|b| b == b'1');
+        Self { post: on(0), react: on(1), whisper: on(2), moderate: bit && moderator_tools }
     }
 }
 
@@ -66,6 +74,8 @@ struct Catalogue {
     /// The badges members are grouped by, highest first, as the page orders
     /// them (`data-chat-member-groups`, "staff" today).
     member_groups: Vec<String>,
+    /// The last chat page read offered moderator controls.
+    moderator_tools: bool,
 }
 
 fn catalogue() -> &'static Mutex<Catalogue> {
@@ -113,7 +123,8 @@ pub fn reactions() -> Vec<Reaction> {
 /// What a room lets this account do; everything a member can do when the
 /// room's tab has not been read.
 pub fn powers(room: &str) -> Powers {
-    catalogue().lock().unwrap().rooms.get(room).map(|(bits, _)| Powers::from_bits(bits)).unwrap_or(Powers { post: true, react: true, whisper: true, moderate: false })
+    let c = catalogue().lock().unwrap();
+    c.rooms.get(room).map(|(bits, _)| Powers::from_bits(bits, c.moderator_tools)).unwrap_or(Powers { post: true, react: true, whisper: true, moderate: false })
 }
 
 /// A room's subtitle as its tab carries it.
@@ -184,6 +195,32 @@ pub(super) fn parse_page(html: &str) -> (Vec<PageReaction>, Vec<PageRoom>) {
     (reactions, rooms)
 }
 
+/// Whether a chat page gives this account a moderator's controls: a message
+/// action that edits, removes or restores *anybody's* message (an ordinary
+/// member's revise/tombstone carry `data-chat-own-only`), or one only a
+/// moderator has - sanctions, the pinned message, the room's stream.
+pub(super) fn page_offers_moderation(html: &str) -> bool {
+    const ANYONES: [&str; 3] = ["revise", "tombstone", "restore"];
+    const MODERATORS: [&str; 5] = ["sanction", "lift_sanction", "motd", "stream", "purge"];
+    if html.contains("data-chat-motd-clear") || html.contains("data-chat-stream-set") {
+        return true;
+    }
+    let mut rest = html;
+    while let Some(at) = rest.find("data-chat-action=\"") {
+        let tag_start = rest[..at].rfind('<').unwrap_or(0);
+        let tail = &rest[tag_start..];
+        let end = tail.find('>').unwrap_or(tail.len());
+        let tag = &tail[..end];
+        if let Some(action) = protocol::attr(tag, "data-chat-action") {
+            if MODERATORS.contains(&action.as_str()) || (ANYONES.contains(&action.as_str()) && !tag.contains("data-chat-own-only")) {
+                return true;
+            }
+        }
+        rest = &rest[at + "data-chat-action=\"".len()..];
+    }
+    false
+}
+
 /// The badges members are grouped by, highest first.
 pub fn member_groups() -> Vec<String> {
     let c = catalogue().lock().unwrap();
@@ -211,6 +248,7 @@ pub(super) async fn take_page(http: &http::HttpClient, host: &str, html: &str) {
     let (reactions, rooms) = parse_page(html);
     if !rooms.is_empty() {
         let mut c = catalogue().lock().unwrap();
+        c.moderator_tools = page_offers_moderation(html);
         for (uuid, bits, subtitle) in rooms {
             c.rooms.insert(uuid, (bits, subtitle));
         }
@@ -308,14 +346,27 @@ mod tests {
 
     #[test]
     fn permission_bits() {
-        assert_eq!(Powers::from_bits("111000000"), Powers { post: true, react: true, whisper: true, moderate: false });
-        assert_eq!(Powers::from_bits("000000000"), Powers::default());
-        assert!(Powers::from_bits("111010000").moderate);
-        // What the site gives an ordinary member now: nothing to moderate with.
-        assert!(!Powers::from_bits("11100000010").moderate);
-        assert!(!Powers::from_bits("11100000011").moderate);
-        // Moderation is still there when one of its six is granted, whatever follows.
-        assert!(Powers::from_bits("11100100010").moderate);
+        assert_eq!(Powers::from_bits("111000000", false), Powers { post: true, react: true, whisper: true, moderate: false });
+        assert_eq!(Powers::from_bits("000000000", true), Powers::default());
+        assert!(Powers::from_bits("111010000", true).moderate);
+        // What the site gives an ordinary member, in each layout it has used: nothing to moderate with.
+        assert!(!Powers::from_bits("11100000010", false).moderate);
+        assert!(!Powers::from_bits("1110000010", false).moderate);
+        // A bit in the old moderation positions is not enough without the page's controls.
+        assert!(!Powers::from_bits("111010000", false).moderate);
+    }
+
+    #[test]
+    fn moderation_is_what_the_page_hands_over() {
+        // An ordinary member's page (2026-11-25): edit and remove for their own messages only.
+        let member = r#"<template data-chat-template="row-actions"><button type="button" class="ephyraChat-action" data-chat-action="revise" data-chat-own-only>Edit</button>
+            <button type="button" class="ephyraChat-action ephyraChat-action--danger" data-chat-action="tombstone" data-chat-own-only>Delete</button>
+            <button type="button" data-chat-action="remove_member" data-chat-owner-only data-chat-group-only>Remove</button></template>
+            <template data-chat-template="moderation-form"><form></form></template>"#;
+        assert!(!page_offers_moderation(member));
+        assert!(page_offers_moderation(r#"<button type="button" data-chat-action="tombstone">Delete</button>"#));
+        assert!(page_offers_moderation(r#"<form data-chat-action="sanction"></form>"#));
+        assert!(page_offers_moderation(r#"<button data-chat-motd-clear>Unpin</button>"#));
     }
 
     #[test]

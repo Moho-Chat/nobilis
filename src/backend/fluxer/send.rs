@@ -51,6 +51,9 @@ fn noted(handle: &Handle, channel: &str, e: super::api::ApiError) -> String {
 /// `SPOILER_` name Discord uses: a file sent under that name alone was shown uncovered (seen on fluxer.com, 2026-11-18).
 pub const IS_SPOILER: u64 = 1 << 3;
 
+/// Fluxer's message flag for a silent message (`SUPPRESS_NOTIFICATIONS`, `http-api/messages.mdx`).
+pub const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+
 /// What a file is called when it is sent; with `spoiler`, Discord's `SPOILER_` name as well (kept for the spoiler flag
 /// only to be read where the name is, and harmless where the flag is).
 pub fn sent_name(path: &str, spoiler: bool) -> String {
@@ -62,8 +65,8 @@ pub fn sent_name(path: &str, spoiler: bool) -> String {
     }
 }
 
-/// The message itself: the words with custom emoji named by id, a nonce, and the message answered.
-fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>) -> Value {
+/// The message itself: the words with custom emoji named by id, a nonce, the message answered, and flags.
+fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>, silent: bool) -> Value {
     let wire = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let guild = world.channels.get(channel).and_then(|c| c.guild.clone());
@@ -72,6 +75,9 @@ fn payload(handle: &Handle, channel: &str, body: &str, reply_to: Option<&str>) -
     let mut payload = json!({ "content": wire, "nonce": crate::model::next_message_id().to_string().chars().filter(char::is_ascii_alphanumeric).take(32).collect::<String>() });
     if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
         payload["message_reference"] = json!({ "message_id": reply, "channel_id": channel });
+    }
+    if silent {
+        payload["flags"] = json!(SUPPRESS_NOTIFICATIONS);
     }
     payload
 }
@@ -93,22 +99,25 @@ fn may_write(handle: &Handle, channel: &str) -> Result<(), String> {
 }
 
 /// Sends a message, in answer to another if `reply_to` names one.
-pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
+pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>, silent: bool) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
     may_write(&handle, &channel)?;
     check(body, handle.limits.message_length)?;
     slowed(&handle, &channel)?;
-    let payload = payload(&handle, &channel, body, reply_to);
+    let payload = payload(&handle, &channel, body, reply_to, silent);
     let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted(&handle, &channel, e))?;
+    if buffer.slowmode_secs > 0 {
+        handle.set_slow_until(&channel, chrono::Utc::now().timestamp() + buffer.slowmode_secs as i64);
+    }
     // At once rather than when the event comes back: the echo finds it kept already.
     messages::record(state, &handle, &sent);
     Ok(())
 }
 
 /// Sends files with a message, as one multipart request (`payload_json` and `files[n]`).
-pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, silent: bool, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
     if files.is_empty() {
-        return send(state, buffer, caption, reply_to).await;
+        return send(state, buffer, caption, reply_to, silent).await;
     }
     let (handle, channel) = handle_for(state, buffer)?;
     may_write(&handle, &channel)?;
@@ -126,6 +135,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
     }
     let mut parts = Vec::new();
     let mut listed = Vec::new();
+    let mut upload_req = Vec::new();
     for (n, (path, spoiler)) in files.iter().enumerate() {
         let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
         if size > biggest {
@@ -133,15 +143,113 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
         }
         let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {path}: {e}"))?;
         let name = sent_name(path, false);
+        let ctype = crate::backend::stoat::send::content_type_of(&name).to_string();
         listed.push(json!({ "id": n, "filename": name, "flags": if *spoiler { IS_SPOILER } else { 0 } }));
-        parts.push((name.clone(), crate::backend::stoat::send::content_type_of(&name).to_string(), bytes));
+        upload_req.push(json!({ "id": n, "filename": name, "file_size": size, "content_type": ctype }));
+        parts.push((name, ctype, bytes));
     }
-    let mut payload = payload(&handle, &channel, caption, reply_to);
-    payload["attachments"] = json!(listed);
     if let Some(p) = progress {
         p.at(crate::upload::Phase::Sending, total as usize, "Fluxer");
     }
+    // Use presigned uploads when the instance advertises `presigned_attachment_uploads`, falling back to multipart if
+    // the instance turns the feature off at runtime.
+    if handle.instance.presigned_uploads {
+        match handle.api.post(&format!("/channels/{channel}/attachments"), &json!({ "attachments": upload_req })).await {
+            Ok(plan) => {
+                let uploads = plan["attachments"].as_array().cloned().unwrap_or_default();
+                if uploads.len() == parts.len() {
+                    let router = crate::net::route::router();
+                    let raw = router.client_if("fluxer", router.routed(&handle.account_id), |b| b.user_agent(super::user_agent()).timeout(std::time::Duration::from_secs(300)));
+                    let mut to_complete = Vec::new();
+                    let mut preuploaded = Vec::new();
+                    let mut failed: Option<String> = None;
+                    for (idx, u) in uploads.iter().enumerate() {
+                        let (ref name, ref ctype, ref bytes) = parts[idx];
+                        let spoiler = files[idx].1;
+                        let key = u["upload_filename"].as_str().unwrap_or_default();
+                        let mode = u["upload_mode"].as_str().unwrap_or("singlepart");
+                        if mode == "multipart" {
+                            let part_size = u["part_size"].as_u64().unwrap_or(10 * 1024 * 1024) as usize;
+                            let upload_id = u["upload_id"].as_str().unwrap_or_default();
+                            for part in u["parts"].as_array().into_iter().flatten() {
+                                let num = part["part_number"].as_u64().unwrap_or(1) as usize;
+                                let Some(url) = part["upload_url"].as_str() else { continue };
+                                let start = (num.saturating_sub(1)) * part_size;
+                                let end = (start + part_size).min(bytes.len());
+                                if let Err(e) = raw.put(url).body(bytes[start..end].to_vec()).send().await.and_then(|r| r.error_for_status()) {
+                                    failed = Some(format!("uploading {name}: {e}"));
+                                    break;
+                                }
+                            }
+                            if failed.is_some() {
+                                break;
+                            }
+                            to_complete.push(json!({ "upload_filename": key, "upload_id": upload_id }));
+                        } else if let Some(url) = u["upload_url"].as_str() {
+                            if let Err(e) = raw.put(url).header("Content-Type", ctype.as_str()).body(bytes.clone()).send().await.and_then(|r| r.error_for_status()) {
+                                failed = Some(format!("uploading {name}: {e}"));
+                                break;
+                            }
+                        }
+                        preuploaded.push(json!({
+                            "id": idx, "filename": name, "upload_filename": key,
+                            "file_size": bytes.len(), "content_type": ctype,
+                            "flags": if spoiler { IS_SPOILER } else { 0 },
+                        }));
+                    }
+                    if let Some(err) = failed {
+                        return Err(err);
+                    }
+                    if !to_complete.is_empty() {
+                        handle.api.post(&format!("/channels/{channel}/attachments/complete"), &json!({ "uploads": to_complete })).await.map_err(|e| noted(&handle, &channel, e))?;
+                    }
+                    let mut payload = payload(&handle, &channel, caption, reply_to, silent);
+                    payload["attachments"] = json!(preuploaded);
+                    let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted(&handle, &channel, e))?;
+                    messages::record(state, &handle, &sent);
+                    return Ok(());
+                }
+            }
+            Err(super::api::ApiError::Refused { code, .. }) if code == "FEATURE_TEMPORARILY_DISABLED" => {}
+            Err(e) => return Err(noted(&handle, &channel, e)),
+        }
+    }
+    let mut payload = payload(&handle, &channel, caption, reply_to, silent);
+    payload["attachments"] = json!(listed);
     let sent = handle.api.multipart(Method::POST, &format!("/channels/{channel}/messages"), &payload, &parts).await.map_err(|e| noted(&handle, &channel, e))?;
+    messages::record(state, &handle, &sent);
+    Ok(())
+}
+
+/// Guild stickers available to this account, in the sticker picker's shape.
+pub fn list_stickers(handle: &Handle, buffer: &Buffer) -> Value {
+    let channel = buffer.remote_id.as_deref();
+    let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    let here = channel.and_then(|c| world.channels.get(c)).and_then(|c| c.guild.clone());
+    let mut rows: Vec<(bool, String, Value)> = world
+        .stickers
+        .iter()
+        .map(|(id, s)| {
+            let pack = world.guilds.get(&s.guild).map(|g| g.name.clone()).unwrap_or_else(|| "Community".to_string());
+            let url = super::media::sticker_url(&handle.instance, id, s.animated).map(|u| super::media::cached(&handle.account_id, super::media::MEDIA, &u, None, Some("image/webp")));
+            let local = here.as_deref() == Some(s.guild.as_str());
+            (
+                !local,
+                format!("{pack}\0{}", s.name.to_lowercase()),
+                json!({ "id": id, "name": s.name, "pack": pack, "body": s.name, "url": url }),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Value::Array(rows.into_iter().map(|(_, _, v)| v).collect())
+}
+
+/// Sends a sticker by id (`POST /channels/{channel}/messages` with `sticker_ids`).
+pub async fn send_sticker(state: &AppState, buffer: &Buffer, sticker_id: &str) -> Result<(), String> {
+    let (handle, channel) = handle_for(state, buffer)?;
+    may_write(&handle, &channel)?;
+    slowed(&handle, &channel)?;
+    let sent = handle.api.post(&format!("/channels/{channel}/messages"), &json!({ "sticker_ids": [sticker_id] })).await.map_err(|e| noted(&handle, &channel, e))?;
     messages::record(state, &handle, &sent);
     Ok(())
 }
@@ -149,7 +257,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
 pub async fn edit(state: &AppState, buffer: &Buffer, message_id: &str, body: &str) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
     check(body, handle.limits.message_length)?;
-    let wire = payload(&handle, &channel, body, None)["content"].clone();
+    let wire = payload(&handle, &channel, body, None, false)["content"].clone();
     let edited = handle.api.patch(&format!("/channels/{channel}/messages/{message_id}"), &json!({ "content": wire })).await.map_err(|e| e.to_string())?;
     let text = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());

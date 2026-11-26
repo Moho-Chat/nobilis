@@ -406,10 +406,16 @@ pub struct Buffer {
     /// read but not write in, or Discord's own notices. Absent where it can.
     #[serde(rename = "readOnly", default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
+    /// Seconds between messages when slow mode is enabled and applies to this account.
+    #[serde(rename = "slowmodeSecs", default, skip_serializing_if = "is_zero_u64")]
+    pub slowmode_secs: u64,
     /// A Discord forum (or media channel): not a conversation but a list of
     /// posts, each of which is a thread. Opened as a pane of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forum: bool,
+    /// Marked by the service as for adults only (a Fluxer or Discord channel's age restriction), so it is marked here.
+    #[serde(rename = "ageRestricted", default, skip_serializing_if = "std::ops::Not::not")]
+    pub age_restricted: bool,
     /// How many messages the service itself counts as unread here, where it keeps a count a client could not work
     /// out from the messages it has: a Telegram topic of a group that was never opened here. A starting point for
     /// the window's own count, which then follows live messages; absent when there is none.
@@ -421,6 +427,10 @@ pub struct Buffer {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1104,7 +1114,9 @@ mod tests {
             name_icon: None,
             topic: None,
             read_only: None,
+            slowmode_secs: 0,
             forum: false,
+            age_restricted: false,
             unread_seed: 0,
             mentions_seed: 0,
         }

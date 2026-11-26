@@ -1087,7 +1087,7 @@ async fn clock(
     mut stop: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(20));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let mut encoder = match opus2::Encoder::new(48_000, opus2::Channels::Stereo, opus2::Application::Voip) {
         Ok(encoder) => Some(encoder),
         Err(e) => {
@@ -1144,14 +1144,19 @@ async fn clock(
             if let Some(effect) = shared.state.voice.take_effect(&shared.account, FRAME_SAMPLES) {
                 voices.push((0, effect));
             }
+            if let Some(stream_pcm) = shared.state.voice.take_stream_audio(&shared.account, FRAME_SAMPLES) {
+                voices.push((0, stream_pcm));
+            }
             let refs: Vec<&[i16]> = voices.iter().map(|(_, pcm)| pcm.as_slice()).collect();
-            let mut mixed = super::voice::mix(&refs);
+            let mut mixed = if refs.is_empty() {
+                vec![0i16; FRAME_SAMPLES]
+            } else {
+                super::voice::mix(&refs)
+            };
             crate::audio::apply_gain(&mut mixed, prefs.output_volume);
-            if !mixed.is_empty() {
-                playback.push(&mixed);
-                if !crate::audio::playback_muted() {
-                    played = mixed;
-                }
+            playback.push(&mixed);
+            if !crate::audio::playback_muted() && !refs.is_empty() {
+                played = mixed;
             }
         }
         played.resize(FRAME_SAMPLES, 0);
@@ -1314,8 +1319,12 @@ pub struct Jitter {
     decoder: Option<opus2::Decoder>,
 }
 
-const JITTER_PRIME: usize = 2;
+const JITTER_PRIME: usize = 3;
 const JITTER_MAX: usize = 25;
+/// Conceal up to two missing trailing frames with Opus PLC before treating a
+/// speaker as silent, so a single jitter spike does not chop speech into silence
+/// and force a 60 ms re-prime.
+const JITTER_TRAILING_PLC: u32 = 2;
 
 impl Jitter {
     pub fn new() -> Self {
@@ -1374,27 +1383,38 @@ impl Jitter {
         match opus {
             Some(opus) => {
                 self.concealed = 0;
-                self.decode(&opus)
+                self.decode(&opus, false)
             }
             None if self.packets.is_empty() => {
-                // Nothing held: they have stopped. Wait for the next burst.
+                if self.concealed < JITTER_TRAILING_PLC {
+                    self.concealed += 1;
+                    return self.decode(&[], false);
+                }
+                // Nothing held after trailing PLC: they have stopped. Wait for the next burst.
                 self.started = false;
                 self.next = None;
+                self.concealed = 0;
                 None
             }
             None => {
                 self.concealed += 1;
+                // If the packet right after the missing one is already here,
+                // ask Opus to recover the lost frame from its in-band FEC.
+                let next_after = next.wrapping_add(1);
+                if let Some(lookahead) = self.packets.get(&next_after).cloned() {
+                    return self.decode(&lookahead, true);
+                }
                 if self.concealed > 5 {
                     // A long gap with packets beyond it: jump to them.
                     self.concealed = 0;
                     self.next = Some(self.oldest());
                 }
-                self.decode(&[])
+                self.decode(&[], false)
             }
         }
     }
 
-    fn decode(&mut self, opus: &[u8]) -> Option<Vec<i16>> {
+    fn decode(&mut self, opus: &[u8], fec: bool) -> Option<Vec<i16>> {
         let decoder = self.decoder.as_mut()?;
         let mut pcm = vec![0i16; FRAME_SAMPLES * 3];
         // What another person's client sent, checked in Rust before libopus
@@ -1406,7 +1426,7 @@ impl Jitter {
         } else {
             &[]
         };
-        let per_channel = decoder.decode(opus, &mut pcm, false).ok()?;
+        let per_channel = decoder.decode(opus, &mut pcm, fec).ok()?;
         pcm.truncate(per_channel * 2);
         Some(pcm)
     }
@@ -1538,12 +1558,21 @@ mod tests {
     #[test]
     fn packets_are_played_in_order_after_a_short_wait() {
         let mut jitter = Jitter::new();
-        jitter.push(11, opus_silence());
-        assert!(jitter.pop().is_none(), "one packet is not enough to start");
+        // Out of order, and fewer than it waits for: nothing yet.
+        for seq in (11..10 + JITTER_PRIME as u16).rev() {
+            jitter.push(seq, opus_silence());
+            assert!(jitter.pop().is_none(), "not enough to start");
+        }
         jitter.push(10, opus_silence());
         assert_eq!(jitter.pop().map(|p| p.len()), Some(FRAME_SAMPLES), "starts from the earliest");
         assert_eq!(jitter.next, Some(11));
-        assert!(jitter.pop().is_some());
+        for _ in 1..JITTER_PRIME {
+            assert!(jitter.pop().is_some());
+        }
+        // The last word is carried over a short gap, then it stops when they do.
+        for _ in 0..JITTER_TRAILING_PLC {
+            assert!(jitter.pop().is_some(), "a trailing frame is concealed");
+        }
         assert!(jitter.pop().is_none(), "and stops when they do");
     }
 
@@ -1551,7 +1580,9 @@ mod tests {
     fn a_late_packet_is_dropped_and_sequence_numbers_wrap() {
         let mut jitter = Jitter::new();
         jitter.push(65_535, opus_silence());
-        jitter.push(0, opus_silence());
+        for seq in 0..(JITTER_PRIME as u16 - 1) {
+            jitter.push(seq, opus_silence());
+        }
         assert!(jitter.pop().is_some());
         assert_eq!(jitter.next, Some(0), "wrapped");
         jitter.push(65_534, opus_silence());
@@ -1562,7 +1593,9 @@ mod tests {
     fn a_lost_packet_is_concealed_rather_than_skipped() {
         let mut jitter = Jitter::new();
         jitter.push(1, opus_silence());
-        jitter.push(3, opus_silence());
+        for seq in 3..(2 + JITTER_PRIME as u16) {
+            jitter.push(seq, opus_silence());
+        }
         assert!(jitter.pop().is_some(), "1");
         assert!(jitter.pop().is_some(), "2 is missing and concealed");
         assert!(jitter.pop().is_some(), "3");

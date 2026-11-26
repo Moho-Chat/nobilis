@@ -234,6 +234,13 @@ pub struct Guild {
     pub features: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Sticker {
+    pub name: String,
+    pub animated: bool,
+    pub guild: String,
+}
+
 #[derive(Debug, Default)]
 pub struct World {
     pub own_id: String,
@@ -241,6 +248,9 @@ pub struct World {
     pub guilds: HashMap<String, Guild>,
     pub channels: HashMap<String, Channel>,
     pub emojis: HashMap<String, Emoji>,
+    pub stickers: HashMap<String, Sticker>,
+    /// Private notes this account wrote on other users (`READY.notes` + `USER_NOTE_UPDATE`).
+    pub notes: HashMap<String, String>,
     /// People this account has blocked, or who are friends (relationship type 2 and 1).
     pub blocked: HashSet<String>,
     pub friends: HashSet<String>,
@@ -308,6 +318,12 @@ impl World {
                 self.emojis.insert(eid.to_string(), Emoji { name: e["name"].as_str().unwrap_or("emoji").to_string(), animated: e["animated"].as_bool().unwrap_or(false), guild: id.clone() });
             }
         }
+        self.stickers.retain(|_, s| s.guild != id);
+        for s in g["stickers"].as_array().into_iter().flatten() {
+            if let Some(sid) = s["id"].as_str() {
+                self.stickers.insert(sid.to_string(), Sticker { name: s["name"].as_str().unwrap_or("sticker").to_string(), animated: s["animated"].as_bool().unwrap_or(false), guild: id.clone() });
+            }
+        }
         self.guilds.insert(id.clone(), guild);
         for m in g["members"].as_array().into_iter().flatten() {
             self.put_member(&id, m);
@@ -366,13 +382,20 @@ impl World {
             Kind::Notes => "Personal Notes".to_string(),
             Kind::Direct | Kind::Group if channel.name.is_empty() => {
                 let names: Vec<String> = channel.recipients.iter().filter(|r| **r != self.own_id).map(|r| self.name_in(None, r)).collect();
-                if names.is_empty() {
-                    "Direct message".to_string()
-                } else {
-                    names.join(", ")
+                match (channel.kind == Kind::Group, names.is_empty()) {
+                    (false, true) => "Direct message".to_string(),
+                    (false, false) => names.join(", "),
+                    // A group with nobody else left in it is still the account's until it leaves.
+                    (true, true) => "A group of just you".to_string(),
+                    // A group is named for everyone in it, the account too, so it is not taken for the direct message
+                    // with the same person.
+                    (true, false) => format!("{} and you", names.join(", ")),
                 }
             }
-            _ => channel.name.clone(),
+            _ => match channel.guild.as_ref().and_then(|g| self.guilds.get(g)) {
+                Some(guild) => format!("{}/{}", guild.name, channel.name),
+                None => channel.name.clone(),
+            },
         }
     }
 
@@ -510,6 +533,8 @@ mod tests {
         assert_eq!(w.title_of(&w.channels["5"]), "Ada L");
         w.put_channel(&json!({ "id": ME, "type": 999 }));
         assert_eq!(w.title_of(&w.channels[ME]), "Personal Notes");
+        w.put_guild(&json!({ "id": G, "properties": { "name": "Hall", "owner_id": ME }, "channels": [{ "id": "40", "type": 0, "name": "general" }] }));
+        assert_eq!(w.title_of(&w.channels["40"]), "Hall/general");
         assert_eq!(mask(&json!("9223372036854775807")), 9223372036854775807);
         assert_eq!(mask(&json!(1024)), 1024);
         assert_eq!(Kind::from(11), Kind::Thread);

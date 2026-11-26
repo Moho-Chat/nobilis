@@ -10,24 +10,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Fresh logins an account may make in any hour.
-pub const PER_HOUR: usize = 3;
-/// And in any day.
-pub const PER_DAY: usize = 8;
+// Half of what arikawa, the library under Dissent, allows any account: it
+// waits five seconds between logins and allows a thousand a day.
 
-const HOUR: i64 = 3600;
-const DAY: i64 = 24 * HOUR;
+/// Seconds there must be between one fresh login and the next.
+pub const MIN_GAP: i64 = 10;
+/// Fresh logins an account may make in any day.
+pub const PER_DAY: usize = 500;
+
+const DAY: i64 = 24 * 3600;
 
 /// Whether one more fresh login may be made at `now` (Unix seconds), given the times of the earlier ones. Answers
 /// the number of seconds to wait when not. The list is kept as it should be saved: only what still counts.
 pub fn admit(history: &mut Vec<i64>, now: i64) -> Result<(), i64> {
     history.retain(|t| now - t < DAY);
     history.sort_unstable();
-    let in_hour: Vec<i64> = history.iter().copied().filter(|t| now - t < HOUR).collect();
     let mut wait = 0;
-    // Over the hour's limit: when the one that makes room ages out.
-    if in_hour.len() >= PER_HOUR {
-        wait = wait.max(in_hour[in_hour.len() - PER_HOUR] + HOUR - now);
+    // Too soon after the last one.
+    if let Some(&last) = history.last() {
+        wait = wait.max(last + MIN_GAP - now);
     }
     // Over the day's.
     if history.len() >= PER_DAY {
@@ -120,8 +121,8 @@ pub fn record(account_id: &str) {
 pub fn explain(wait: i64) -> String {
     let at = chrono::Local::now() + chrono::Duration::seconds(wait);
     format!(
-        "Holding the Discord connection: this account has already logged in {PER_HOUR} times in the last hour (or {PER_DAY} in a day), and many fresh logins can get an account flagged as spam. It will connect at {}.",
-        at.format("%H:%M")
+        "Holding the Discord connection: this account has logged in afresh too often (no more than once every {MIN_GAP} seconds, or {PER_DAY} times a day), and many fresh logins can get an account flagged as spam. It will connect at {}.",
+        at.format("%H:%M:%S")
     )
 }
 
@@ -130,35 +131,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_few_logins_an_hour_are_let_through_and_the_next_waits_for_the_oldest_to_age_out() {
+    fn logins_are_spaced_out() {
         let mut history = Vec::new();
         let start = 1_000_000;
         assert_eq!(admit(&mut history, start), Ok(()));
-        assert_eq!(admit(&mut history, start + 60), Ok(()));
-        assert_eq!(admit(&mut history, start + 120), Ok(()));
-        // The fourth, ten minutes in: held until the first is an hour old.
-        assert_eq!(admit(&mut history, start + 600), Err(HOUR - 600));
-        assert_eq!(history.len(), 3, "a held login is not counted");
-        // An hour after the first, there is room.
-        assert_eq!(admit(&mut history, start + HOUR), Ok(()));
+        // Three seconds later: held until ten have passed.
+        assert_eq!(admit(&mut history, start + 3), Err(MIN_GAP - 3));
+        assert_eq!(history.len(), 1, "a held login is not counted");
+        assert_eq!(admit(&mut history, start + MIN_GAP), Ok(()));
     }
 
     #[test]
-    fn the_day_has_its_own_limit_however_the_hours_fall() {
-        let mut history = Vec::new();
+    fn the_day_has_its_own_limit() {
         let start = 5_000_000;
-        // Three an hour for three hours is nine; the eighth is held until the first is a day old.
-        let mut made = 0;
-        for hour in 0..3 {
-            for n in 0..3 {
-                if admit(&mut history, start + hour * HOUR + n).is_ok() {
-                    made += 1;
-                }
-            }
-        }
-        assert_eq!(made, PER_DAY);
-        let wait = admit(&mut history, start + 3 * HOUR).unwrap_err();
-        assert_eq!(wait, DAY - 3 * HOUR);
+        let mut history: Vec<i64> = (0..PER_DAY as i64).map(|n| start + n * MIN_GAP).collect();
+        let now = start + PER_DAY as i64 * MIN_GAP;
+        // Held until the first of the day's logins is a day old.
+        assert_eq!(admit(&mut history, now), Err(start + DAY - now));
+        assert_eq!(admit(&mut history, start + DAY), Ok(()));
     }
 
     #[test]

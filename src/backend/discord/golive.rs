@@ -144,6 +144,75 @@ pub fn ping(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> 
     Ok(())
 }
 
+/// Fetches a Go Live stream's current preview thumbnail as a data URL.
+///
+/// Discord serves a JSON object `{ "url": "https://cdn.discordapp.com/..." }`
+/// from `GET /streams/{stream_key}/preview?version={ms}` for any active stream
+/// in a voice channel this account can see, even without joining the channel.
+/// Fetching the image bytes here rather than handing the CDN URL straight to
+/// the renderer keeps Tor/proxy routing intact and avoids expiring-link issues.
+pub async fn fetch_stream_preview(state: &AppState, account_id: &str, stream_key: &str) -> Result<Option<String>> {
+    use super::http::{bare_client_for, http_client_for, SendPaced, API_BASE};
+    use base64::Engine;
+
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let encoded_key: String = stream_key
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let version = chrono::Utc::now().timestamp_millis();
+    let api_url = format!("{API_BASE}/streams/{encoded_key}/preview?version={version}");
+
+    let resp = http_client_for(&cfg.token)
+        .get(&api_url)
+        .header("Authorization", &cfg.token)
+        .send_paced()
+        .await
+        .context("asking Discord for a stream preview")?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: Value = resp.json().await.context("reading stream preview answer")?;
+    let Some(cdn_url) = body["url"].as_str().filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+
+    let img_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bare_client_for(&cfg.token).get(cdn_url).send(),
+    )
+    .await
+    .context("stream preview image timed out")?
+    .context("fetching stream preview image")?;
+
+    if !img_resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let content_type = img_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        .filter(|ct| ct.starts_with("image/"))
+        .unwrap_or("image/jpeg")
+        .to_string();
+
+    let bytes = img_resp.bytes().await.context("reading stream preview image")?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(Some(format!("data:{content_type};base64,{encoded}")))
+}
+
 /// The two halves of a stream's handshake, as they arrive.
 ///
 /// The same shape the voice handshake uses and for the same reason: the

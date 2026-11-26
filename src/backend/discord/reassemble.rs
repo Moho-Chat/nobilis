@@ -36,25 +36,41 @@ pub struct Frame {
 /// How long a complete frame waits behind a missing packet for it to be sent
 /// again, before the missing packet is given up on.
 ///
-/// A retransmission asked for straight away comes back in one round trip to
-/// the relay - tens of milliseconds - and a frame at thirty a second is
-/// thirty-three; this is a few frames' worth, which covers a resend without
-/// making every loss a visible stall.
-pub const RETRANSMIT_WAIT: Duration = Duration::from_millis(120);
+/// Covers two round trips to a ~115 ms relay so NACK + RTX retransmissions
+/// actually arrive before giving up and triggering a PLI keyframe storm.
+pub const RETRANSMIT_WAIT: Duration = Duration::from_millis(250);
 
 /// How many packets to hold before giving up on a gap.
 ///
-/// At 720p30 and 2.5Mbit a frame is a handful of packets, so this is some
-/// tens of frames - long enough to outlast ordinary reordering and a
-/// retransmit, short enough that a viewer is not watching a picture from two
-/// seconds ago because one packet went missing.
-pub const DEFAULT_WINDOW: usize = 512;
+/// Roomy enough for 1080p60 and 1440p keyframes (which can span 60–150+ RTP
+/// packets) plus reordering and retransmissions.
+pub const DEFAULT_WINDOW: usize = 1024;
+
+/// Video codecs this reassembler can depacketize from RTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    #[default]
+    Vp8,
+    H264,
+    Vp9,
+}
+
+impl VideoCodec {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            VideoCodec::Vp8 => "vp8",
+            VideoCodec::H264 => "h264",
+            VideoCodec::Vp9 => "vp9",
+        }
+    }
+}
 
 /// The reorder window for one sender.
 ///
 /// One per SSRC. Two people streaming into the same connection would
 /// otherwise share a sequence space they do not share in reality.
 pub struct Reassembler {
+    codec: VideoCodec,
     packets: BTreeMap<u64, Packet>,
     /// The highest extended sequence number seen, which is what later
     /// sequence numbers are placed relative to.
@@ -73,8 +89,21 @@ pub struct Reassembler {
 }
 
 impl Reassembler {
+    #[cfg(test)]
     pub fn new(window: usize) -> Self {
-        Self { packets: BTreeMap::new(), highest: None, floor: 0, window: window.max(2), waiting_since: None, emitted: false }
+        Self::with_codec(window, VideoCodec::Vp8)
+    }
+
+    pub fn with_codec(window: usize, codec: VideoCodec) -> Self {
+        Self { codec, packets: BTreeMap::new(), highest: None, floor: 0, window: window.max(2), waiting_since: None, emitted: false }
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    pub fn highest_seq(&self) -> u32 {
+        self.highest.unwrap_or(0) as u32
     }
 
     /// Where a 16-bit sequence number sits on a line that does not wrap.
@@ -167,11 +196,28 @@ impl Reassembler {
             for sequence in start..=end {
                 let Some(packet) = self.packets.remove(&sequence) else { break };
                 timestamp = packet.timestamp;
-                let Some(offset) = vp8_payload_start(&packet.payload) else { continue };
-                if sequence == start {
-                    keyframe = is_keyframe(&packet.payload[offset..]);
+                match self.codec {
+                    VideoCodec::Vp8 => {
+                        let Some(offset) = vp8_payload_start(&packet.payload) else { continue };
+                        if sequence == start {
+                            keyframe = is_keyframe(&packet.payload[offset..]);
+                        }
+                        data.extend_from_slice(&packet.payload[offset..]);
+                    }
+                    VideoCodec::H264 => {
+                        append_h264_packet(&mut data, &packet.payload);
+                    }
+                    VideoCodec::Vp9 => {
+                        let Some(offset) = vp9_payload_start(&packet.payload) else { continue };
+                        if sequence == start {
+                            keyframe = is_vp9_keyframe(&packet.payload[offset..]);
+                        }
+                        data.extend_from_slice(&packet.payload[offset..]);
+                    }
                 }
-                data.extend_from_slice(&packet.payload[offset..]);
+            }
+            if self.codec == VideoCodec::H264 {
+                keyframe = is_h264_keyframe(&data);
             }
             self.floor = end + 1;
             // Packets before a frame that has now been handed out cannot
@@ -185,21 +231,45 @@ impl Reassembler {
         out
     }
 
-    /// The first run of packets that is a whole frame: starts with `S` and a
-    /// partition index of zero, ends with the marker bit, and is unbroken in
-    /// between.
+    /// The first run of packets that is a whole frame: unbroken in sequence
+    /// order, starting at a valid frame boundary for the codec, and ending
+    /// with the RTP marker bit.
     fn first_complete(&self) -> Option<(u64, u64)> {
         let mut start: Option<u64> = None;
+        let mut start_ts: Option<u32> = None;
         let mut previous: Option<u64> = None;
         for (&sequence, packet) in &self.packets {
             // A hole: everything gathered so far belongs to a frame that
             // cannot be completed from here, so begin again on the far side.
             if previous.is_some_and(|p| sequence != p + 1) {
                 start = None;
+                start_ts = None;
             }
             previous = Some(sequence);
-            if starts_frame(&packet.payload) {
-                start = Some(sequence);
+            match self.codec {
+                VideoCodec::Vp8 => {
+                    if starts_frame(&packet.payload) {
+                        start = Some(sequence);
+                    }
+                }
+                VideoCodec::Vp9 => {
+                    if vp9_starts_frame(&packet.payload) {
+                        start = Some(sequence);
+                    }
+                }
+                VideoCodec::H264 => {
+                    // An H.264 access unit may consist of multiple NAL packets
+                    // (e.g. SPS, PPS, IDR FU-A) sharing the same RTP timestamp.
+                    if start.is_none() || start_ts != Some(packet.timestamp) {
+                        if h264_starts_nal(&packet.payload) {
+                            start = Some(sequence);
+                            start_ts = Some(packet.timestamp);
+                        } else {
+                            start = None;
+                            start_ts = None;
+                        }
+                    }
+                }
             }
             let Some(first) = start else { continue };
             if packet.marker {
@@ -260,6 +330,163 @@ pub fn starts_frame(payload: &[u8]) -> bool {
 /// way round from how it reads.
 pub fn is_keyframe(frame: &[u8]) -> bool {
     frame.first().is_some_and(|b| b & 1 == 0)
+}
+
+/// Codec-dispatched keyframe check on a decrypted frame.
+pub fn is_codec_keyframe(codec: VideoCodec, frame: &[u8]) -> bool {
+    match codec {
+        VideoCodec::Vp8 => is_keyframe(frame),
+        VideoCodec::H264 => is_h264_keyframe(frame),
+        VideoCodec::Vp9 => is_vp9_keyframe(frame),
+    }
+}
+
+/// Whether an H.264 RTP packet begins a NAL unit (single NAL, STAP-A, or FU-A with S=1).
+pub fn h264_starts_nal(payload: &[u8]) -> bool {
+    let Some(&first) = payload.first() else { return false };
+    match first & 0x1f {
+        1..=24 => true,
+        28 => payload.get(1).is_some_and(|h| h & 0x80 != 0),
+        _ => false,
+    }
+}
+
+/// Appends one RFC 6184 H.264 RTP payload onto an Annex B byte stream.
+pub fn append_h264_packet(out: &mut Vec<u8>, payload: &[u8]) {
+    let Some(&first) = payload.first() else { return };
+    match first & 0x1f {
+        1..=23 => {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(payload);
+        }
+        24 => {
+            // STAP-A: sequence of 16-bit big-endian length-prefixed NAL units.
+            let mut at = 1;
+            while at + 2 <= payload.len() {
+                let len = u16::from_be_bytes([payload[at], payload[at + 1]]) as usize;
+                at += 2;
+                if len == 0 || at + len > payload.len() {
+                    break;
+                }
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(&payload[at..at + len]);
+                at += len;
+            }
+        }
+        28 => {
+            // FU-A: fragmented NAL unit.
+            if payload.len() < 2 {
+                return;
+            }
+            let fu_header = payload[1];
+            if fu_header & 0x80 != 0 {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.push((first & 0xe0) | (fu_header & 0x1f));
+            }
+            out.extend_from_slice(&payload[2..]);
+        }
+        _ => {}
+    }
+}
+
+/// Whether an Annex B H.264 access unit contains an IDR slice (NAL type 5).
+pub fn is_h264_keyframe(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let nal_at = if data[i + 2] == 1 {
+                Some(i + 3)
+            } else if data[i + 2] == 0 && data[i + 3] == 1 {
+                Some(i + 4)
+            } else {
+                None
+            };
+            if let Some(at) = nal_at {
+                if at < data.len() && (data[at] & 0x1f) == 5 {
+                    return true;
+                }
+                i = at + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a VP9 RTP packet has the Beginning-of-Frame (B) bit set.
+pub fn vp9_starts_frame(payload: &[u8]) -> bool {
+    payload.first().is_some_and(|b| b & 0x08 != 0)
+}
+
+/// Where the VP9 bitstream begins past the RFC/draft VP9 RTP payload descriptor.
+pub fn vp9_payload_start(payload: &[u8]) -> Option<usize> {
+    let first = *payload.first()?;
+    let i_bit = first & 0x80 != 0;
+    let p_bit = first & 0x40 != 0;
+    let l_bit = first & 0x20 != 0;
+    let f_bit = first & 0x10 != 0;
+    let v_bit = first & 0x02 != 0;
+    let mut at = 1;
+    if i_bit {
+        let b = *payload.get(at)?;
+        at += if b & 0x80 != 0 { 2 } else { 1 };
+    }
+    if l_bit {
+        at += 1;
+        if !f_bit {
+            at += 1; // TL0PICIDX
+        }
+    }
+    if f_bit && p_bit {
+        loop {
+            let b = *payload.get(at)?;
+            at += 1;
+            if b & 0x01 == 0 {
+                break;
+            }
+        }
+    }
+    if v_bit {
+        let ss = *payload.get(at)?;
+        at += 1;
+        let n_s = ((ss >> 5) & 0x07) as usize;
+        let y_bit = ss & 0x10 != 0;
+        let g_bit = ss & 0x08 != 0;
+        if y_bit {
+            at += (n_s + 1) * 4;
+        }
+        if g_bit {
+            let n_g = *payload.get(at)? as usize;
+            at += 1;
+            for _ in 0..n_g {
+                let b = *payload.get(at)?;
+                at += 1;
+                let r = ((b >> 2) & 0x03) as usize;
+                at += r;
+            }
+        }
+    }
+    (at <= payload.len()).then_some(at)
+}
+
+/// Whether a VP9 frame is a keyframe from its uncompressed header.
+pub fn is_vp9_keyframe(frame: &[u8]) -> bool {
+    let Some(&b0) = frame.first() else { return false };
+    // Frame marker must be 0b10.
+    if (b0 >> 6) != 2 {
+        return false;
+    }
+    let profile_low = (b0 >> 5) & 1;
+    let profile_high = (b0 >> 4) & 1;
+    let profile = (profile_high << 1) | profile_low;
+    // For profile 3 there is an extra reserved bit; otherwise show_existing_frame is bit 3, frame_type is bit 2.
+    let (show_existing, frame_type) = if profile == 3 {
+        ((b0 >> 2) & 1, (b0 >> 1) & 1)
+    } else {
+        ((b0 >> 3) & 1, (b0 >> 2) & 1)
+    };
+    show_existing == 0 && frame_type == 0
 }
 
 #[cfg(test)]

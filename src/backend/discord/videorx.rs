@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::reassemble::{Frame, Reassembler, DEFAULT_WINDOW};
+use super::reassemble::{Frame, Reassembler, VideoCodec, DEFAULT_WINDOW};
 use super::rtp::Packet;
 use super::voicecrypto::Sealer;
 
-/// The payload type retransmissions arrive under, beside VP8's 103.
+/// The payload types retransmissions arrive under, beside each video codec.
+pub const PAYLOAD_TYPE_H264_RTX: u8 = 102;
 pub const PAYLOAD_TYPE_RTX: u8 = 104;
+pub const PAYLOAD_TYPE_VP9_RTX: u8 = 106;
 
 /// How long to wait before asking for the same packet again. About a round
 /// trip to the relay.
@@ -69,13 +71,25 @@ impl Default for VideoReceiver {
 
 impl VideoReceiver {
     pub fn new() -> Self {
+        Self::with_codec(VideoCodec::Vp8)
+    }
+
+    pub fn with_codec(codec: VideoCodec) -> Self {
         Self {
-            window: Reassembler::new(DEFAULT_WINDOW),
+            window: Reassembler::with_codec(DEFAULT_WINDOW, codec),
             waiting_for_keyframe: true,
             asked: HashMap::new(),
             last_pli: None,
             stats: Stats::default(),
         }
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        self.window.codec()
+    }
+
+    pub fn highest_seq(&self) -> u32 {
+        self.window.highest_seq()
     }
 
     /// A packet, as first sent or as recovered from a retransmission.
@@ -201,6 +215,47 @@ pub fn pli(sender: u32, media: u32) -> Vec<u8> {
     feedback_header(206, 1, sender, media, 0)
 }
 
+/// An RTCP Receiver Report (RFC 3550 §6.4.2, PT 201) with one reception report
+/// block for `media`, telling the relay this viewer is healthy and receiving.
+pub fn receiver_report(sender: u32, media: u32, highest_seq: u32, fraction_lost: u8, cum_lost: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(32);
+    // V=2, P=0, RC=1; PT=201 (RR); length = 7 (8 32-bit words - 1)
+    packet.push(0x81);
+    packet.push(201);
+    packet.extend_from_slice(&7u16.to_be_bytes());
+    packet.extend_from_slice(&sender.to_be_bytes());
+    // Report block (24 bytes)
+    packet.extend_from_slice(&media.to_be_bytes());
+    let lost_word = ((fraction_lost as u32) << 24) | (cum_lost & 0x00ff_ffff);
+    packet.extend_from_slice(&lost_word.to_be_bytes());
+    packet.extend_from_slice(&highest_seq.to_be_bytes());
+    packet.extend_from_slice(&0u32.to_be_bytes()); // interarrival jitter
+    packet.extend_from_slice(&0u32.to_be_bytes()); // LSR
+    packet.extend_from_slice(&0u32.to_be_bytes()); // DLSR
+    packet
+}
+
+/// Receiver Estimated Maximum Bitrate (draft-alvestrand-rmcat-remb, PT 206,
+/// FMT 15), telling the SFU how much video bandwidth this viewer can accept so
+/// it ramps stream quality up instead of capping at the conservative floor.
+pub fn remb(sender: u32, media: u32, bitrate_bps: u64) -> Vec<u8> {
+    let mut exp: u8 = 0;
+    let mut mantissa: u64 = bitrate_bps;
+    while mantissa > 0x3ffff && exp < 63 {
+        mantissa >>= 1;
+        exp += 1;
+    }
+    let mantissa = mantissa.min(0x3ffff) as u32;
+    // PT=206, FMT=15; media SSRC is 0 per spec, target SSRC goes in the list.
+    let mut packet = feedback_header(206, 15, sender, 0, 3);
+    packet.extend_from_slice(b"REMB");
+    // Num SSRCs = 1 (8 bits), BR Exp (6 bits), BR Mantissa (18 bits)
+    let br_word = (1u32 << 24) | ((exp as u32) << 18) | mantissa;
+    packet.extend_from_slice(&br_word.to_be_bytes());
+    packet.extend_from_slice(&media.to_be_bytes());
+    packet
+}
+
 fn feedback_header(payload_type: u8, format: u8, sender: u32, media: u32, words: usize) -> Vec<u8> {
     let mut packet = Vec::with_capacity(12 + words * 4);
     packet.push(0x80 | format);
@@ -315,13 +370,15 @@ mod tests {
         let first = rx.push(vp8(1, true, true, true), false, t);
         assert!(rx.admit(&first[0], true));
         rx.push(vp8(3, true, true, false), false, t);
-        let frames = rx.push(vp8(4, true, true, false), false, t + Duration::from_millis(200));
+        // Past how long the reassembler waits for the lost one to be sent again.
+        let given_up = t + super::super::reassemble::RETRANSMIT_WAIT + Duration::from_millis(10);
+        let frames = rx.push(vp8(4, true, true, false), false, given_up);
         assert!(frames[0].after_gap);
         assert!(!rx.admit(&frames[0], false), "the frame after the loss is not decoded");
         assert!(!rx.admit(&frames[1], false), "nor anything until a keyframe");
         assert!(rx.wants_keyframe(t));
         assert!(!rx.wants_keyframe(t + Duration::from_millis(10)), "and not asked again at once");
-        let key = rx.push(vp8(5, true, true, true), false, t + Duration::from_millis(300));
+        let key = rx.push(vp8(5, true, true, true), false, given_up + Duration::from_millis(100));
         assert!(rx.admit(&key[0], true));
         assert!(!rx.is_waiting_for_keyframe());
     }

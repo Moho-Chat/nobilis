@@ -110,6 +110,8 @@ pub struct VoiceState {
     sent_peaks: Mutex<HashMap<String, f32>>,
     /// Soundboard sounds waiting to be mixed into the call, as 48kHz stereo.
     effects: Mutex<HashMap<String, std::collections::VecDeque<i16>>>,
+    /// Decoded Go Live stream audio waiting to be mixed into the call, as 48kHz stereo.
+    stream_audio: Mutex<HashMap<String, std::collections::VecDeque<i16>>>,
 }
 
 /// Who is audible in one call, and how loudly.
@@ -340,19 +342,35 @@ mod speaking_tests {
 
 /// Sums what several people are saying into one stream.
 ///
-/// Saturating rather than wrapping: a loud moment should clip, which sounds
-/// like a loud moment, instead of wrapping around to the opposite extreme,
-/// which sounds like a gunshot. Speakers whose packets were lost contribute
-/// nothing rather than shortening the tick.
+/// Accumulates in i32 and applies a soft-clipping knee above 85% full scale so
+/// several loud speakers overlapping sound warm rather than crackling with hard
+/// digital clipping, while ordinary single-speaker levels pass untouched.
 pub(super) fn mix(voices: &[&[i16]]) -> Vec<i16> {
     let longest = voices.iter().map(|v| v.len()).max().unwrap_or(0);
-    let mut mixed = vec![0i16; longest];
+    if longest == 0 {
+        return Vec::new();
+    }
+    let mut sum = vec![0i32; longest];
     for voice in voices {
-        for (slot, sample) in mixed.iter_mut().zip(voice.iter()) {
-            *slot = slot.saturating_add(*sample);
+        for (slot, &sample) in sum.iter_mut().zip(voice.iter()) {
+            *slot += sample as i32;
         }
     }
-    mixed
+    const KNEE: f32 = 27_852.0; // ~85% of i16::MAX
+    const HEADROOM: f32 = 32_767.0 - KNEE;
+    sum.into_iter()
+        .map(|s| {
+            let f = s as f32;
+            let abs = f.abs();
+            if abs <= KNEE {
+                s as i16
+            } else {
+                let over = (abs - KNEE) / HEADROOM;
+                let shaped = KNEE + HEADROOM * (over / (1.0 + over));
+                (shaped.copysign(f).round() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            }
+        })
+        .collect()
 }
 
 impl VoiceState {
@@ -470,6 +488,31 @@ impl VoiceState {
     /// The next stretch of soundboard audio for this call, if any is playing.
     pub fn take_effect(&self, account_id: &str, samples: usize) -> Option<Vec<i16>> {
         let mut all = self.effects.lock().unwrap();
+        let queue = all.get_mut(account_id)?;
+        if queue.is_empty() {
+            return None;
+        }
+        let n = samples.min(queue.len());
+        Some(queue.drain(..n).collect())
+    }
+
+    /// Queues decoded Go Live stream audio (48kHz stereo) to be mixed into
+    /// this account's voice playback. Capped at ~200 ms so a burst never builds
+    /// lasting latency.
+    pub fn queue_stream_audio(&self, account_id: &str, pcm: &[i16]) {
+        const MAX_BACKLOG: usize = 48_000 * 2 / 5; // 200 ms stereo
+        let mut all = self.stream_audio.lock().unwrap();
+        let queue = all.entry(account_id.to_string()).or_default();
+        queue.extend(pcm.iter().copied());
+        if queue.len() > MAX_BACKLOG {
+            let excess = queue.len() - MAX_BACKLOG;
+            queue.drain(..excess);
+        }
+    }
+
+    /// The next stretch of Go Live stream audio for this call, if any.
+    pub fn take_stream_audio(&self, account_id: &str, samples: usize) -> Option<Vec<i16>> {
+        let mut all = self.stream_audio.lock().unwrap();
         let queue = all.get_mut(account_id)?;
         if queue.is_empty() {
             return None;
@@ -755,9 +798,15 @@ mod tests {
     fn a_loud_room_clips_rather_than_wrapping() {
         // Wrapping turns a loud moment into a full-scale discontinuity, which
         // is heard as a bang rather than as loudness.
+        // Above the knee the sum is bent softly toward full scale rather than cut off at it: still loud, still the
+        // right way up, never past the edge.
         let a = [i16::MAX, i16::MIN];
         let b = [i16::MAX, i16::MIN];
-        assert_eq!(mix(&[&a, &b]), vec![i16::MAX, i16::MIN]);
+        let mixed = mix(&[&a, &b]);
+        assert!(mixed[0] > 30_000, "loud stays loud: {}", mixed[0]);
+        assert!(mixed[1] < -30_000, "and the right way up: {}", mixed[1]);
+        // Below the knee nothing is touched.
+        assert_eq!(mix(&[&[20_000i16][..], &[5_000i16][..]]), vec![25_000]);
     }
 
     #[test]

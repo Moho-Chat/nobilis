@@ -458,6 +458,21 @@ pub async fn connect(
         .context("the stream server did not answer the discovery packet")??;
     let (public_address, public_port) = discovery_answer(&answer[..read_len])?;
 
+    let codecs = if matches!(role, Role::Viewer { .. }) {
+        // Viewers accept H.264, VP8, and VP9 so hardware-encoded streams from
+        // official Discord clients arrive at full quality instead of being dropped.
+        json!([
+            { "name": "opus", "type": "audio", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE_OPUS },
+            { "name": "H264", "type": "video", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE_H264, "rtx_payload_type": videorx::PAYLOAD_TYPE_H264_RTX },
+            { "name": "VP8", "type": "video", "priority": 2000, "payload_type": rtp::PAYLOAD_TYPE_VP8, "rtx_payload_type": videorx::PAYLOAD_TYPE_RTX },
+            { "name": "VP9", "type": "video", "priority": 3000, "payload_type": rtp::PAYLOAD_TYPE_VP9, "rtx_payload_type": videorx::PAYLOAD_TYPE_VP9_RTX },
+        ])
+    } else {
+        json!([
+            { "name": "opus", "type": "audio", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE_OPUS },
+            { "name": "VP8", "type": "video", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE_VP8, "rtx_payload_type": videorx::PAYLOAD_TYPE_RTX },
+        ])
+    };
     write
         .send(WsMessage::Text(
             json!({
@@ -465,10 +480,7 @@ pub async fn connect(
                 "d": {
                     "protocol": "udp",
                     "data": { "address": public_address, "port": public_port, "mode": mode.wire_name() },
-                    "codecs": [
-                        { "name": "opus", "type": "audio", "priority": 1000, "payload_type": 120 },
-                        { "name": "VP8", "type": "video", "priority": 1000, "payload_type": rtp::PAYLOAD_TYPE_VP8, "rtx_payload_type": rtp::PAYLOAD_TYPE_VP8 + 1 },
-                    ],
+                    "codecs": codecs,
                 }
             })
             .to_string(),
@@ -526,6 +538,15 @@ pub async fn connect(
             .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package)))
             .await
             .context("sending the key package")?;
+    }
+
+    if matches!(role, Role::Viewer { .. }) {
+        // Tell the SFU we want full-quality video (Sink Quality Level = 100),
+        // matching voiceconn.rs and official Discord clients.
+        write
+            .send(WsMessage::Text(json!({ "op": 15, "d": { "any": 100 } }).to_string()))
+            .await
+            .context("asking for full stream quality")?;
     }
 
     // What is about to arrive, so the far end expects a picture rather than
@@ -610,8 +631,17 @@ pub async fn connect(
     // The socket has to keep being read and heart-beaten for the connection
     // to stay up; nothing else is waiting on it, so it runs on its own.
     let account = account_id.to_string();
+    let stream_key_ws = stream_key.to_string();
+    let state_ws = state.clone();
+    let is_viewer = matches!(role, Role::Viewer { .. });
     tokio::spawn(async move {
         let mut beat = tokio::time::interval(beat_every);
+        // Periodic OP_STREAM_PING (op 21) starting after 30 s so Discord keeps
+        // counting this viewer as active without bursting the gateway rate limit
+        // when watching several streams at once.
+        let ping_every = std::time::Duration::from_secs(30);
+        let mut stream_ping = tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
+        stream_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The last sequence number the server sent, which every v8 heartbeat
         // has to acknowledge. Binary frames carry it in their first two
         // bytes; JSON ones carry it as `seq`.
@@ -620,6 +650,12 @@ pub async fn connect(
         let mut announced = false;
         loop {
             tokio::select! {
+                _ = stream_ping.tick(), if is_viewer => {
+                    if !live.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = super::golive::ping(&state_ws, &account, &stream_key_ws);
+                }
                 _ = beat.tick() => {
                     // Voice gateway v8's heartbeat, which is not v4's.
                     //
@@ -670,7 +706,17 @@ pub async fn connect(
                         // able to encrypt anything.
                         Some(Ok(incoming)) => {
                             note_sequence(&incoming, &seq_ack);
-                            note_senders(&incoming, &senders, &resends).await;
+                            let new_ssrcs = note_senders(&incoming, &senders, &resends).await;
+                            if is_viewer && !new_ssrcs.is_empty() {
+                                let mut wants = serde_json::Map::new();
+                                wants.insert("any".to_string(), json!(100));
+                                for s in new_ssrcs {
+                                    wants.insert(s.to_string(), json!(100));
+                                }
+                                let _ = write
+                                    .send(WsMessage::Text(json!({ "op": 15, "d": wants }).to_string()))
+                                    .await;
+                            }
                             if let Some(reply) = answer_dave(&dave, &incoming, &account).await {
                                 if write.send(reply).await.is_err() {
                                     break;
@@ -718,30 +764,37 @@ async fn note_senders(
     incoming: &WsMessage,
     senders: &Arc<Mutex<HashMap<u32, u64>>>,
     resends: &Arc<Mutex<HashMap<u32, u32>>>,
-) {
-    let WsMessage::Text(text) = incoming else { return };
-    let Ok(message) = serde_json::from_str::<Value>(text) else { return };
+) -> Vec<u32> {
+    let WsMessage::Text(text) = incoming else { return Vec::new() };
+    let Ok(message) = serde_json::from_str::<Value>(text) else { return Vec::new() };
     if message["op"].as_u64() != Some(12) {
-        return;
+        return Vec::new();
     }
     let d = &message["d"];
     // Discord writes ids as strings everywhere else and as numbers here, so
     // both are read rather than the one that happened to arrive first.
     let Some(user) = d["user_id"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| d["user_id"].as_u64()) else {
-        return;
+        return Vec::new();
     };
     resends.lock().await.extend(videorx::rtx_pairs(d));
     let mut held = senders.lock().await;
+    let mut video_ssrcs = Vec::new();
+    if let Some(ssrc) = d["audio_ssrc"].as_u64().filter(|s| *s != 0) {
+        held.insert(ssrc as u32, user);
+    }
     if let Some(ssrc) = d["video_ssrc"].as_u64().filter(|s| *s != 0) {
         held.insert(ssrc as u32, user);
+        video_ssrcs.push(ssrc as u32);
     }
     // A stream can be re-announced on a new SSRC when quality changes, and
     // the entries in `streams` are where that arrives first.
     for stream in d["streams"].as_array().into_iter().flatten() {
         if let Some(ssrc) = stream["ssrc"].as_u64().filter(|s| *s != 0) {
             held.insert(ssrc as u32, user);
+            video_ssrcs.push(ssrc as u32);
         }
     }
+    video_ssrcs
 }
 
 /// Reads the socket for as long as the stream lasts, and hands the window
@@ -801,6 +854,12 @@ async fn watch_socket(
         }
     };
 
+    let mut audio_decoder = opus2::Decoder::new(48_000, opus2::Channels::Stereo).ok();
+    let mut last_feedback = std::time::Instant::now();
+    // Advertise 8 Mbps receive capacity in periodic REMB so the SFU ramps
+    // stream bitrate up instead of capping at the ~600–1000 kbps floor.
+    const TARGET_REMB_BPS: u64 = 8_000_000;
+
     tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
     while live.load(Ordering::Relaxed) {
         let read = tokio::time::timeout(std::time::Duration::from_secs(30), udp.recv(&mut buffer)).await;
@@ -841,9 +900,45 @@ async fn watch_socket(
         // is indistinguishable, from the outside, from no stream at all.
         *types.entry(parsed.payload_type).or_insert(0u64) += 1;
         *sources.entry(parsed.ssrc).or_insert(0u64) += 1;
-        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 && parsed.payload_type != videorx::PAYLOAD_TYPE_RTX {
+
+        // Stream audio (Opus): decode non-DAVE audio and mix into the call's playback.
+        if parsed.payload_type == rtp::PAYLOAD_TYPE_OPUS || parsed.payload_type == rtp::PAYLOAD_TYPE_OPUS_WEBRTC {
+            let Ok(payload) = voicecrypto::open_rtp(mode, &key, datagram, &parsed) else {
+                unopened += 1;
+                continue;
+            };
+            let opus = {
+                let held = dave.lock().await;
+                if held.is_some() {
+                    // DAVE-encrypted stream audio requires `Dave::decrypt_audio` in dave.rs.
+                    continue;
+                }
+                payload
+            };
+            if let Some(decoder) = audio_decoder.as_mut() {
+                let mut pcm = vec![0i16; rtp::OPUS_FRAME_SAMPLES * 2 * 3];
+                if crate::opus_packet::plausible(&opus, pcm.len() / 2).is_some() {
+                    if let Ok(per_channel) = decoder.decode(&opus, &mut pcm, false) {
+                        pcm.truncate(per_channel * 2);
+                        state.voice.queue_stream_audio(&account_id, &pcm);
+                    }
+                }
+            }
             continue;
         }
+
+        let video_kind = match parsed.payload_type {
+            rtp::PAYLOAD_TYPE_VP8 => Some((super::reassemble::VideoCodec::Vp8, false)),
+            videorx::PAYLOAD_TYPE_RTX => Some((super::reassemble::VideoCodec::Vp8, true)),
+            rtp::PAYLOAD_TYPE_H264 => Some((super::reassemble::VideoCodec::H264, false)),
+            videorx::PAYLOAD_TYPE_H264_RTX => Some((super::reassemble::VideoCodec::H264, true)),
+            rtp::PAYLOAD_TYPE_VP9 => Some((super::reassemble::VideoCodec::Vp9, false)),
+            videorx::PAYLOAD_TYPE_VP9_RTX => Some((super::reassemble::VideoCodec::Vp9, true)),
+            _ => None,
+        };
+        let Some((codec, is_rtx)) = video_kind else {
+            continue;
+        };
         // Discord's own rule for where the clear header ends, the same one a
         // voice call's camera arrives under. The three guesses this used to
         // try between all left the extension's preamble out of one span or
@@ -853,7 +948,7 @@ async fn watch_socket(
             unopened += 1;
             continue;
         };
-        let (video_ssrc, sequence, payload, resent) = if parsed.payload_type == videorx::PAYLOAD_TYPE_RTX {
+        let (video_ssrc, sequence, payload, resent) = if is_rtx {
             let known = resends.lock().await.get(&parsed.ssrc).copied();
             let Some(media) = known.or_else(|| {
                 let guess = parsed.ssrc.wrapping_sub(1);
@@ -867,10 +962,10 @@ async fn watch_socket(
             (parsed.ssrc, parsed.sequence, payload, false)
         };
         let now = std::time::Instant::now();
-        let picture_rx = pictures.entry(video_ssrc).or_default();
+        let picture_rx = pictures.entry(video_ssrc).or_insert_with(|| VideoReceiver::with_codec(codec));
         let whole = picture_rx.push(
             rtp::Packet {
-                payload_type: rtp::PAYLOAD_TYPE_VP8,
+                payload_type: parsed.payload_type,
                 sequence,
                 timestamp: parsed.timestamp,
                 ssrc: video_ssrc,
@@ -883,6 +978,16 @@ async fn watch_socket(
         let lost = picture_rx.due_for_asking(now);
         if !lost.is_empty() {
             send_rtcp(videorx::nack(ssrc, video_ssrc, &lost)).await;
+        }
+        // Periodic RTCP Receiver Report + REMB so the SFU knows our receive
+        // path is healthy and ramps up to full bitrate.
+        if last_feedback.elapsed() >= std::time::Duration::from_secs(1) {
+            last_feedback = now;
+            let targets: Vec<(u32, u32)> = pictures.iter().map(|(&s, rx)| (s, rx.highest_seq())).collect();
+            for (target_ssrc, highest) in targets {
+                send_rtcp(videorx::receiver_report(ssrc, target_ssrc, highest, 0, 0)).await;
+                send_rtcp(videorx::remb(ssrc, target_ssrc, TARGET_REMB_BPS)).await;
+            }
         }
         for frame in whole {
             // Whoever the server said owns this SSRC, and the stream's owner
@@ -902,8 +1007,9 @@ async fn watch_socket(
                     None => frame.data.clone(),
                 }
             };
-            let keyframe = super::reassemble::is_keyframe(&picture);
             let Some(picture_rx) = pictures.get_mut(&video_ssrc) else { continue };
+            let rx_codec = picture_rx.codec();
+            let keyframe = super::reassemble::is_codec_keyframe(rx_codec, &picture);
             let first = picture_rx.stats.frames == 0;
             let admitted = picture_rx.admit(&frame, keyframe);
             if picture_rx.wants_keyframe(now) {
@@ -913,12 +1019,13 @@ async fn watch_socket(
                 continue;
             }
             if first {
-                tracing::info!("discord[{account_id}]: the first keyframe of {stream_key} arrived");
+                tracing::info!("discord[{account_id}]: the first {} keyframe of {stream_key} arrived", rx_codec.wire_name());
             }
             frames += 1;
             if frames % 900 == 1 {
                 tracing::info!(
-                    "discord[{account_id}]: {stream_key}: {frames} frames, {unopened} packets that would not open, {undecrypted} frames that would not decrypt; {:?}",
+                    "discord[{account_id}]: {stream_key} ({}): {frames} frames, {unopened} packets that would not open, {undecrypted} frames that would not decrypt; {:?}",
+                    rx_codec.wire_name(),
                     picture_rx.stats
                 );
             }
@@ -927,6 +1034,7 @@ async fn watch_socket(
                 json!({
                     "accountId": account_id,
                     "streamKey": stream_key,
+                    "codec": rx_codec.wire_name(),
                     "keyframe": keyframe,
                     // Microseconds, which is what a WebCodecs decoder takes.
                     // RTP counts video in 90kHz ticks.

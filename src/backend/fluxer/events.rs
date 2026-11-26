@@ -30,6 +30,19 @@ fn register_guild(state: &AppState, handle: &Handle, guild: &world::Guild, posit
     );
 }
 
+/// Puts this account's guilds in the order `user_settings.guild_folders` gives, with any unlisted guilds after them.
+pub fn apply_guild_order(state: &AppState, handle: &Handle, order: &[String]) {
+    let guilds: Vec<world::Guild> = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list: Vec<world::Guild> = world.guilds.values().cloned().collect();
+        list.sort_by_key(|g| (order.iter().position(|id| id == &g.id).unwrap_or(usize::MAX), g.name.to_lowercase()));
+        list
+    };
+    for (position, guild) in guilds.iter().enumerate() {
+        register_guild(state, handle, guild, position as i64);
+    }
+}
+
 /// What a channel is called in the list: its title, told apart from another of the same name by the end of its id.
 fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &str) -> String {
     let taken = state.runtime.list_buffers().into_iter().any(|b| b.account_id == account_id && b.name == wanted && b.remote_id.as_deref() != Some(channel_id));
@@ -44,12 +57,15 @@ fn unique_name(state: &AppState, account_id: &str, wanted: &str, channel_id: &st
 /// and its category, and told whether the account may write in it.
 pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, place: i64, heading: Option<(&str, i64)>) {
     let account_id = &handle.account_id;
-    // Categories are headings and a link channel is only a link. A voice channel is a conversation too: it has a call,
-    // and messages beside it. A forum is a list of posts; a thread is a conversation once this account has joined it.
-    if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Other(_)) || (channel.kind == Kind::Thread && !channel.joined) {
+    // Categories are headings; a link channel opens its URL from the list. A voice channel is a conversation too: it has
+    // a call, and messages beside it. A forum is a list of posts; a thread is a conversation once this account has joined it.
+    if matches!(channel.kind, Kind::Category | Kind::Other(_))
+        || (channel.kind == Kind::Thread && !channel.joined)
+        || (channel.kind == Kind::Link && !channel.url.as_deref().is_some_and(|u| u.starts_with("http://") || u.starts_with("https://")))
+    {
         return;
     }
-    let (title, read_only, avatar, unread) = {
+    let (title, read_only, slowmode, avatar, unread) = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         if channel.guild.is_some() && world.permissions(channel) & world::VIEW_CHANNEL == 0 {
             return;
@@ -65,7 +81,9 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
             (Some(_), Some((None, mentions))) => (true, mentions),
             _ => (false, 0),
         };
-        (world.title_of(channel), world.read_only(channel, now()), avatar, unread)
+        let bypass = world.permissions(channel) & (world::BYPASS_SLOWMODE | world::ADMINISTRATOR | world::MANAGE_CHANNELS | world::MANAGE_MESSAGES) != 0;
+        let slowmode = if channel.slowmode > 0 && !bypass { channel.slowmode } else { 0 };
+        (world.title_of(channel), world.read_only(channel, now()), slowmode, avatar, unread)
     };
     let kind = if channel.kind.private() && channel.kind != Kind::Group { "dm" } else { "channel" };
     let existing = state.runtime.list_buffers().into_iter().find(|b| b.account_id == *account_id && b.remote_id.as_deref() == Some(channel.id.as_str()));
@@ -100,17 +118,22 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
         }
     }
     state.runtime.set_buffer_read_only(state, &buffer.id, read_only);
-    if let Some(topic) = &channel.topic {
+    state.runtime.set_buffer_slowmode(state, &buffer.id, slowmode);
+    if let Some(url) = channel.url.as_deref().filter(|_| channel.kind == Kind::Link) {
+        state.runtime.set_buffer_topic(state, &buffer.id, url);
+    } else if let Some(topic) = &channel.topic {
         state.runtime.set_buffer_topic(state, &buffer.id, topic);
     }
     let icon = match channel.kind {
         Kind::Announcement => Some("campaign"),
         Kind::Voice => Some("volume_up"),
         Kind::Thread => Some("forum"),
+        Kind::Link => Some("open_in_new"),
         _ => None,
     };
     state.runtime.set_buffer_name_icon(state, &buffer.id, icon);
     state.runtime.set_buffer_forum(state, &buffer.id, channel.kind == Kind::Forum);
+    state.runtime.set_buffer_age_restricted(state, &buffer.id, channel.nsfw);
     if let Some(url) = avatar {
         state.runtime.set_buffer_avatar(state, &buffer.id, &media::cached(account_id, media::AVATARS, &url, None, Some("image/webp")));
     }
@@ -244,6 +267,13 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
                 world.read.insert(id.to_string(), (r["last_message_id"].as_str().map(str::to_string), r["mention_count"].as_u64().unwrap_or(0)));
             }
         }
+        if let Some(notes) = data["notes"].as_object() {
+            for (uid, text) in notes {
+                if let Some(s) = text.as_str().filter(|s| !s.is_empty()) {
+                    world.notes.insert(uid.clone(), s.to_string());
+                }
+            }
+        }
     }
     register_all(state, handle);
     super::own::settings_changed(state, handle, &data["user_settings"]);
@@ -348,7 +378,14 @@ fn edited(state: &AppState, handle: &Handle, data: &Value) {
         let body = {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
             let guild = world.channels.get(channel).and_then(|c| c.guild.clone());
-            messages::words(&world, Some(handle), guild.as_deref(), content)
+            // A call ending sends MESSAGE_UPDATE on the type-3 system message with empty content: keep the system card text.
+            if let Some(sys) = messages::system_text(&world, guild.as_deref(), data) {
+                sys
+            } else if content.is_empty() && state.store.get_message(&buffer.id, id).ok().flatten().is_some_and(|m| m.kind == "system") {
+                return;
+            } else {
+                messages::words(&world, Some(handle), guild.as_deref(), content)
+            }
         };
         state.runtime.update_message_body_only(state, &buffer.id, id, &body);
     }
@@ -478,6 +515,44 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 redraw_guild(state, handle, c.guild.clone().as_deref(), Some(&c));
             }
         }
+        // Somebody came into a group or left it (or this account was taken out, which Fluxer says as a removal of its
+        // own id): the group's people, and its title when it has no name of its own.
+        "CHANNEL_RECIPIENT_ADD" | "CHANNEL_RECIPIENT_REMOVE" => {
+            let (Some(channel_id), Some(user)) = (data["channel_id"].as_str(), data["user"]["id"].as_str()) else { return };
+            let (channel, own) = {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((id, parsed)) = world::parse_user(&data["user"]) {
+                    world.users.entry(id).or_insert(parsed);
+                }
+                let own = world.own_id == user;
+                if let Some(c) = world.channels.get_mut(channel_id) {
+                    c.recipients.retain(|r| r != user);
+                    if kind == "CHANNEL_RECIPIENT_ADD" {
+                        c.recipients.push(user.to_string());
+                    }
+                }
+                if own && kind == "CHANNEL_RECIPIENT_REMOVE" {
+                    world.remove_channel(channel_id);
+                }
+                (world.channels.get(channel_id).cloned(), own)
+            };
+            match channel {
+                Some(c) if !own || kind == "CHANNEL_RECIPIENT_ADD" => {
+                    register_channel(state, handle, &c, 0, None);
+                    if let Some(buffer) = messages::buffer_of(state, account_id, channel_id) {
+                        let (state, handle) = (state.clone(), handle.clone());
+                        tokio::spawn(async move {
+                            let _ = super::members::refresh(&state, &handle, &buffer).await;
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(buffer) = messages::buffer_of(state, account_id, channel_id) {
+                        state.runtime.remove_buffer(state, &buffer.id);
+                    }
+                }
+            }
+        }
         "THREAD_DELETE" | "CHANNEL_DELETE" => {
             if let Some(id) = data["id"].as_str() {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).remove_channel(id);
@@ -503,6 +578,9 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             };
             if let Some(id) = id {
+                if kind == "GUILD_UPDATE" {
+                    super::invites::invalidate_guild(&id);
+                }
                 let guild = handle.world.lock().unwrap_or_else(|e| e.into_inner()).guilds.get(&id).cloned();
                 if let Some(guild) = guild {
                     register_guild(state, handle, &guild, 0);
@@ -529,6 +607,30 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 state.runtime.remove_buffer_group(state, &rail_id(account_id, id));
             }
         }
+        "USER_NOTE_UPDATE" => {
+            if let Some(uid) = data["id"].as_str() {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                match data["note"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(text) => {
+                        world.notes.insert(uid.to_string(), text.to_string());
+                    }
+                    None => {
+                        world.notes.remove(uid);
+                    }
+                }
+            }
+        }
+        "GUILD_STICKERS_UPDATE" => {
+            if let Some(guild) = data["guild_id"].as_str() {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                world.stickers.retain(|_, s| s.guild != guild);
+                for s in data["stickers"].as_array().into_iter().flatten() {
+                    if let Some(sid) = s["id"].as_str() {
+                        world.stickers.insert(sid.to_string(), world::Sticker { name: s["name"].as_str().unwrap_or("sticker").to_string(), animated: s["animated"].as_bool().unwrap_or(false), guild: guild.to_string() });
+                    }
+                }
+            }
+        }
         "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" | "GUILD_ROLE_UPDATE_BULK" => {
             let Some(guild) = data["guild_id"].as_str() else { return };
             {
@@ -551,6 +653,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             }
             register_guild_channels(state, handle, guild);
+            super::members::redraw_guild(state, handle, guild, None);
         }
         "GUILD_EMOJIS_UPDATE" => {
             let Some(guild) = data["guild_id"].as_str() else { return };
@@ -575,6 +678,9 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
             // The account's own roles or timeout changed what it may do.
             if own {
                 register_guild_channels(state, handle, guild);
+            }
+            if let Some(user) = data["user"]["id"].as_str() {
+                super::members::redraw_guild(state, handle, guild, Some(user));
             }
         }
         "GUILD_MEMBER_REMOVE" => {

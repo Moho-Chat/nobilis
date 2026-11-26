@@ -1,11 +1,8 @@
 //! Adding an account: the sign-in a person takes part in.
 //!
-//! Three ways in, all ending in a session token Fluxer issued (which is what the account keeps; a password is never
+//! Two ways in, both ending in a session token Fluxer issued (which is what the account keeps; a password is never
 //! kept):
 //!
-//! - **a code from another Fluxer app** (Fluxer's "desktop handoff"): moho asks for a code, the person types it into a
-//!   Fluxer app where they are already signed in and approves, and moho collects the session. Nothing secret is typed
-//!   into moho at all.
 //! - **username or email and password**, then the six-digit code of an authenticator (or a backup code) if the account
 //!   has one. Fluxer gates the password request with its ALTCHA proof of work, which is solved here (see `altcha`). A
 //!   sign-in from a new place on an account without a second factor waits for the link Fluxer emails.
@@ -14,8 +11,8 @@
 //! It runs as its own task and talks to the window through events:
 //!
 //! - `fluxerLoginStatus` - what it is doing, for a line of text
-//! - `fluxerLoginNeeds` - what is wanted: `step` is `mfa` (with `methods`), `email` (the emailed link) or `handoff`
-//!   (with the `code` to type into the other app); `error` says why the last answer was refused
+//! - `fluxerLoginNeeds` - what is wanted: `step` is `mfa` (with `methods`) or `email` (the emailed link); `error` says
+//!   why the last answer was refused
 //! - `fluxerLoginResult` - done, with the account, or the reason it failed
 //!
 //! and the window answers with `submitFluxerCode`. An account is never made here.
@@ -65,7 +62,6 @@ pub fn cancel(login_id: &str) {
 enum Way {
     Password { login: String, password: String },
     Token(String),
-    Handoff,
 }
 
 pub fn start(state: AppState, login_id: String, instance: String, login: String, password: String) {
@@ -74,10 +70,6 @@ pub fn start(state: AppState, login_id: String, instance: String, login: String,
 
 pub fn start_token(state: AppState, login_id: String, instance: String, token: String) {
     begin(state, login_id, instance, Way::Token(token));
-}
-
-pub fn start_handoff(state: AppState, login_id: String, instance: String) {
-    begin(state, login_id, instance, Way::Handoff);
 }
 
 fn begin(state: AppState, login_id: String, instance: String, way: Way) {
@@ -123,6 +115,10 @@ async fn flow(state: &AppState, login_id: &str, typed: &str, way: Way, mut rx: m
     let origin = discovery::normalize_origin(typed).ok_or_else(|| anyhow!("that does not look like the address of a Fluxer instance"))?;
     status(state, login_id, "Reaching the instance");
     let key = crate::net::route::pending_key("fluxer");
+    let router = crate::net::route::router();
+    if router.routed(&key) {
+        router.ready(|msg| status(state, login_id, msg)).await.map_err(|e| anyhow!("starting Tor or reaching the proxy: {e:#}"))?;
+    }
     let instance = discovery::fetch(&key, &origin).await?;
     let anonymous = Api::new(&key, &instance.api, None);
     let made_here = !matches!(way, Way::Token(_));
@@ -138,10 +134,6 @@ async fn flow(state: &AppState, login_id: &str, typed: &str, way: Way, mut rx: m
                 None => return Ok(None),
             }
         }
-        Way::Handoff => match handoff_flow(state, login_id, &anonymous).await? {
-            Some(token) => token,
-            None => return Ok(None),
-        },
     };
     if token.is_empty() {
         bail!("there is no token");
@@ -216,49 +208,9 @@ async fn email_flow(state: &AppState, login_id: &str, api: &Api, ticket: &str) -
     bail!("The emailed link was not used in time. Start the sign-in again")
 }
 
-/// The code to approve in another Fluxer app, and the wait for it.
-async fn handoff_flow(state: &AppState, login_id: &str, api: &Api) -> Result<Option<String>> {
-    let started = api.post("/auth/handoff/initiate", &json!({})).await.map_err(|e| anyhow!("{e}"))?;
-    let code = started["code"].as_str().ok_or_else(|| anyhow!("Fluxer did not give a code"))?.to_string();
-    let secret = started["poll_secret"].as_str().ok_or_else(|| anyhow!("Fluxer did not give a way to wait for the code"))?.to_string();
-    needs(state, login_id, "handoff", json!({ "code": spaced(&code), "expiresAt": started["expires_at"] }), None);
-    let deadline = Instant::now() + PATIENCE;
-    while Instant::now() < deadline {
-        tokio::time::sleep(POLL_EVERY).await;
-        if closed(login_id) {
-            let _ = api.request(Method::DELETE, &format!("/auth/handoff/{code}"), &[], Some(&json!({ "poll_secret": secret })), None).await;
-            return Ok(None);
-        }
-        let reply = api.post(&format!("/auth/handoff/{code}/status"), &json!({ "poll_secret": secret })).await.map_err(|e| anyhow!("{e}"))?;
-        match reply["status"].as_str() {
-            Some("completed") => return reply["token"].as_str().map(|t| Some(t.to_string())).ok_or_else(|| anyhow!("Fluxer approved the code but gave no session")),
-            Some("denied") => bail!("The other Fluxer app turned the sign-in down"),
-            Some("expired") => bail!("The code ran out before it was approved. Start again for a new one"),
-            _ => {}
-        }
-    }
-    bail!("The code was not approved in time. Start again for a new one")
-}
-
-/// A handoff code as Fluxer's apps show it: two groups of six.
-pub fn spaced(code: &str) -> String {
-    let plain: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    if plain.len() == 12 {
-        format!("{}-{}", &plain[..6], &plain[6..])
-    } else {
-        plain
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_handoff_code_is_shown_as_two_groups_of_six() {
-        assert_eq!(spaced("ABCDEF123456"), "ABCDEF-123456");
-        assert_eq!(spaced("abc-def"), "abcdef");
-    }
 
     #[test]
     fn a_username_has_its_tag_only_where_it_has_one() {

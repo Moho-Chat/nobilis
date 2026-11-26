@@ -8,8 +8,10 @@
 //! Two kinds of room share it. *Listed* rooms are the site's own (#fishtank),
 //! chosen on the Join page and kept in the account's settings. *Side* rooms
 //! are private conversations - what the site calls a whisper - which the chat
-//! itself remembers and names in every `welcome`; each is a conversation of
-//! its own here, named after the people in it.
+//! itself remembers: named in `welcome`, listed by `GET /v1/side_rooms` (read
+//! after every welcome), and announced as they open, close or get a message by
+//! `side_room_changed`. Each is a conversation of its own here, named after
+//! the people in it - or, for a group chat somebody named, its title.
 //!
 //! The socket and every request go through the web helper (net/webhelper.rs),
 //! because the site's gate admits only a browser's network stack.
@@ -81,6 +83,19 @@ struct RoomState {
     /// A side room with more than one other person in it: a group chat,
     /// shown with its member list, rather than a direct message.
     group: bool,
+    /// The chat calls it a group (`side_room_kind: "group"`), whoever is in
+    /// it - a group with one other person left is still a group.
+    declared_group: bool,
+    /// A group chat's title, when somebody gave it one.
+    title: Option<String>,
+    /// A group chat's owner, who alone may rename it or remove people.
+    owner: Option<String>,
+    /// Where this account has read a side room to, as the chat holds it.
+    read: u64,
+    /// A listed room's featured stream.
+    stream: Option<super::stream::Stream>,
+    /// This account is watching that stream, and has told the chat so.
+    watching: bool,
     last: Option<u64>,
     /// The oldest entry held, where history paging continues from.
     first: Option<u64>,
@@ -100,6 +115,29 @@ impl RoomState {
     /// Whether a side room has more than one other person in it.
     fn is_group(members: &[Principal], me: &str) -> bool {
         members.iter().filter(|m| m.uuid != me).count() > 1
+    }
+
+    /// Takes in what the chat says of a side room - a listing row, or its
+    /// `joined` - for whichever of kind, title and members it carries.
+    fn take_side_row(&mut self, row: &Value, me: &str) {
+        self.kind = RoomKind::Side;
+        if let Some(kind) = row["side_room_kind"].as_str() {
+            self.declared_group = kind == "group";
+        }
+        if row.get("owner_principal_uuid").is_some() {
+            self.owner = row["owner_principal_uuid"].as_str().map(str::to_lowercase);
+        }
+        if let Some(read) = row["read_seq"].as_u64() {
+            self.read = self.read.max(read);
+        }
+        if row.get("title").is_some() {
+            self.title = row["title"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        }
+        let members: Vec<Principal> = row["members"].as_array().into_iter().flatten().filter_map(Principal::from_value).collect();
+        if !members.is_empty() {
+            self.members = members;
+        }
+        self.group = self.declared_group || Self::is_group(&self.members, me);
     }
 }
 
@@ -288,6 +326,105 @@ impl Chat {
         if join {
             self.join(uuid, after);
         }
+    }
+
+    /// Every side room the chat lists for this account, page by page, each
+    /// taken in and joined: what `welcome` names is not the whole of it.
+    async fn list_side_rooms(&self, session: &Session, host: &str) -> Result<()> {
+        let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let mut cursor: Option<String> = None;
+        // A bound, not a limit anybody should meet: 20 pages of 100.
+        for _ in 0..20 {
+            let path = match &cursor {
+                Some(c) => format!("side_rooms?limit=100&cursor={}", http::percent_encode(c)),
+                None => "side_rooms?limit=100".to_string(),
+            };
+            let page = api_get(session, host, &path).await?;
+            for row in page["rooms"].as_array().into_iter().flatten() {
+                let Some(uuid) = row["chat_room_uuid"].as_str().map(str::to_lowercase) else { continue };
+                {
+                    let mut rooms = self.rooms.lock().unwrap();
+                    let room = rooms.entry(uuid.clone()).or_insert_with(|| RoomState { kind: RoomKind::Side, ..Default::default() });
+                    room.take_side_row(row, &me);
+                }
+                let after = self.rooms.lock().unwrap().get(&uuid).and_then(|r| r.last);
+                self.want_side_room(&uuid, after);
+            }
+            cursor = page["page"]["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The featured stream of the room a conversation shows, and whether
+    /// this account is watching it.
+    pub(super) fn stream_of_buffer(&self, buffer_name: &str) -> Option<(super::stream::Stream, bool)> {
+        let rooms = self.rooms.lock().unwrap();
+        let room = rooms.values().find(|r| r.buffer == buffer_name)?;
+        room.stream.clone().map(|s| (s, room.watching))
+    }
+
+    /// Starts or stops watching the featured stream of the room a
+    /// conversation shows: said to the chat, and remembered, so it is said
+    /// again after a rejoin.
+    pub(super) fn watch_stream(&self, buffer_name: &str, watching: bool) -> Result<()> {
+        let uuid = {
+            let mut rooms = self.rooms.lock().unwrap();
+            let Some((uuid, room)) = rooms.iter_mut().find(|(_, r)| r.buffer == buffer_name) else {
+                bail!("\"{buffer_name}\" isn't one of this account's rooms");
+            };
+            if watching && room.stream.is_none() {
+                bail!("nothing is being streamed in this room");
+            }
+            if room.watching == watching {
+                return Ok(());
+            }
+            room.watching = watching;
+            uuid.clone()
+        };
+        // Not refused while the chat is frozen: the site's own client sends it then too.
+        self.send(&json!({ "t": "stream_watch", "chat_room_uuid": uuid, "watching": watching }));
+        Ok(())
+    }
+
+    /// Says a side room has been read up to its newest entry, so the site
+    /// and the account's other clients show it read. Listed rooms keep no
+    /// read position.
+    pub(super) fn mark_read(&self, buffer_name: &str) {
+        let frame = {
+            let mut rooms = self.rooms.lock().unwrap();
+            let Some((uuid, room)) = rooms.iter_mut().find(|(_, r)| r.buffer == buffer_name && r.kind == RoomKind::Side) else { return };
+            let Some(seq) = room.last.filter(|seq| *seq > room.read) else { return };
+            if !room.joined {
+                return;
+            }
+            room.read = seq;
+            json!({ "t": "read", "chat_room_uuid": uuid, "room_seq": seq })
+        };
+        self.send(&frame);
+    }
+
+    /// What a side room is to this account: (whether a group, whether this
+    /// account may run it - rename it, remove people), or None for a listed
+    /// room. A group with no owner is anybody's to run.
+    pub(super) fn side_room_powers(&self, buffer_name: &str) -> Option<(bool, bool)> {
+        let me = self.me.lock().unwrap().as_ref().map(|m| m.uuid.to_lowercase()).unwrap_or_default();
+        let rooms = self.rooms.lock().unwrap();
+        let room = rooms.values().find(|r| r.buffer == buffer_name && r.kind == RoomKind::Side)?;
+        Some((room.group, room.group && room.owner.as_ref().is_none_or(|o| *o == me)))
+    }
+
+    /// A side room's conversation name that no other room here has: a group
+    /// can be given any title, including one another conversation has.
+    fn unique_buffer_name(&self, uuid: &str, wanted: &str) -> String {
+        let rooms = self.rooms.lock().unwrap();
+        let taken = |name: &str| rooms.iter().any(|(u, r)| u != uuid && r.buffer.eq_ignore_ascii_case(name));
+        if !taken(wanted) {
+            return wanted.to_string();
+        }
+        (2..).map(|n| format!("{wanted} ({n})")).find(|n| !taken(n)).unwrap_or_else(|| wanted.to_string())
     }
 
     fn join(&self, uuid: &str, after: Option<u64>) {
@@ -583,11 +720,21 @@ impl Ctx<'_> {
                 let rooms = state.accounts.get_sneedchat(account_id).map(|c| c.rooms).unwrap_or_default();
                 chat.want_rooms(&rooms);
                 for room in frame["side_rooms"].as_array().into_iter().flatten() {
-                    if let Some(uuid) = room["chat_room_uuid"].as_str() {
-                        let after = chat.rooms.lock().unwrap().get(uuid).and_then(|r| r.last);
-                        chat.want_side_room(uuid, after);
+                    if let Some(uuid) = room["chat_room_uuid"].as_str().map(str::to_lowercase) {
+                        let after = chat.rooms.lock().unwrap().get(&uuid).and_then(|r| r.last);
+                        chat.want_side_room(&uuid, after);
                     }
                 }
+                // The site's own client reads the list after every welcome
+                // rather than trusting what welcome names; so does this.
+                tokio::spawn({
+                    let (chat, session, host, account_id) = (chat.clone(), self.session.clone(), self.host.to_string(), account_id.to_string());
+                    async move {
+                        if let Err(e) = chat.list_side_rooms(&session, &host).await {
+                            tracing::warn!("sneedchat[{account_id}]: reading the side rooms: {e:#}");
+                        }
+                    }
+                });
                 let revision = frame["emoticon_revision"].as_str().map(str::to_string);
                 self.refresh_emoticons(revision);
             }
@@ -599,6 +746,8 @@ impl Ctx<'_> {
                 }
             }
             "joined" => self.joined(frame),
+            "side_room_changed" => self.side_room_changed(frame),
+            "principal_changed" => self.principal_changed(frame),
             "left" => {
                 let uuid = frame["chat_room_uuid"].as_str().unwrap_or_default();
                 let reason = frame["reason"].as_str().unwrap_or("no reason given").to_string();
@@ -688,7 +837,9 @@ impl Ctx<'_> {
                 let answered = chat.answer(&key, Err(code.clone()))
                     || chat.answer(frame["ref"].as_str().unwrap_or_default(), Err(code.clone()))
                     || chat.answer(&format!("react:{key}"), Err(code.clone()))
-                    || chat.answer(&format!("invite:{key}"), Err(code.clone()));
+                    || chat.answer(&format!("invite:{key}"), Err(code.clone()))
+                    || chat.answer(&format!("title:{key}"), Err(code.clone()))
+                    || chat.answer(&format!("remove:{key}"), Err(code.clone()));
                 if !answered {
                     if let Some((name, kind)) = chat.buffer_of(&key) {
                         let said = format!("Couldn't join this room: {}.", protocol::describe_error(&code));
@@ -703,6 +854,94 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// A side room opened, closed, renamed or written in, said to the whole
+    /// connection (`side_room_changed`). A room this account was not told of
+    /// before - somebody opened one with us, or wrote in one not joined - is
+    /// joined now, and its `joined` makes the conversation; a closed one is
+    /// let go of, the conversation kept with a line saying so.
+    fn side_room_changed(&self, frame: &Value) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some(uuid) = frame["chat_room_uuid"].as_str().map(str::to_lowercase) else { return };
+        match frame["change"].as_str().unwrap_or_default() {
+            "closed" => {
+                let gone = chat.rooms.lock().unwrap().remove(&uuid);
+                if let Some(room) = gone.filter(|r| !r.buffer.is_empty()) {
+                    state.runtime.record_message(state, account_id, &room.buffer, room.buffer_kind(), "", "This conversation was closed.", false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                }
+            }
+            "read" => {
+                // Read on another of this account's clients.
+                if let Some(read) = frame["read_seq"].as_u64() {
+                    if let Some(room) = chat.rooms.lock().unwrap().get_mut(&uuid) {
+                        room.read = room.read.max(read);
+                    }
+                    self.apply_read(&uuid);
+                }
+            }
+            _ => {
+                let after = chat.rooms.lock().unwrap().get(&uuid).and_then(|r| r.last);
+                chat.want_side_room(&uuid, after);
+            }
+        }
+    }
+
+    /// A side room read (here, or on another client) up to everything held:
+    /// shown read. One read only part of the way stays as it is - which of
+    /// the messages count as unread is the window's to say.
+    fn apply_read(&self, uuid: &str) {
+        let Some((buffer, read, last)) = self.chat.rooms.lock().unwrap().get(uuid).filter(|r| !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.read, r.last)) else { return };
+        if read > 0 && last.is_some_and(|last| read >= last) {
+            let buffer_id = crate::model::buffer_id(self.account_id, &buffer);
+            self.state.runtime.set_buffer_unread(self.state, &buffer_id, 0, 0);
+        }
+    }
+
+    /// Somebody's public profile changed - a new name, picture or badge -
+    /// shown wherever they are at once: on every room's member list, and as
+    /// the name of a direct conversation with them. Messages already shown
+    /// keep the name they were written under.
+    fn principal_changed(&self, frame: &Value) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let Some(mut p) = Principal::from_value(frame) else { return };
+        p.uuid = p.uuid.to_lowercase();
+        chat.people.lock().unwrap().insert(p.uuid.clone(), p.clone());
+        let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.to_lowercase()).unwrap_or_default();
+        if p.uuid == me {
+            if let Some(mine) = chat.me.lock().unwrap().as_mut() {
+                mine.name = p.name.clone();
+            }
+            state.runtime.set_own_identity(account_id, &p.name);
+            let _ = state.accounts.set_sneedchat_display_name(account_id, &p.name);
+        }
+        let (buffers, pairs): (Vec<String>, Vec<String>) = {
+            let mut rooms = chat.rooms.lock().unwrap();
+            let mut pairs = Vec::new();
+            for (uuid, room) in rooms.iter_mut() {
+                if let Some(m) = room.members.iter_mut().find(|m| m.uuid.eq_ignore_ascii_case(&p.uuid)) {
+                    *m = Principal { uuid: m.uuid.clone(), ..p.clone() };
+                    if room.kind == RoomKind::Side && room.title.is_none() {
+                        pairs.push(uuid.clone());
+                    }
+                }
+            }
+            (rooms.values().filter(|r| !r.buffer.is_empty()).map(|r| r.buffer.clone()).collect(), pairs)
+        };
+        for name in buffers {
+            super::rooms::update_member(state, self.http, self.host, &crate::model::buffer_id(account_id, &name), &p);
+        }
+        // A conversation named after the people in it follows the new name.
+        for uuid in pairs {
+            self.rename_side_room(&uuid);
+        }
+    }
+
+    /// Tells the window what a listed room is streaming, if anything.
+    fn announce_stream(&self, uuid: &str) {
+        let Some((buffer, stream, watching)) = self.chat.rooms.lock().unwrap().get(uuid).filter(|r| !r.buffer.is_empty()).map(|r| (r.buffer.clone(), r.stream.clone(), r.watching)) else { return };
+        let buffer_id = crate::model::buffer_id(self.account_id, &buffer);
+        self.state.events.emit("sneedchatStream", json!({ "bufferId": buffer_id, "stream": super::stream::stream_json(stream.as_ref(), watching) }));
+    }
+
     /// A side room shown as what it is: a direct message with one other
     /// person, or - with more - a group chat under its own heading, with its
     /// member list. Called when it is joined and whenever its members change.
@@ -715,6 +954,30 @@ impl Ctx<'_> {
         state.runtime.set_buffer_kind(state, &buffer_id, kind);
         state.runtime.set_buffer_category(state, &buffer_id, (kind == "channel").then_some("Group chats"), 0);
         super::rooms::publish_presence(state, self.http, self.host, account_id, &name, &members);
+    }
+
+    /// A side room's conversation moved to what it is called now: a group's
+    /// new title, or the people in it once the title is cleared.
+    fn rename_side_room(&self, uuid: &str) {
+        let (state, account_id, chat) = (self.state, self.account_id, self.chat);
+        let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let Some((old, wanted)) = chat.rooms.lock().unwrap().get(uuid).filter(|r| !r.buffer.is_empty()).map(|r| {
+            (r.buffer.clone(), side_room_name(&r.members, &me, uuid, r.group.then_some(r.title.as_deref()).flatten()))
+        }) else {
+            return;
+        };
+        let new = chat.unique_buffer_name(uuid, &wanted);
+        if new == old {
+            return;
+        }
+        let kind = {
+            let mut rooms = chat.rooms.lock().unwrap();
+            let Some(r) = rooms.get_mut(uuid) else { return };
+            r.buffer = new.clone();
+            r.buffer_kind()
+        };
+        state.runtime.rename_buffer(state, account_id, &old, &new, kind);
+        self.settle_side_room(uuid);
     }
 
     fn refresh_emoticons(&self, revision: Option<String>) {
@@ -749,6 +1012,7 @@ impl Ctx<'_> {
             }
         }
         let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
+        let mut rewatch = false;
         let (name, kind) = {
             let mut rooms = chat.rooms.lock().unwrap();
             let room = match rooms.get_mut(uuid) {
@@ -763,17 +1027,36 @@ impl Ctx<'_> {
                 room.last = Some(0);
             }
             if side {
-                room.kind = RoomKind::Side;
-                if !members.is_empty() {
-                    room.members = members.clone();
-                }
-                room.group = RoomState::is_group(&room.members, &me);
-                if room.buffer.is_empty() {
-                    room.buffer = side_room_name(&room.members, &me, uuid);
+                room.take_side_row(frame, &me);
+            } else {
+                room.stream = super::stream::Stream::of(frame);
+                // The chat starts every subscription unwatched: still watching is said again.
+                if room.watching && room.stream.is_some() {
+                    rewatch = true;
+                } else {
+                    room.watching = false;
                 }
             }
             (room.buffer.clone(), room.buffer_kind())
         };
+        // A side room is named once it is known who is in it - or what it is called.
+        let (name, kind) = if side && name.is_empty() {
+            let wanted = {
+                let rooms = chat.rooms.lock().unwrap();
+                let r = &rooms[uuid];
+                side_room_name(&r.members, &me, uuid, r.group.then_some(r.title.as_deref()).flatten())
+            };
+            let unique = chat.unique_buffer_name(uuid, &wanted);
+            let mut rooms = chat.rooms.lock().unwrap();
+            let r = rooms.get_mut(uuid).expect("just tracked");
+            r.buffer = unique;
+            (r.buffer.clone(), r.buffer_kind())
+        } else {
+            (name, kind)
+        };
+        if rewatch {
+            chat.send(&json!({ "t": "stream_watch", "chat_room_uuid": uuid, "watching": true }));
+        }
         if name.is_empty() {
             return;
         }
@@ -781,8 +1064,12 @@ impl Ctx<'_> {
         state.runtime.set_buffer_link(state, &buffer.id, None);
         if side {
             self.settle_side_room(uuid);
-        } else if let Some(subtitle) = super::catalogue::subtitle(uuid) {
-            state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
+            self.apply_read(uuid);
+        } else {
+            if let Some(subtitle) = super::catalogue::subtitle(uuid) {
+                state.runtime.set_buffer_topic(state, &buffer.id, &subtitle);
+            }
+            self.announce_stream(uuid);
         }
         // Whoever opened a side room with us is waiting on this.
         for m in chat.rooms.lock().unwrap().get(uuid).map(|r| r.members.clone()).unwrap_or_default() {
@@ -854,8 +1141,9 @@ impl Ctx<'_> {
                 state.runtime.set_buffer_topic(state, &buffer_id, entry.subtitle.as_deref().unwrap_or_default());
                 return;
             }
-            "chat_side_room_member_added" | "chat_side_room_member_left" => {
+            "chat_side_room_member_added" | "chat_side_room_member_left" | "chat_side_room_member_removed" => {
                 let added = entry.kind.ends_with("added");
+                let removed = entry.kind.ends_with("removed");
                 let name = who("principal_uuid");
                 if let Some(p) = frame["principal_uuid"].as_str().map(str::to_string) {
                     let me = chat.me.lock().unwrap().as_ref().map(|m| m.uuid.clone()).unwrap_or_default();
@@ -867,15 +1155,67 @@ impl Ctx<'_> {
                         } else if !added {
                             room.members.retain(|m| m.uuid != p);
                         }
-                        room.group = RoomState::is_group(&room.members, &me);
+                        room.group = room.declared_group || RoomState::is_group(&room.members, &me);
                     }
                 }
                 if added {
                     chat.answer(&format!("invite:{}", entry.room), Ok(()));
                 }
-                system(format!("{name} {} the conversation.", if added { "joined" } else { "left" }));
+                if removed {
+                    chat.answer(&format!("remove:{}", entry.room), Ok(()));
+                }
+                system(format!("{name} {} the conversation.", if added { "joined" } else if removed { "was removed from" } else { "left" }));
                 if !replaying {
                     self.settle_side_room(&entry.room);
+                }
+                return;
+            }
+            "chat_side_room_title_set" => {
+                let title = frame["title"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+                if let Some(room) = chat.rooms.lock().unwrap().get_mut(&entry.room) {
+                    room.title = title.clone();
+                }
+                let name = who("actor_principal_uuid");
+                system(match &title {
+                    Some(t) => format!("{name} renamed the conversation to {t}."),
+                    None => format!("{name} cleared the conversation's name."),
+                });
+                chat.answer(&format!("title:{}", entry.room), Ok(()));
+                // A live rename moves the conversation to its new name.
+                if !replaying {
+                    self.rename_side_room(&entry.room);
+                }
+                return;
+            }
+            "chat_side_room_owner_set" => {
+                if let Some(room) = chat.rooms.lock().unwrap().get_mut(&entry.room) {
+                    room.owner = frame["principal_uuid"].as_str().map(str::to_lowercase);
+                }
+                system(format!("{} is now the conversation's owner.", who("principal_uuid")));
+                return;
+            }
+            "chat_room_stream_set" => {
+                let stream = super::stream::Stream::of(frame);
+                let changed = {
+                    let mut rooms = chat.rooms.lock().unwrap();
+                    match rooms.get_mut(&entry.room) {
+                        Some(room) if room.stream != stream => {
+                            if stream.is_none() {
+                                room.watching = false;
+                            }
+                            room.stream = stream.clone();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                let name = who("actor_principal_uuid");
+                system(match &stream {
+                    Some(s) => format!("{name} featured a {} stream: {}", s.provider_name(), s.url()),
+                    None => format!("{name} took the featured stream down."),
+                });
+                if changed && !replaying {
+                    self.announce_stream(&entry.room);
                 }
                 return;
             }
@@ -1074,8 +1414,12 @@ impl Ctx<'_> {
     }
 }
 
-/// What a side room is called: the other people in it, by name.
-fn side_room_name(members: &[Principal], me: &str, uuid: &str) -> String {
+/// What a side room is called: a group chat's title when it has one, else
+/// the other people in it, by name.
+fn side_room_name(members: &[Principal], me: &str, uuid: &str, title: Option<&str>) -> String {
+    if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        return t.to_string();
+    }
     let others: Vec<&str> = members.iter().filter(|m| m.uuid != me).map(|m| m.name.as_str()).filter(|n| !n.is_empty()).collect();
     if others.is_empty() {
         format!("whisper-{}", &uuid[uuid.len().saturating_sub(6)..])
@@ -1237,9 +1581,33 @@ mod tests {
     #[test]
     fn a_side_room_is_named_for_the_others_in_it() {
         let p = |u: &str, n: &str| Principal { uuid: u.into(), name: n.into(), ..Default::default() };
-        assert_eq!(side_room_name(&[p("me", "Ancient Pioneer"), p("u2", "Ryo Ma")], "me", "abcdef-123456"), "Ryo Ma");
-        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B"), p("u3", "C")], "me", "x"), "B, C");
-        assert_eq!(side_room_name(&[p("me", "A")], "me", "abcdef-123456"), "whisper-123456");
+        assert_eq!(side_room_name(&[p("me", "Ancient Pioneer"), p("u2", "Ryo Ma")], "me", "abcdef-123456", None), "Ryo Ma");
+        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B"), p("u3", "C")], "me", "x", None), "B, C");
+        assert_eq!(side_room_name(&[p("me", "A")], "me", "abcdef-123456", None), "whisper-123456");
+        // A group chat somebody named goes by its name.
+        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B"), p("u3", "C")], "me", "x", Some(" Lolcow Watch ")), "Lolcow Watch");
+        assert_eq!(side_room_name(&[p("me", "A"), p("u2", "B")], "me", "x", Some("  ")), "B");
+    }
+
+    #[test]
+    fn a_side_room_takes_in_what_the_chat_says_of_it() {
+        let mut room = RoomState::default();
+        // A listing row: a group of two that the chat calls a group, named.
+        room.take_side_row(&json!({ "chat_room_uuid": "r", "side_room_kind": "group", "title": "Plans",
+            "members": [{ "principal_uuid": "me", "display_name": "A" }, { "principal_uuid": "u2", "display_name": "B" }] }), "me");
+        assert_eq!(room.kind, RoomKind::Side);
+        assert!(room.group, "a group with one other person is still a group");
+        assert_eq!(room.title.as_deref(), Some("Plans"));
+        assert_eq!(room.members.len(), 2);
+        // A later frame without members or title leaves both; a cleared title clears it.
+        room.take_side_row(&json!({ "side_room_kind": "group" }), "me");
+        assert_eq!((room.members.len(), room.title.as_deref()), (2, Some("Plans")));
+        room.take_side_row(&json!({ "title": null }), "me");
+        assert_eq!(room.title, None);
+        // A pair is a direct message.
+        let mut pair = RoomState::default();
+        pair.take_side_row(&json!({ "side_room_kind": "pair", "members": [{ "principal_uuid": "me", "display_name": "A" }, { "principal_uuid": "u2", "display_name": "B" }] }), "me");
+        assert_eq!(pair.buffer_kind(), "dm");
     }
 
     #[tokio::test]

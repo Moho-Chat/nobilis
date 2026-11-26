@@ -780,25 +780,86 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
     let buffer = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
     let reader = buffer.clone();
 
+    // 60 ms of 48kHz stereo cushion before draining begins, plus ±0.5% adaptive
+    // rate matching so crystal drift between the tokio 20ms timer and the audio
+    // hardware never causes periodic underrun stutters or growing latency.
+    const PREFILL_SAMPLES: usize = (TARGET_RATE as usize * TARGET_CHANNELS as usize * 60) / 1000;
+    let base_step = TARGET_RATE as f64 / rate.max(1) as f64;
+    let mut primed = false;
+    let mut phase: f64 = 0.0;
+    let mut last_sample: [f32; 2] = [0.0, 0.0];
+
     // Voice arrives as 48kHz stereo; the device may want something else.
-    let fill = move |out_frames: usize, mut write: Box<dyn FnMut(usize, f32) + '_>| {
-        let mut buf = reader.lock().unwrap();
+    let mut fill = move |out_frames: usize, mut write: Box<dyn FnMut(usize, f32) + '_>| {
+        // Non-blocking lock: if the producer is mid-push, decay smoothly for
+        // this callback rather than stalling the real-time audio thread.
+        let Ok(mut buf) = reader.try_lock() else {
+            for frame in 0..out_frames {
+                last_sample[0] *= 0.985;
+                last_sample[1] *= 0.985;
+                for ch in 0..channels as usize {
+                    write(frame * channels as usize + ch, last_sample[ch.min(1)]);
+                }
+            }
+            return;
+        };
+
+        if !primed {
+            if buf.len() < PREFILL_SAMPLES {
+                for frame in 0..out_frames {
+                    last_sample[0] *= 0.985;
+                    last_sample[1] *= 0.985;
+                    for ch in 0..channels as usize {
+                        write(frame * channels as usize + ch, last_sample[ch.min(1)]);
+                    }
+                }
+                return;
+            }
+            primed = true;
+        }
+
+        let step = if buf.len() < PREFILL_SAMPLES / 2 {
+            base_step * 0.995
+        } else if buf.len() > PREFILL_SAMPLES * 2 {
+            base_step * 1.005
+        } else {
+            base_step
+        };
+
+        let ch_in = TARGET_CHANNELS as usize;
+        let mut underran = false;
         for frame in 0..out_frames {
-            // Nearest-neighbour again, and for the same reason: enough to
-            // carry speech, and no dependency to keep current.
-            let src_frame = (frame as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize;
-            let base = src_frame * TARGET_CHANNELS as usize;
+            let idx = phase.floor() as usize;
+            let frac = (phase - idx as f64) as f32;
+            let base = idx * ch_in;
+            if base + ch_in <= buf.len() {
+                let next_base = (base + ch_in).min(buf.len() - ch_in);
+                let l0 = buf[base] as f32 / i16::MAX as f32;
+                let r0 = buf[base + 1] as f32 / i16::MAX as f32;
+                let l1 = buf[next_base] as f32 / i16::MAX as f32;
+                let r1 = buf[next_base + 1] as f32 / i16::MAX as f32;
+                last_sample[0] = l0 + (l1 - l0) * frac;
+                last_sample[1] = r0 + (r1 - r0) * frac;
+                phase += step;
+            } else {
+                // Smooth fade-out on transient underrun; resume immediately on
+                // the next frame rather than re-priming a full 60 ms silence gap.
+                underran = true;
+                last_sample[0] *= 0.985;
+                last_sample[1] *= 0.985;
+            }
             for ch in 0..channels as usize {
-                // Mono output takes the left channel; anything wider than
-                // stereo repeats what there is rather than leaving silence in
-                // the surround channels.
-                let sample = buf.get(base + ch.min(TARGET_CHANNELS as usize - 1)).copied().unwrap_or(0);
-                write(frame * channels as usize + ch, sample as f32 / i16::MAX as f32);
+                write(frame * channels as usize + ch, last_sample[ch.min(1)]);
             }
         }
-        let consumed = (out_frames as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize * TARGET_CHANNELS as usize;
-        let drop_n = consumed.min(buf.len());
+        let consumed_frames = phase.floor() as usize;
+        let drop_n = (consumed_frames * ch_in).min(buf.len());
         buf.drain(..drop_n);
+        if underran {
+            phase = 0.0;
+        } else {
+            phase -= consumed_frames as f64;
+        }
     };
 
     let err = |e| tracing::warn!("audio: output stream error: {e}");

@@ -1741,6 +1741,8 @@ impl Runtime {
             }
         }
         self.refresh_buffer_activity(state, &new_id);
+        // A window showing the old one follows it to its new name, instead of being left on a buffer that is gone.
+        state.events.emit("bufferRenamed", serde_json::json!({ "from": old_id, "to": new_id }));
     }
 
     /// Where another client of this account says a conversation was read to.
@@ -1842,7 +1844,9 @@ impl Runtime {
             name_icon: None,
             topic: None,
             read_only: None,
+            slowmode_secs: 0,
             forum: false,
+            age_restricted: false,
             unread_seed: 0,
             mentions_seed: 0,
         };
@@ -3430,6 +3434,23 @@ impl Runtime {
     }
 
     /// Marks a buffer as a forum: a list of posts rather than a conversation.
+    /// Marks a conversation as age-restricted by its service, or not.
+    pub fn set_buffer_age_restricted(&self, state: &AppState, buffer_id: &str, restricted: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.age_restricted != restricted => {
+                    b.age_restricted = restricted;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn set_buffer_forum(&self, state: &AppState, buffer_id: &str, forum: bool) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
@@ -3464,6 +3485,23 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.read_only != new => {
                     b.read_only = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Sets the channel's effective slowmode interval in seconds (0 = none or bypassed).
+    pub fn set_buffer_slowmode(&self, state: &AppState, buffer_id: &str, seconds: u64) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.slowmode_secs != seconds => {
+                    b.slowmode_secs = seconds;
                     Some(b.clone())
                 }
                 _ => None,

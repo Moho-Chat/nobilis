@@ -32,14 +32,24 @@ pub fn entry(world: &World, handle: &Handle, guild: Option<&str>, user_id: &str,
     let user = world.users.get(user_id).cloned().unwrap_or_default();
     let nick = member.and_then(|m| m["nick"].as_str()).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| world.name_in(guild, user_id));
     let avatar = user.avatar.as_deref().and_then(|h| media::asset_url(&handle.instance, "avatars", user_id, h)).map(|u| media::cached(&handle.account_id, media::AVATARS, &u, None, Some("image/webp")));
-    let roles: Vec<String> = match (member, guild.and_then(|g| world.guilds.get(g))) {
+    // The roles held, highest first; the highest one listed apart ("hoisted") is the heading the person is listed
+    // under, and the highest with a colour is the colour of their name.
+    let held: Vec<super::world::Role> = match (member, guild.and_then(|g| world.guilds.get(g))) {
         (Some(m), Some(g)) => {
-            let mut held: Vec<(&String, i64)> = m["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).filter_map(|r| g.roles.get(r).map(|role| (&role.name, role.position))).collect();
-            held.sort_by_key(|(_, at)| -at);
-            held.into_iter().map(|(name, _)| name.clone()).collect()
+            let mut held: Vec<super::world::Role> = m["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).filter_map(|r| g.roles.get(r).cloned()).collect();
+            held.sort_by_key(|role| -role.position);
+            held
         }
         _ => Vec::new(),
     };
+    let roles: Vec<String> = held.iter().map(|r| r.name.clone()).collect();
+    let hoisted = held.iter().find(|r| r.hoist);
+    let colour = held.iter().find(|r| r.color != 0).map(|r| format!("#{:06x}", r.color));
+    // From the member as given, or as kept: a timeout that has not run out yet.
+    let until = member
+        .and_then(|m| m["communication_disabled_until"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp()))
+        .or_else(|| guild.and_then(|g| world.guilds.get(g)).and_then(|g| g.members.get(user_id)).and_then(|m| m.timeout_until));
+    let timed_out = until.is_some_and(|t| t > chrono::Utc::now().timestamp());
     let word = status_word(status);
     let relationship = if world.friends.contains(user_id) {
         "Friend"
@@ -63,6 +73,10 @@ pub fn entry(world: &World, handle: &Handle, guild: Option<&str>, user_id: &str,
         "relationship": relationship,
         "avatarUrl": avatar,
         "roles": roles,
+        "hoist": hoisted.map(|r| r.name.clone()),
+        "hoistRank": hoisted.map(|r| r.position),
+        "colour": colour,
+        "timedOut": timed_out,
     })
 }
 
@@ -157,6 +171,39 @@ pub fn presence(state: &AppState, handle: &Handle, data: &Value) {
         let list = json!(updated);
         state.runtime.set_presence(&buffer.id, list.clone());
         state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": list }));
+    }
+}
+
+/// A guild's roles or somebody's roles in it changed: every list shown for one of its channels is drawn again from
+/// what is known, so a role given, coloured or listed apart shows at once. `only` is the one person who changed, or
+/// none for everybody (a role itself changed).
+pub fn redraw_guild(state: &AppState, handle: &Handle, guild: &str, only: Option<&str>) {
+    for buffer in state.runtime.list_buffers() {
+        if buffer.account_id != handle.account_id || !buffer.group_id.as_deref().is_some_and(|g| g.ends_with(&format!("|guild:{guild}"))) {
+            continue;
+        }
+        let Some(existing) = state.runtime.get_presence(&buffer.id) else { continue };
+        let Some(members) = existing.as_array() else { continue };
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(g) = world.guilds.get(guild) else { continue };
+        let mut changed = false;
+        let updated: Vec<Value> = members
+            .iter()
+            .map(|m| {
+                let Some(id) = m["userId"].as_str().filter(|id| only.is_none_or(|o| o == *id)) else { return m.clone() };
+                let Some(member) = g.members.get(id) else { return m.clone() };
+                changed = true;
+                let shape = json!({ "nick": member.nick, "roles": member.roles });
+                let (status, custom) = world.presence.get(id).cloned().unwrap_or_else(|| (m["status"].as_str().unwrap_or("offline").to_string(), None));
+                entry(&world, handle, Some(guild), id, Some(&shape), &status, custom.as_deref())
+            })
+            .collect();
+        drop(world);
+        if changed {
+            let list = json!(updated);
+            state.runtime.set_presence(&buffer.id, list.clone());
+            state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": list }));
+        }
     }
 }
 

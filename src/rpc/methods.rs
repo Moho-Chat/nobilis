@@ -166,7 +166,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
-        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => Some("fluxer"),
+        "addFluxerAccount" | "addFluxerAccountToken" => Some("fluxer"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -467,6 +467,44 @@ pub async fn dispatch(
                 }
             }
             _ => (None, Some("sneedchatInvite requires a Sneedchat \"accountId\"".to_string())),
+        },
+
+        // A listed room's featured stream, and watching it with the room.
+        "getSneedchatStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => (Some(backend::sneedchat::stream(&buffer.account_id, &buffer.name)), None),
+            _ => (None, Some("getSneedchatStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        "sneedchatWatchStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::watch_stream(&buffer.account_id, &buffer.name, p_bool(params, "watching", true)) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatWatchStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        // A moderator features a stream (`url`) or takes it down (no `url`).
+        "sneedchatSetStream" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::set_stream(&buffer.account_id, &buffer.name, p_str_opt(params, "url")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatSetStream requires a Sneedchat \"bufferId\"".to_string())),
+        },
+
+        // A group chat's name, set or (no `title`) cleared, by its owner.
+        "sneedchatRenameGroup" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::rename_group(&buffer.account_id, &buffer.name, p_str_opt(params, "title")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRenameGroup requires a Sneedchat \"bufferId\"".to_string())),
+        },
+        // Somebody taken out of a group chat, by its owner.
+        "sneedchatRemoveMember" => match p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) {
+            Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::remove_member(&buffer.account_id, &buffer.name, p_str(params, "who", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            _ => (None, Some("sneedchatRemoveMember requires a Sneedchat \"bufferId\"".to_string())),
         },
 
         // Bringing back a message that was taken down.
@@ -1625,6 +1663,11 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                // Sneedchat keeps one for each private conversation.
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
+                    backend::sneedchat::mark_read(&buffer.account_id, &buffer.name);
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
                     if let Err(e) = backend::fluxer::send::mark_read(state, &buffer).await {
                         tracing::debug!("fluxer read position: {e}");
@@ -1718,6 +1761,78 @@ pub async fn dispatch(
         // with that person, while a list always makes a new group. A caller
         // that could not tell them apart would quietly create a duplicate
         // conversation every time it opened a one-to-one.
+        // Fluxer's groups answer to Discord's calls, which the window already makes for a group of friends.
+        "openDiscordGroupDm" | "addToDiscordGroupDm" | "removeFromDiscordGroupDm" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let account_id = p_str(params, "accountId", "");
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            if method == "openDiscordGroupDm" {
+                let users: Vec<String> = params.get("userIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                return match backend::fluxer::people::create_group(state, &handle, &users).await {
+                    Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
+            let (Some(channel), Some(user)) = (p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).and_then(|b| b.remote_id), p_str_opt(params, "userId")) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\" and \"userId\"")));
+            };
+            match backend::fluxer::people::group_member(&handle, &channel, user, method == "addToDiscordGroupDm").await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A Fluxer community made by this account, or deleted by it (which Fluxer asks a password or a code for).
+        "createFluxerGuild" => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("createFluxerGuild requires a connected Fluxer \"accountId\"".to_string()));
+            };
+            match backend::fluxer::people::create_guild(&handle, p_str(params, "name", "")).await {
+                Ok(guild) => {
+                    // Its first text channel, to open.
+                    let first = {
+                        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut text: Vec<_> = world.channels.values().filter(|c| c.guild.as_deref() == Some(guild.as_str()) && c.kind == backend::fluxer::world::Kind::Text).map(|c| (c.position, c.id.clone())).collect();
+                        text.sort();
+                        text.first().map(|(_, id)| id.clone())
+                    };
+                    let buffer = first.and_then(|c| backend::fluxer::messages::buffer_of(state, &handle.account_id, &c)).map(|b| b.id);
+                    (Some(serde_json::json!({ "groupId": backend::fluxer::events::rail_id(&handle.account_id, &guild), "bufferId": buffer })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+        "deleteFluxerGuild" => {
+            let Some((account_id, guild)) = p_str_opt(params, "groupId").and_then(|g| g.split_once("|guild:")) else {
+                return (None, Some("deleteFluxerGuild requires a community's \"groupId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match backend::fluxer::people::delete_guild(state, &handle, guild, p_str_opt(params, "password"), p_str_opt(params, "code")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Links to a community or a group that somebody sent this account, waiting in the invitations tile.
+        "fluxerInviteOffers" | "answerFluxerInvite" => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some(format!("{method} requires a connected Fluxer \"accountId\"")));
+            };
+            if method == "fluxerInviteOffers" {
+                return (Some(backend::fluxer::invites::offers(&handle)), None);
+            }
+            let Some(code) = p_str_opt(params, "code") else {
+                return (None, Some("answerFluxerInvite requires \"code\"".to_string()));
+            };
+            match backend::fluxer::invites::answer(state, &handle, code, p_bool(params, "accept", false)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "openDiscordGroupDm" => {
             let account_id = match p_str_opt(params, "accountId") {
                 Some(a) => a,
@@ -3551,6 +3666,10 @@ pub async fn dispatch(
                 crate::audio::set_playback_muted(prefs.deafened);
                 backend::discord::announce_voice_flags(state, &account_id, mic_muted, prefs.deafened);
             }
+            // Fluxer calls are joined by the window, but what the others are told about them is said from here.
+            for handle in state.runtime.all_fluxer_handles() {
+                backend::fluxer::voice::say_state(&handle, prefs.mic_muted, prefs.deafened);
+            }
             state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
             (Some(serde_json::to_value(prefs).unwrap()), None)
         }
@@ -3897,6 +4016,17 @@ pub async fn dispatch(
                                 Ok(false) => {}
                                 Err(e) => return (None, Some(format!("{e:#}"))),
                             }
+                        } else if buffer.account_id.starts_with("fluxer:") {
+                            // A direct message is closed and a group is left, at Fluxer; a guild's channel is only
+                            // stopped being shown here, since being in the guild is what puts it there.
+                            if let (Some(handle), Some(channel)) = (state.runtime.fluxer_handle(&buffer.account_id), buffer.remote_id.as_deref()) {
+                                let private = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get(channel).is_some_and(|c| matches!(c.kind, backend::fluxer::world::Kind::Direct | backend::fluxer::world::Kind::Group));
+                                if private {
+                                    if let Err(e) = backend::fluxer::people::close_private(&handle, channel).await {
+                                        return (None, Some(format!("{e:#}")));
+                                    }
+                                }
+                            }
                         } else if buffer.kind == "dm" && buffer.account_id.starts_with("discord:") {
                             if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {
                                 if let Err(e) = backend::discord::close_dm(state, &buffer.account_id, &channel_id).await {
@@ -4136,7 +4266,8 @@ pub async fn dispatch(
                     };
                     let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
                     let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
-                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    let silent = params.get("silent").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let sent = backend::fluxer::send::send_files(state, &buffer, body, &files, reply_to_id, silent, progress).await;
                     if let Some(p) = progress {
                         if !files.is_empty() {
                             p.done(sent.as_ref().err().map(String::as_str));
@@ -5358,7 +5489,7 @@ pub async fn dispatch(
         // a Matrix call on a media server), and who is in each channel's call.
         // Fluxer's calls answer to Stoat's calls (the window joins both on LiveKit the same way), and two of their own:
         // leaving, which Fluxer wants said on the gateway, and saying the microphone, camera and screen.
-        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" | "fluxerStreamPreview" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
                 return (None, Some(format!("{method} requires a known \"bufferId\"")));
             };
@@ -5374,7 +5505,8 @@ pub async fn dispatch(
                     if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
                         return (None, Some(why));
                     }
-                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false)).await {
+                    let prefs = state.voice_prefs.get();
+                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false), prefs.mic_muted, prefs.deafened).await {
                         Ok(joined) => (Some(joined), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     }
@@ -5383,8 +5515,19 @@ pub async fn dispatch(
                     backend::fluxer::voice::leave(&handle);
                     (Some(ok_node()), None)
                 }
+                "fluxerStreamPreview" => {
+                    let Some(user) = p_str_opt(params, "userId") else {
+                        return (None, Some("fluxerStreamPreview requires \"userId\"".to_string()));
+                    };
+                    match backend::fluxer::voice::stream_preview(&handle, &buffer, user).await {
+                        Ok(url) => (Some(serde_json::json!({ "url": url })), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
                 _ => {
-                    backend::fluxer::voice::set_state(&handle, p_bool(params, "muted", false), p_bool(params, "camera", false), p_bool(params, "screen", false));
+                    // The microphone and hearing are the voice buttons', which this daemon holds; the window says the rest.
+                    let prefs = state.voice_prefs.get();
+                    backend::fluxer::voice::set_state(&handle, prefs.mic_muted, prefs.deafened, p_bool(params, "camera", false), p_bool(params, "screen", false));
                     (Some(ok_node()), None)
                 }
             }
@@ -5510,7 +5653,7 @@ pub async fn dispatch(
 
         // Signing in to Fluxer: an id now and the rest as events (backend/fluxer/login.rs). The instance is optional and
         // is the official one when it is left out.
-        "addFluxerAccount" | "addFluxerAccountToken" | "addFluxerAccountHandoff" => {
+        "addFluxerAccount" | "addFluxerAccountToken" => {
             let instance = p_str(params, "instance", "").to_string();
             let login_id = format!("fluxer-{}", crate::model::next_message_id());
             match method {
@@ -5520,13 +5663,12 @@ pub async fn dispatch(
                     };
                     backend::fluxer::login::start(state.clone(), login_id.clone(), instance, login.to_string(), password.to_string());
                 }
-                "addFluxerAccountToken" => {
+                _ => {
                     let Some(token) = p_str_opt(params, "token") else {
                         return (None, Some("addFluxerAccountToken requires \"token\"".to_string()));
                     };
                     backend::fluxer::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
                 }
-                _ => backend::fluxer::login::start_handoff(state.clone(), login_id.clone(), instance),
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
@@ -7629,6 +7771,15 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             }
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("discord:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("ending a Discord poll needs its \"pollId\"".to_string()));
+                };
+                return match backend::discord::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -7972,6 +8123,15 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
             }
+        }
+
+        "fluxerGuildFolders" => {
+            let mut by_account = serde_json::Map::new();
+            for handle in state.runtime.all_fluxer_handles() {
+                let folders = handle.guild_folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                by_account.insert(handle.account_id, serde_json::Value::Array(folders));
+            }
+            (Some(serde_json::Value::Object(by_account)), None)
         }
 
         // An account's chat folders, which the window shows as categories on the account's page, and the changes it
@@ -8533,6 +8693,32 @@ pub async fn dispatch(
             }
         }
 
+        // Fetches a Go Live stream's preview thumbnail for hover cards in the
+        // voice channel rail, without needing to join the channel first.
+        "getDiscordStreamPreview" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("getDiscordStreamPreview requires \"accountId\"".to_string()));
+            };
+            let built = match (p_str_opt(params, "userId"), p_str_opt(params, "channelId")) {
+                (Some(user_id), Some(channel_id)) => Some(
+                    backend::discord::golive::StreamKey {
+                        guild_id: p_str_opt(params, "guildId").map(str::to_string),
+                        channel_id: channel_id.to_string(),
+                        user_id: user_id.to_string(),
+                    }
+                    .to_wire(),
+                ),
+                _ => None,
+            };
+            let Some(stream_key) = p_str_opt(params, "streamKey").map(str::to_string).or(built) else {
+                return (None, Some("getDiscordStreamPreview requires \"streamKey\", or \"userId\" and \"channelId\"".to_string()));
+            };
+            match backend::discord::golive::fetch_stream_preview(state, account_id, &stream_key).await {
+                Ok(url) => (Some(serde_json::json!({ "url": url, "streamKey": stream_key })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Watching somebody else's stream, which is a different act from
         // hosting one: no capture, no encoder, and a connection that reads
         // rather than writes. The frames arrive as `discordStreamFrame`
@@ -9054,6 +9240,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("fluxer:") {
+                let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                    return (Some(serde_json::json!([])), None);
+                };
+                return (Some(backend::fluxer::send::list_stickers(&handle, &buffer)), None);
+            }
             let token = state.accounts.get_discord(&buffer.account_id).map(|c| c.token).unwrap_or_default();
             (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id, &token).await)), None)
         }
@@ -9080,10 +9272,46 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("fluxer:") {
+                return match backend::fluxer::send::send_sticker(state, &buffer, sticker_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
             match backend::discord::stickers::send(state, buffer_id, &cfg.token, sticker_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "startFluxerThread" => {
+            let (Some(buffer), Some(message_id)) = (p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)), p_str_opt(params, "messageId")) else {
+                return (None, Some("startFluxerThread requires \"bufferId\" and \"messageId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let name = p_str(params, "name", "").trim();
+            if name.is_empty() {
+                return (None, Some("A thread needs a name".to_string()));
+            }
+            match backend::fluxer::threads::start_from(state, &handle, &buffer, message_id, name).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "setFluxerNote" => {
+            let (Some(account_id), Some(user_id)) = (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) else {
+                return (None, Some("setFluxerNote requires \"accountId\" and \"userId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match backend::fluxer::profile::set_note(&handle, user_id, p_str(params, "note", "")).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }

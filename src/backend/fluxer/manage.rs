@@ -108,6 +108,9 @@ fn powers(handle: &Handle, guild: &str) -> Value {
         "permissions": has(world::MANAGE_ROLES),
         "webhooks": has(world::MANAGE_WEBHOOKS),
         "audit": has(world::VIEW_AUDIT_LOG),
+        "nickname": g.owner == world.own_id || has(world::CHANGE_NICKNAME),
+        "emojis": has(world::MANAGE_EXPRESSIONS) || has(world::CREATE_EXPRESSIONS),
+        "manageEmojis": has(world::MANAGE_EXPRESSIONS),
     })
 }
 
@@ -165,9 +168,14 @@ pub async fn overview(handle: &Handle, buffer: &Buffer) -> Result<Value> {
         .collect();
     let everyone = roles.as_array().into_iter().flatten().find(|r| r["id"].as_str() == Some(guild.as_str())).map(|r| world::mask(&r["permissions"])).unwrap_or(0);
     let icon = fresh["icon"].as_str().and_then(|h| media::asset_url(&handle.instance, "icons", &guild, h)).map(|u| media::cached(&handle.account_id, media::AVATARS, &u, None, Some("image/webp")));
+    let own_nick = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.guilds.get(&guild).and_then(|g| g.members.get(&world.own_id)).and_then(|m| m.nick.clone()).unwrap_or_default()
+    };
     Ok(json!({
         "serverId": guild,
         "name": fresh["name"], "description": fresh["description"].as_str().unwrap_or(""), "iconUrl": icon,
+        "ownNick": own_nick,
         "can": powers(handle, &guild),
         "categories": categories,
         "channels": listed,
@@ -262,6 +270,14 @@ pub async fn set_categories(handle: &Handle, buffer: &Buffer, wanted: &Value) ->
         }
         kept.push(id);
     }
+    // A channel under a heading that is no longer listed under any is taken out from under it: "no heading" is a place
+    // too. Without this a channel moved out of every heading stayed where it was.
+    let placed: Vec<&str> = list.iter().flat_map(|h| h["channels"].as_array().into_iter().flatten().filter_map(Value::as_str)).collect();
+    for c in existing.iter().filter(|c| c["type"].as_i64() != Some(4) && c["parent_id"].is_string()) {
+        if let Some(id) = c["id"].as_str().filter(|id| !placed.contains(id)) {
+            positions.push(json!({ "id": id, "position": c["position"], "parent_id": null }));
+        }
+    }
     handle.api.request(Method::PATCH, &format!("/guilds/{guild}/channels"), &[], Some(&json!(positions)), None).await.map_err(fail)?;
     for gone in existing.iter().filter(|c| c["type"].as_i64() == Some(4)).filter_map(|c| c["id"].as_str()).filter(|id| !kept.iter().any(|k| k == id)) {
         handle.api.delete(&format!("/channels/{gone}")).await.map_err(fail)?;
@@ -329,12 +345,17 @@ pub fn describe(world: &world::World, guild: &str, e: &Value) -> String {
     let target = e["target_id"].as_str().unwrap_or("");
     let person = || world.name_in(Some(guild), target);
     let channel = |id: &str| world.channels.get(id).map(|c| format!("#{}", c.name)).unwrap_or_else(|| "a channel".to_string());
-    let role = || e["options"]["role_name"].as_str().map(str::to_string).or_else(|| world.guilds.get(guild).and_then(|g| g.roles.get(target)).map(|r| r.name.clone())).unwrap_or_else(|| "a role".to_string());
+    // The name a thing had, from the entry's own record of what changed: the only place a deleted one is still named.
+    let named = || {
+        e["changes"].as_array().into_iter().flatten().find(|c| c["key"].as_str() == Some("name")).and_then(|c| c["new_value"].as_str().or(c["old_value"].as_str())).map(str::to_string)
+    };
+    let role = || e["options"]["role_name"].as_str().map(str::to_string).or_else(|| world.guilds.get(guild).and_then(|g| g.roles.get(target)).map(|r| r.name.clone())).or_else(named).unwrap_or_else(|| "a role".to_string());
+    let called = |what: &str| named().map(|n| format!("the {what} {n}")).unwrap_or_else(|| format!("{} {what}", if what.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" }));
     let what = match e["action_type"].as_i64().unwrap_or(0) {
         1 => "changed the community's settings".to_string(),
         10 => format!("made {}", channel(target)),
         11 => format!("changed {}", channel(target)),
-        12 => "deleted a channel".to_string(),
+        12 => named().map(|n| format!("deleted #{n}")).unwrap_or_else(|| "deleted a channel".to_string()),
         13..=15 => format!("changed who may do what in {}", channel(e["options"]["channel_id"].as_str().unwrap_or(target))),
         20 => format!("kicked {}", person()),
         22 => format!("banned {}", person()),
@@ -345,17 +366,26 @@ pub fn describe(world: &world::World, guild: &str, e: &Value) -> String {
         27 => format!("took {} out of a call", person()),
         30 => format!("made the role {}", role()),
         31 => format!("changed the role {}", role()),
-        32 => "deleted a role".to_string(),
+        32 => format!("deleted the role {}", role()),
         40 => "made an invite".to_string(),
+        41 => "changed an invite".to_string(),
         42 => "deleted an invite".to_string(),
-        50..=52 => "changed a webhook".to_string(),
-        60..=62 => "changed an emoji".to_string(),
+        50 => format!("made {}", called("webhook")),
+        51 => format!("changed {}", called("webhook")),
+        52 => format!("deleted {}", called("webhook")),
+        60 => format!("added {}", called("emoji")),
+        61 => format!("changed {}", called("emoji")),
+        62 => format!("removed {}", called("emoji")),
         72 => format!("deleted a message in {}", channel(e["options"]["channel_id"].as_str().unwrap_or(""))),
         73 => format!("deleted {} messages in {}", e["options"]["count"].as_str().or(e["options"]["count"].as_u64().map(|_| "")).unwrap_or("some"), channel(e["options"]["channel_id"].as_str().unwrap_or(""))),
         74 => format!("pinned a message in {}", channel(e["options"]["channel_id"].as_str().unwrap_or(""))),
         75 => format!("unpinned a message in {}", channel(e["options"]["channel_id"].as_str().unwrap_or(""))),
-        90..=92 => "changed a sticker".to_string(),
-        110..=112 => "changed a thread".to_string(),
+        90 => format!("added {}", called("sticker")),
+        91 => format!("changed {}", called("sticker")),
+        92 => format!("removed {}", called("sticker")),
+        110 => format!("started {}", called("thread")),
+        111 => format!("changed {}", called("thread")),
+        112 => format!("deleted {}", called("thread")),
         n => format!("did something Fluxer calls {n}"),
     };
     let reason = e["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default();
@@ -391,6 +421,96 @@ pub async fn webhooks(handle: &Handle, channel: &str) -> Result<Value> {
 }
 
 /// Runs one action of the settings window; answers what it shows afterwards.
+/// The community's invites, newest first: who made each, where it leads, how often it was used and when it ends.
+pub async fn invites(handle: &Handle, buffer: &Buffer) -> Result<Value> {
+    let guild = guild_of(handle, buffer)?;
+    let list = handle.api.get(&format!("/guilds/{guild}/invites"), &[]).await.map_err(fail)?;
+    let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    let rows: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| {
+            let channel = i["channel"]["id"].as_str().and_then(|c| world.channels.get(c)).map(|c| c.name.clone()).or_else(|| i["channel"]["name"].as_str().map(str::to_string)).unwrap_or_default();
+            let by = i["inviter"]["id"].as_str().map(|u| world.name_in(Some(&guild), u)).unwrap_or_default();
+            json!({
+                "code": i["code"], "link": format!("{}/{}", handle.instance.invite.trim_end_matches('/'), i["code"].as_str().unwrap_or("")),
+                "channel": channel, "by": by, "uses": i["uses"], "maxUses": i["max_uses"], "maxAge": i["max_age"],
+                "createdAt": i["created_at"], "temporary": i["temporary"],
+            })
+        })
+        .collect();
+    Ok(json!({ "invites": rows }))
+}
+
+/// Who is banned from the community, and why when a reason was given.
+pub async fn bans(handle: &Handle, buffer: &Buffer) -> Result<Value> {
+    let guild = guild_of(handle, buffer)?;
+    let list = handle.api.get(&format!("/guilds/{guild}/bans"), &[]).await.map_err(fail)?;
+    let rows: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| {
+            let user = &b["user"];
+            let id = user["id"].as_str()?;
+            let name = user["global_name"].as_str().filter(|n| !n.is_empty()).or(user["username"].as_str()).unwrap_or(id);
+            Some(json!({ "userId": id, "name": name, "reason": b["reason"] }))
+        })
+        .collect();
+    Ok(json!({ "bans": rows }))
+}
+
+/// Sets or clears this account's own nickname in the community (`PATCH /guilds/{id}/members/@me`).
+pub async fn set_nickname(handle: &Handle, buffer: &Buffer, nick: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    let trimmed = nick.trim();
+    let value = if trimmed.is_empty() { Value::Null } else { json!(trimmed.chars().take(32).collect::<String>()) };
+    handle.api.patch(&format!("/guilds/{guild}/members/@me"), &json!({ "nick": value })).await.map_err(fail)?;
+    let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    let own = world.own_id.clone();
+    if let Some(m) = world.guilds.get_mut(&guild).and_then(|g| g.members.get_mut(&own)) {
+        m.nick = if trimmed.is_empty() { None } else { Some(trimmed.chars().take(32).collect()) };
+    }
+    Ok(())
+}
+
+/// Custom emoji in this community.
+pub async fn emojis(handle: &Handle, buffer: &Buffer) -> Result<Value> {
+    let guild = guild_of(handle, buffer)?;
+    let list = handle.api.get(&format!("/guilds/{guild}/emojis"), &[]).await.map_err(fail)?;
+    let rows: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let id = e["id"].as_str()?;
+            let name = e["name"].as_str().unwrap_or("emoji");
+            let animated = e["animated"].as_bool().unwrap_or(false);
+            let url = media::emoji_url(&handle.instance, id, animated).map(|u| media::cached(&handle.account_id, media::MEDIA, &u, None, Some(if animated { "image/gif" } else { "image/webp" })));
+            Some(json!({ "id": id, "name": name, "animated": animated, "url": url }))
+        })
+        .collect();
+    Ok(json!({ "emojis": rows }))
+}
+
+/// Uploads a custom emoji to the community (`POST /guilds/{id}/emojis`).
+pub async fn create_emoji(handle: &Handle, buffer: &Buffer, name: &str, path: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    let name: String = name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+    if name.len() < 2 {
+        bail!("An emoji name needs at least two letters, digits or underscores");
+    }
+    let image = data_uri(path).await?;
+    handle.api.post(&format!("/guilds/{guild}/emojis"), &json!({ "name": name, "image": image })).await.map(|_| ()).map_err(fail)
+}
+
+/// Deletes a custom emoji from the community (`DELETE /guilds/{id}/emojis/{emoji}`).
+pub async fn delete_emoji(handle: &Handle, buffer: &Buffer, emoji_id: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    handle.api.delete(&format!("/guilds/{guild}/emojis/{emoji_id}")).await.map(|_| ()).map_err(fail)
+}
+
 pub async fn run(handle: &Handle, buffer: &Buffer, action: &str, p: &Value) -> Result<Value> {
     let text = |k: &str| p[k].as_str();
     let id = |k: &str| p[k].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("{action} needs \"{k}\""));
@@ -409,6 +529,15 @@ pub async fn run(handle: &Handle, buffer: &Buffer, action: &str, p: &Value) -> R
         "reorderRoles" => reorder_roles(handle, buffer, &names_in(&p["order"])).await?,
         "setRolePermissions" => set_role_permissions(handle, buffer, text("roleId").filter(|r| !r.is_empty()), &names_in(&p["allow"])).await?,
         "setChannelPermissions" => set_channel_permissions(handle, buffer, id("channelId")?, text("roleId").filter(|r| !r.is_empty()), &names_in(&p["allow"]), &names_in(&p["deny"])).await?,
+        "invites" => return invites(handle, buffer).await,
+        "bans" => return bans(handle, buffer).await,
+        "emojis" => return emojis(handle, buffer).await,
+        "setNickname" => set_nickname(handle, buffer, text("nick").unwrap_or("")).await?,
+        "createEmoji" => create_emoji(handle, buffer, text("name").unwrap_or(""), id("path")?).await?,
+        "deleteEmoji" => delete_emoji(handle, buffer, id("emojiId")?).await?,
+        "deleteInvite" => {
+            handle.api.delete(&format!("/invites/{}", id("code")?)).await.map_err(fail)?;
+        }
         "createWebhook" => {
             handle.api.post(&format!("/channels/{}/webhooks", id("channelId")?), &json!({ "name": text("name").unwrap_or("").trim() })).await.map_err(fail)?;
         }
@@ -435,6 +564,19 @@ mod tests {
     #[test]
     fn roles_in_the_windows_order_become_positions_highest_first() {
         assert_eq!(positions_for(&["A".into(), "B".into()]), json!([{ "id": "A", "position": 2 }, { "id": "B", "position": 1 }]));
+    }
+
+    #[test]
+    fn audit_lines_name_what_was_made_or_deleted_from_its_changes() {
+        let world = world::World::default();
+        let entry = |action: i64, changes: Value| json!({ "user_id": "0", "target_id": "9", "action_type": action, "changes": changes });
+        let named = json!([{ "key": "name", "new_value": "Test hook" }]);
+        assert_eq!(describe(&world, "1", &entry(50, named.clone())), "Fluxer made the webhook Test hook");
+        assert_eq!(describe(&world, "1", &entry(52, json!([{ "key": "name", "old_value": "Test hook" }]))), "Fluxer deleted the webhook Test hook");
+        assert_eq!(describe(&world, "1", &entry(51, Value::Null)), "Fluxer changed a webhook");
+        assert_eq!(describe(&world, "1", &entry(60, Value::Null)), "Fluxer added an emoji");
+        assert_eq!(describe(&world, "1", &entry(32, json!([{ "key": "name", "old_value": "Helpers" }]))), "Fluxer deleted the role Helpers");
+        assert_eq!(describe(&world, "1", &entry(12, json!([{ "key": "name", "old_value": "old-room" }]))), "Fluxer deleted #old-room");
     }
 
     #[test]
