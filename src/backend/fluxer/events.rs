@@ -49,7 +49,7 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
     if matches!(channel.kind, Kind::Category | Kind::Link | Kind::Other(_)) || (channel.kind == Kind::Thread && !channel.joined) {
         return;
     }
-    let (title, read_only, avatar, unread) = {
+    let (title, read_only, slowmode, avatar, unread) = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         if channel.guild.is_some() && world.permissions(channel) & world::VIEW_CHANNEL == 0 {
             return;
@@ -65,7 +65,9 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
             (Some(_), Some((None, mentions))) => (true, mentions),
             _ => (false, 0),
         };
-        (world.title_of(channel), world.read_only(channel, now()), avatar, unread)
+        let bypass = world.permissions(channel) & (world::BYPASS_SLOWMODE | world::ADMINISTRATOR | world::MANAGE_CHANNELS | world::MANAGE_MESSAGES) != 0;
+        let slowmode = if channel.slowmode > 0 && !bypass { channel.slowmode } else { 0 };
+        (world.title_of(channel), world.read_only(channel, now()), slowmode, avatar, unread)
     };
     let kind = if channel.kind.private() && channel.kind != Kind::Group { "dm" } else { "channel" };
     let existing = state.runtime.list_buffers().into_iter().find(|b| b.account_id == *account_id && b.remote_id.as_deref() == Some(channel.id.as_str()));
@@ -100,6 +102,7 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, pl
         }
     }
     state.runtime.set_buffer_read_only(state, &buffer.id, read_only);
+    state.runtime.set_buffer_slowmode(state, &buffer.id, slowmode);
     if let Some(topic) = &channel.topic {
         state.runtime.set_buffer_topic(state, &buffer.id, topic);
     }

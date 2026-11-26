@@ -1844,6 +1844,7 @@ impl Runtime {
             name_icon: None,
             topic: None,
             read_only: None,
+            slowmode_secs: 0,
             forum: false,
             unread_seed: 0,
             mentions_seed: 0,
@@ -3466,6 +3467,23 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.read_only != new => {
                     b.read_only = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Sets the channel's effective slowmode interval in seconds (0 = none or bypassed).
+    pub fn set_buffer_slowmode(&self, state: &AppState, buffer_id: &str, seconds: u64) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.slowmode_secs != seconds => {
+                    b.slowmode_secs = seconds;
                     Some(b.clone())
                 }
                 _ => None,

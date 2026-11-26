@@ -100,6 +100,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     slowed(&handle, &channel)?;
     let payload = payload(&handle, &channel, body, reply_to);
     let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted(&handle, &channel, e))?;
+    if buffer.slowmode_secs > 0 {
+        handle.set_slow_until(&channel, chrono::Utc::now().timestamp() + buffer.slowmode_secs as i64);
+    }
     // At once rather than when the event comes back: the echo finds it kept already.
     messages::record(state, &handle, &sent);
     Ok(())

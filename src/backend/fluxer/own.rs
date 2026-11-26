@@ -22,7 +22,8 @@ pub fn status_of(status: &str) -> &'static str {
 
 /// The presence command: the status, and the custom status when a line is given (an empty line clears it).
 pub fn command(status: &str, text: Option<&str>) -> Value {
-    let mut d = json!({ "status": status_of(status), "afk": false, "mobile": false });
+    let word = status_of(status);
+    let mut d = json!({ "status": word, "afk": word == "idle", "mobile": false });
     if let Some(text) = text {
         let text = text.trim();
         d["custom_status"] = if text.is_empty() { Value::Null } else { json!({ "text": text.chars().take(128).collect::<String>() }) };
@@ -41,13 +42,28 @@ pub fn settings_change(status: &str, text: Option<&str>) -> Value {
 }
 
 pub async fn apply_status(handle: &Handle, status: &str, text: Option<&str>) -> bool {
-    match handle.api.patch("/users/@me/settings", &settings_change(status, text)).await {
+    // Both places must agree: op 3 updates this live gateway session's presence immediately (otherwise Fluxer keeps
+    // showing the session's prior presence, e.g. idle), while PATCH /users/@me/settings updates the account's saved
+    // status across every session.
+    let _ = handle.gateway.send(command(status, text).to_string());
+    let patched = match handle.api.patch("/users/@me/settings", &settings_change(status, text)).await {
         Ok(_) => true,
         Err(e) => {
             tracing::info!("fluxer[{}]: status not set: {e}", handle.account_id);
             false
         }
+    };
+    if patched {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let own = world.own_id.clone();
+        let prev_text = world.presence.get(&own).and_then(|p| p.1.clone());
+        let next_text = match text {
+            Some(t) => Some(t.trim().to_string()).filter(|s| !s.is_empty()),
+            None => prev_text,
+        };
+        world.presence.insert(own, (status_of(status).to_string(), next_text));
     }
+    patched
 }
 
 /// What moho calls a status Fluxer's settings name.
@@ -136,6 +152,7 @@ mod tests {
     #[test]
     fn a_status_is_said_in_fluxers_words_and_an_empty_line_clears_the_custom_status() {
         assert_eq!(command("dnd", None), json!({ "op": 3, "d": { "status": "dnd", "afk": false, "mobile": false } }));
+        assert_eq!(command("idle", None), json!({ "op": 3, "d": { "status": "idle", "afk": true, "mobile": false } }));
         assert_eq!(command("invisible", Some(""))["d"]["custom_status"], Value::Null);
         assert_eq!(command("online", Some(" lunch "))["d"]["custom_status"]["text"], "lunch");
         assert_eq!(status_of("whatever"), "online");

@@ -406,6 +406,9 @@ pub struct Buffer {
     /// read but not write in, or Discord's own notices. Absent where it can.
     #[serde(rename = "readOnly", default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
+    /// Seconds between messages when slow mode is enabled and applies to this account.
+    #[serde(rename = "slowmodeSecs", default, skip_serializing_if = "is_zero_u64")]
+    pub slowmode_secs: u64,
     /// A Discord forum (or media channel): not a conversation but a list of
     /// posts, each of which is a thread. Opened as a pane of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -421,6 +424,10 @@ pub struct Buffer {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1104,6 +1111,7 @@ mod tests {
             name_icon: None,
             topic: None,
             read_only: None,
+            slowmode_secs: 0,
             forum: false,
             unread_seed: 0,
             mentions_seed: 0,
