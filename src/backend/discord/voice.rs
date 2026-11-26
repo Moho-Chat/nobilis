@@ -798,9 +798,15 @@ mod tests {
     fn a_loud_room_clips_rather_than_wrapping() {
         // Wrapping turns a loud moment into a full-scale discontinuity, which
         // is heard as a bang rather than as loudness.
+        // Above the knee the sum is bent softly toward full scale rather than cut off at it: still loud, still the
+        // right way up, never past the edge.
         let a = [i16::MAX, i16::MIN];
         let b = [i16::MAX, i16::MIN];
-        assert_eq!(mix(&[&a, &b]), vec![i16::MAX, i16::MIN]);
+        let mixed = mix(&[&a, &b]);
+        assert!(mixed[0] > 30_000, "loud stays loud: {}", mixed[0]);
+        assert!(mixed[1] < -30_000, "and the right way up: {}", mixed[1]);
+        // Below the knee nothing is touched.
+        assert_eq!(mix(&[&[20_000i16][..], &[5_000i16][..]]), vec![25_000]);
     }
 
     #[test]

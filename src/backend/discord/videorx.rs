@@ -370,13 +370,15 @@ mod tests {
         let first = rx.push(vp8(1, true, true, true), false, t);
         assert!(rx.admit(&first[0], true));
         rx.push(vp8(3, true, true, false), false, t);
-        let frames = rx.push(vp8(4, true, true, false), false, t + Duration::from_millis(200));
+        // Past how long the reassembler waits for the lost one to be sent again.
+        let given_up = t + super::super::reassemble::RETRANSMIT_WAIT + Duration::from_millis(10);
+        let frames = rx.push(vp8(4, true, true, false), false, given_up);
         assert!(frames[0].after_gap);
         assert!(!rx.admit(&frames[0], false), "the frame after the loss is not decoded");
         assert!(!rx.admit(&frames[1], false), "nor anything until a keyframe");
         assert!(rx.wants_keyframe(t));
         assert!(!rx.wants_keyframe(t + Duration::from_millis(10)), "and not asked again at once");
-        let key = rx.push(vp8(5, true, true, true), false, t + Duration::from_millis(300));
+        let key = rx.push(vp8(5, true, true, true), false, given_up + Duration::from_millis(100));
         assert!(rx.admit(&key[0], true));
         assert!(!rx.is_waiting_for_keyframe());
     }

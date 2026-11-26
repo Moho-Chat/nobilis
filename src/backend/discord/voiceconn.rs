@@ -1558,12 +1558,21 @@ mod tests {
     #[test]
     fn packets_are_played_in_order_after_a_short_wait() {
         let mut jitter = Jitter::new();
-        jitter.push(11, opus_silence());
-        assert!(jitter.pop().is_none(), "one packet is not enough to start");
+        // Out of order, and fewer than it waits for: nothing yet.
+        for seq in (11..10 + JITTER_PRIME as u16).rev() {
+            jitter.push(seq, opus_silence());
+            assert!(jitter.pop().is_none(), "not enough to start");
+        }
         jitter.push(10, opus_silence());
         assert_eq!(jitter.pop().map(|p| p.len()), Some(FRAME_SAMPLES), "starts from the earliest");
         assert_eq!(jitter.next, Some(11));
-        assert!(jitter.pop().is_some());
+        for _ in 1..JITTER_PRIME {
+            assert!(jitter.pop().is_some());
+        }
+        // The last word is carried over a short gap, then it stops when they do.
+        for _ in 0..JITTER_TRAILING_PLC {
+            assert!(jitter.pop().is_some(), "a trailing frame is concealed");
+        }
         assert!(jitter.pop().is_none(), "and stops when they do");
     }
 
@@ -1571,7 +1580,9 @@ mod tests {
     fn a_late_packet_is_dropped_and_sequence_numbers_wrap() {
         let mut jitter = Jitter::new();
         jitter.push(65_535, opus_silence());
-        jitter.push(0, opus_silence());
+        for seq in 0..(JITTER_PRIME as u16 - 1) {
+            jitter.push(seq, opus_silence());
+        }
         assert!(jitter.pop().is_some());
         assert_eq!(jitter.next, Some(0), "wrapped");
         jitter.push(65_534, opus_silence());
@@ -1582,7 +1593,9 @@ mod tests {
     fn a_lost_packet_is_concealed_rather_than_skipped() {
         let mut jitter = Jitter::new();
         jitter.push(1, opus_silence());
-        jitter.push(3, opus_silence());
+        for seq in 3..(2 + JITTER_PRIME as u16) {
+            jitter.push(seq, opus_silence());
+        }
         assert!(jitter.pop().is_some(), "1");
         assert!(jitter.pop().is_some(), "2 is missing and concealed");
         assert!(jitter.pop().is_some(), "3");
