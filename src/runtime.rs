@@ -1741,6 +1741,8 @@ impl Runtime {
             }
         }
         self.refresh_buffer_activity(state, &new_id);
+        // A window showing the old one follows it to its new name, instead of being left on a buffer that is gone.
+        state.events.emit("bufferRenamed", serde_json::json!({ "from": old_id, "to": new_id }));
     }
 
     /// Where another client of this account says a conversation was read to.

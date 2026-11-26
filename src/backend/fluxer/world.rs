@@ -366,10 +366,14 @@ impl World {
             Kind::Notes => "Personal Notes".to_string(),
             Kind::Direct | Kind::Group if channel.name.is_empty() => {
                 let names: Vec<String> = channel.recipients.iter().filter(|r| **r != self.own_id).map(|r| self.name_in(None, r)).collect();
-                if names.is_empty() {
-                    "Direct message".to_string()
-                } else {
-                    names.join(", ")
+                match (channel.kind == Kind::Group, names.is_empty()) {
+                    (false, true) => "Direct message".to_string(),
+                    (false, false) => names.join(", "),
+                    // A group with nobody else left in it is still the account's until it leaves.
+                    (true, true) => "A group of just you".to_string(),
+                    // A group is named for everyone in it, the account too, so it is not taken for the direct message
+                    // with the same person.
+                    (true, false) => format!("{} and you", names.join(", ")),
                 }
             }
             _ => channel.name.clone(),

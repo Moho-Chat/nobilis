@@ -75,10 +75,96 @@ pub async fn leave_guild(state: &AppState, handle: &Handle, guild: &str) -> Resu
     {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         if world.guilds.get(guild).is_some_and(|g| g.owner == world.own_id) {
-            bail!("You own this community. Hand it to somebody else or delete it from Fluxer's own app if you mean to leave it");
+            bail!("You own this community. Hand it to somebody else in Fluxer's own app, or delete it from its settings here");
         }
     }
     handle.api.delete(&format!("/users/@me/guilds/{guild}")).await.map_err(|e| anyhow!("{e}"))?;
+    events::handle(state, handle, "GUILD_DELETE", &json!({ "id": guild }));
+    Ok(())
+}
+
+/// Makes a group with these people (all of them the account's friends, as Fluxer asks), and answers its buffer id.
+pub async fn create_group(state: &AppState, handle: &Handle, users: &[String]) -> Result<String> {
+    let users: Vec<&String> = users.iter().filter(|u| !u.is_empty()).collect();
+    if users.is_empty() {
+        bail!("Pick who the group is with");
+    }
+    let made = handle.api.gated(reqwest::Method::POST, "/users/@me/channels", &json!({ "recipients": users })).await.map_err(|e| match e.code() {
+        "GROUP_DM_RECIPIENTS_NOT_ADDABLE" => anyhow!("Fluxer will not put some of them in a group with you: only friends who allow it can be added"),
+        _ => anyhow!("{e}"),
+    })?;
+    let channel = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.put_channel(&made).and_then(|id| world.channels.get(&id).cloned())
+    }
+    .ok_or_else(|| anyhow!("Fluxer did not say where that group is"))?;
+    events::register_channel(state, handle, &channel, 0, None);
+    messages::buffer_of(state, &handle.account_id, &channel.id).map(|b| b.id).ok_or_else(|| anyhow!("the group did not come up"))
+}
+
+/// Puts somebody into a group, or takes them out of it (only the group's owner may take out anybody but themselves).
+pub async fn group_member(handle: &Handle, channel: &str, user: &str, add: bool) -> Result<()> {
+    let path = format!("/channels/{channel}/recipients/{user}");
+    let done = if add { handle.api.gated(reqwest::Method::PUT, &path, &json!({})).await } else { handle.api.delete(&path).await };
+    done.map(|_| ()).map_err(|e| match e.code() {
+        "NOT_FRIENDS_WITH_USER" => anyhow!("Only your friends can be added to a group"),
+        "MAX_GROUP_DM_RECIPIENTS" => anyhow!("This group is full"),
+        "MISSING_ACCESS" => anyhow!("Their settings do not let you add them to a group"),
+        _ => anyhow!("{e}"),
+    })
+}
+
+/// Closes a direct message (it only goes from this account's list, and comes back with the next message) or leaves a
+/// group (the others are told, and one of them owns it if this account did).
+pub async fn close_private(handle: &Handle, channel: &str) -> Result<()> {
+    handle.api.delete(&format!("/channels/{channel}")).await.map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Makes a community owned by this account, with Fluxer's starting channels (a `general` text and a `General` voice
+/// channel), and answers its id once the gateway has said it, so its conversations are there.
+pub async fn create_guild(handle: &Handle, name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        bail!("A community's name is 1 to 100 characters");
+    }
+    let made = handle.api.post("/guilds", &json!({ "name": name })).await.map_err(|e| match e.code() {
+        "MAX_GUILDS" => anyhow!("This account is in as many communities as Fluxer allows"),
+        "GUILD_CREATION_EMAIL_VERIFICATION_REQUIRED" => anyhow!("Fluxer wants this account's email address verified before it makes a community. Do that in Fluxer's own app"),
+        "UNCLAIMED_ACCOUNT_CANNOT_CREATE_GUILDS" => anyhow!("Fluxer lets an account make a community only once it has an email address. Add one in Fluxer's own app"),
+        _ => anyhow!("{e}"),
+    })?;
+    let id = made["id"].as_str().ok_or_else(|| anyhow!("Fluxer did not say which community it made"))?.to_string();
+    // GUILD_CREATE follows on the gateway with its channels; wait a little for it so the window can open it.
+    for _ in 0..50 {
+        if handle.world.lock().unwrap_or_else(|e| e.into_inner()).guilds.contains_key(&id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(id)
+}
+
+/// Deletes a community this account owns, for good. Fluxer asks for proof that it is the person: the account's
+/// password, or the code from its authenticator app when it has one.
+pub async fn delete_guild(state: &AppState, handle: &Handle, guild: &str, password: Option<&str>, code: Option<&str>) -> Result<()> {
+    {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let g = world.guilds.get(guild).ok_or_else(|| anyhow!("That community is not on this account"))?;
+        if g.owner != world.own_id {
+            bail!("Only the owner can delete a community");
+        }
+    }
+    let body = match (code.map(str::trim).filter(|c| !c.is_empty()), password.filter(|p| !p.is_empty())) {
+        (Some(code), _) => json!({ "mfa_method": "totp", "mfa_code": code }),
+        (None, Some(password)) => json!({ "password": password }),
+        (None, None) => json!({}),
+    };
+    handle.api.post(&format!("/guilds/{guild}/delete"), &body).await.map_err(|e| match (e.code(), e.field_code()) {
+        ("SUDO_MODE_REQUIRED", _) => anyhow!("Fluxer wants your password (or your authenticator's code) to delete a community"),
+        (_, Some("INVALID_PASSWORD" | "PASSWORD_INCORRECT")) => anyhow!("That password is not right"),
+        _ => anyhow!("{e}"),
+    })?;
     events::handle(state, handle, "GUILD_DELETE", &json!({ "id": guild }));
     Ok(())
 }

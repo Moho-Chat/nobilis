@@ -1718,6 +1718,78 @@ pub async fn dispatch(
         // with that person, while a list always makes a new group. A caller
         // that could not tell them apart would quietly create a duplicate
         // conversation every time it opened a one-to-one.
+        // Fluxer's groups answer to Discord's calls, which the window already makes for a group of friends.
+        "openDiscordGroupDm" | "addToDiscordGroupDm" | "removeFromDiscordGroupDm" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
+            let account_id = p_str(params, "accountId", "");
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            if method == "openDiscordGroupDm" {
+                let users: Vec<String> = params.get("userIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                return match backend::fluxer::people::create_group(state, &handle, &users).await {
+                    Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
+            let (Some(channel), Some(user)) = (p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).and_then(|b| b.remote_id), p_str_opt(params, "userId")) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\" and \"userId\"")));
+            };
+            match backend::fluxer::people::group_member(&handle, &channel, user, method == "addToDiscordGroupDm").await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A Fluxer community made by this account, or deleted by it (which Fluxer asks a password or a code for).
+        "createFluxerGuild" => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some("createFluxerGuild requires a connected Fluxer \"accountId\"".to_string()));
+            };
+            match backend::fluxer::people::create_guild(&handle, p_str(params, "name", "")).await {
+                Ok(guild) => {
+                    // Its first text channel, to open.
+                    let first = {
+                        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut text: Vec<_> = world.channels.values().filter(|c| c.guild.as_deref() == Some(guild.as_str()) && c.kind == backend::fluxer::world::Kind::Text).map(|c| (c.position, c.id.clone())).collect();
+                        text.sort();
+                        text.first().map(|(_, id)| id.clone())
+                    };
+                    let buffer = first.and_then(|c| backend::fluxer::messages::buffer_of(state, &handle.account_id, &c)).map(|b| b.id);
+                    (Some(serde_json::json!({ "groupId": backend::fluxer::events::rail_id(&handle.account_id, &guild), "bufferId": buffer })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+        "deleteFluxerGuild" => {
+            let Some((account_id, guild)) = p_str_opt(params, "groupId").and_then(|g| g.split_once("|guild:")) else {
+                return (None, Some("deleteFluxerGuild requires a community's \"groupId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match backend::fluxer::people::delete_guild(state, &handle, guild, p_str_opt(params, "password"), p_str_opt(params, "code")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Links to a community or a group that somebody sent this account, waiting in the invitations tile.
+        "fluxerInviteOffers" | "answerFluxerInvite" => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
+                return (None, Some(format!("{method} requires a connected Fluxer \"accountId\"")));
+            };
+            if method == "fluxerInviteOffers" {
+                return (Some(backend::fluxer::invites::offers(&handle)), None);
+            }
+            let Some(code) = p_str_opt(params, "code") else {
+                return (None, Some("answerFluxerInvite requires \"code\"".to_string()));
+            };
+            match backend::fluxer::invites::answer(state, &handle, code, p_bool(params, "accept", false)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "openDiscordGroupDm" => {
             let account_id = match p_str_opt(params, "accountId") {
                 Some(a) => a,
@@ -3900,6 +3972,17 @@ pub async fn dispatch(
                                 Ok(true) => return (Some(ok_node()), None),
                                 Ok(false) => {}
                                 Err(e) => return (None, Some(format!("{e:#}"))),
+                            }
+                        } else if buffer.account_id.starts_with("fluxer:") {
+                            // A direct message is closed and a group is left, at Fluxer; a guild's channel is only
+                            // stopped being shown here, since being in the guild is what puts it there.
+                            if let (Some(handle), Some(channel)) = (state.runtime.fluxer_handle(&buffer.account_id), buffer.remote_id.as_deref()) {
+                                let private = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get(channel).is_some_and(|c| matches!(c.kind, backend::fluxer::world::Kind::Direct | backend::fluxer::world::Kind::Group));
+                                if private {
+                                    if let Err(e) = backend::fluxer::people::close_private(&handle, channel).await {
+                                        return (None, Some(format!("{e:#}")));
+                                    }
+                                }
                             }
                         } else if buffer.kind == "dm" && buffer.account_id.starts_with("discord:") {
                             if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {

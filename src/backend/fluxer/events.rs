@@ -478,6 +478,44 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 redraw_guild(state, handle, c.guild.clone().as_deref(), Some(&c));
             }
         }
+        // Somebody came into a group or left it (or this account was taken out, which Fluxer says as a removal of its
+        // own id): the group's people, and its title when it has no name of its own.
+        "CHANNEL_RECIPIENT_ADD" | "CHANNEL_RECIPIENT_REMOVE" => {
+            let (Some(channel_id), Some(user)) = (data["channel_id"].as_str(), data["user"]["id"].as_str()) else { return };
+            let (channel, own) = {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((id, parsed)) = world::parse_user(&data["user"]) {
+                    world.users.entry(id).or_insert(parsed);
+                }
+                let own = world.own_id == user;
+                if let Some(c) = world.channels.get_mut(channel_id) {
+                    c.recipients.retain(|r| r != user);
+                    if kind == "CHANNEL_RECIPIENT_ADD" {
+                        c.recipients.push(user.to_string());
+                    }
+                }
+                if own && kind == "CHANNEL_RECIPIENT_REMOVE" {
+                    world.remove_channel(channel_id);
+                }
+                (world.channels.get(channel_id).cloned(), own)
+            };
+            match channel {
+                Some(c) if !own || kind == "CHANNEL_RECIPIENT_ADD" => {
+                    register_channel(state, handle, &c, 0, None);
+                    if let Some(buffer) = messages::buffer_of(state, account_id, channel_id) {
+                        let (state, handle) = (state.clone(), handle.clone());
+                        tokio::spawn(async move {
+                            let _ = super::members::refresh(&state, &handle, &buffer).await;
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(buffer) = messages::buffer_of(state, account_id, channel_id) {
+                        state.runtime.remove_buffer(state, &buffer.id);
+                    }
+                }
+            }
+        }
         "THREAD_DELETE" | "CHANNEL_DELETE" => {
             if let Some(id) = data["id"].as_str() {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).remove_channel(id);
@@ -551,6 +589,7 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                 }
             }
             register_guild_channels(state, handle, guild);
+            super::members::redraw_guild(state, handle, guild, None);
         }
         "GUILD_EMOJIS_UPDATE" => {
             let Some(guild) = data["guild_id"].as_str() else { return };
@@ -575,6 +614,9 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
             // The account's own roles or timeout changed what it may do.
             if own {
                 register_guild_channels(state, handle, guild);
+            }
+            if let Some(user) = data["user"]["id"].as_str() {
+                super::members::redraw_guild(state, handle, guild, Some(user));
             }
         }
         "GUILD_MEMBER_REMOVE" => {
