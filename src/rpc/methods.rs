@@ -3551,6 +3551,10 @@ pub async fn dispatch(
                 crate::audio::set_playback_muted(prefs.deafened);
                 backend::discord::announce_voice_flags(state, &account_id, mic_muted, prefs.deafened);
             }
+            // Fluxer calls are joined by the window, but what the others are told about them is said from here.
+            for handle in state.runtime.all_fluxer_handles() {
+                backend::fluxer::voice::say_state(&handle, prefs.mic_muted, prefs.deafened);
+            }
             state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
             (Some(serde_json::to_value(prefs).unwrap()), None)
         }
@@ -5358,7 +5362,7 @@ pub async fn dispatch(
         // a Matrix call on a media server), and who is in each channel's call.
         // Fluxer's calls answer to Stoat's calls (the window joins both on LiveKit the same way), and two of their own:
         // leaving, which Fluxer wants said on the gateway, and saying the microphone, camera and screen.
-        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
+        "declineStoatCall" | "joinStoatCall" | "leaveFluxerCall" | "fluxerVoiceState" | "fluxerStreamPreview" if p_str_opt(params, "bufferId").is_some_and(|b| b.starts_with("fluxer:")) => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
                 return (None, Some(format!("{method} requires a known \"bufferId\"")));
             };
@@ -5374,7 +5378,8 @@ pub async fn dispatch(
                     if let Some(why) = crate::net::route::router().call_refusal(&buffer.account_id) {
                         return (None, Some(why));
                     }
-                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false)).await {
+                    let prefs = state.voice_prefs.get();
+                    match backend::fluxer::voice::join(&handle, &buffer, p_bool(params, "video", false), prefs.mic_muted, prefs.deafened).await {
                         Ok(joined) => (Some(joined), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     }
@@ -5383,8 +5388,19 @@ pub async fn dispatch(
                     backend::fluxer::voice::leave(&handle);
                     (Some(ok_node()), None)
                 }
+                "fluxerStreamPreview" => {
+                    let Some(user) = p_str_opt(params, "userId") else {
+                        return (None, Some("fluxerStreamPreview requires \"userId\"".to_string()));
+                    };
+                    match backend::fluxer::voice::stream_preview(&handle, &buffer, user).await {
+                        Ok(url) => (Some(serde_json::json!({ "url": url })), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
                 _ => {
-                    backend::fluxer::voice::set_state(&handle, p_bool(params, "muted", false), p_bool(params, "camera", false), p_bool(params, "screen", false));
+                    // The microphone and hearing are the voice buttons', which this daemon holds; the window says the rest.
+                    let prefs = state.voice_prefs.get();
+                    backend::fluxer::voice::set_state(&handle, prefs.mic_muted, prefs.deafened, p_bool(params, "camera", false), p_bool(params, "screen", false));
                     (Some(ok_node()), None)
                 }
             }

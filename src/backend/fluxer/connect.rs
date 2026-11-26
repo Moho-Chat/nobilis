@@ -167,7 +167,7 @@ async fn run(state: &AppState, config: &FluxerAccountConfig, account_id: &str, r
         world.lock().unwrap_or_else(|e| e.into_inner()).users.insert(id, user);
     }
     let limits = instance.limits(if premium { &["premium"] } else { &[] });
-    let handle = Handle { account_id: account_id.to_string(), api: api.clone(), world: world.clone(), instance: instance.clone(), gateway, active: Arc::new(Mutex::new(HashSet::new())), limits: Arc::new(limits), slow: Arc::default(), notify: Arc::default(), voice: Arc::default(), voice_wait: Arc::default(), voice_here: Arc::default(), ringing: Arc::default() };
+    let handle = Handle { account_id: account_id.to_string(), api: api.clone(), world: world.clone(), instance: instance.clone(), gateway, active: Arc::new(Mutex::new(HashSet::new())), limits: Arc::new(limits), slow: Arc::default(), notify: Arc::default(), voice: Arc::default(), voice_wait: Arc::default(), voice_here: Arc::default(), voice_media: Arc::default(), ringing: Arc::default() };
 
     let can_resume = !resume.session_id.is_empty() && resume.dropped.is_some_and(|d| d.elapsed() < RESUMABLE_FOR);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(3600));

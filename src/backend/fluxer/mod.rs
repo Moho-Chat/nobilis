@@ -92,6 +92,8 @@ pub struct Handle {
     pub voice_wait: Arc<Mutex<Option<GrantWaiter>>>,
     /// The call this account is in from here: its guild, channel and voice connection.
     pub voice_here: Arc<Mutex<Option<VoicePlace>>>,
+    /// Whether this end's camera and shared screen are on in that call, so a mute can be said without turning them off.
+    pub voice_media: Arc<Mutex<(bool, bool)>>,
     /// The private conversations whose call is ringing this account.
     pub ringing: Arc<Mutex<HashSet<String>>>,
 }

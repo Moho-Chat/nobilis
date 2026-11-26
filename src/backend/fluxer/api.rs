@@ -229,6 +229,30 @@ impl Api {
         .await
     }
 
+    /// Something that answers in bytes rather than JSON (a stream's preview picture), with its content type; `None`
+    /// where there is nothing there (404). Asked once: a picture that is late is not worth a retry.
+    pub async fn get_bytes(&self, path: &str) -> Result<Option<(String, Vec<u8>)>, ApiError> {
+        if self.halted() {
+            return Err(ApiError::Unauthorized);
+        }
+        let key = route_key(&Method::GET, path);
+        self.pace(&key).await;
+        let response = self.authorize(self.http.get(format!("{}{path}", self.base))).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        self.learn(&key, response.headers());
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
+        if !(200..300).contains(&status) {
+            let text = response.text().await.unwrap_or_default();
+            let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return Err(ApiError::Refused { status, code: json["code"].as_str().unwrap_or("").to_string(), detail: json });
+        }
+        let bytes = response.bytes().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        Ok(Some((content_type, bytes.to_vec())))
+    }
+
     /// A message with files, as `multipart/form-data`: `payload_json` and `files[n]` (`http-api/index.md`).
     pub async fn multipart(&self, method: Method, path: &str, payload: &Value, files: &[(String, String, Vec<u8>)]) -> Result<Value, ApiError> {
         self.send(method, path, &[], None, |r| {

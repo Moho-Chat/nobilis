@@ -166,8 +166,9 @@ fn place_of(handle: &Handle, buffer: &Buffer) -> Result<(String, Option<String>,
 }
 
 /// Asks for a place in a call and answers what the window joins with: the LiveKit address, the token, and the room
-/// key where there is one. Starting a call in a direct message or a group rings the others.
-pub async fn join(handle: &Handle, buffer: &Buffer, video: bool) -> Result<Value> {
+/// key where there is one. Starting a call in a direct message or a group rings the others. It joins muted or deafened
+/// as the voice buttons stand, so the others never see a microphone that is not open.
+pub async fn join(handle: &Handle, buffer: &Buffer, video: bool, muted: bool, deafened: bool) -> Result<Value> {
     if !handle.instance.voice {
         bail!("This instance has calls turned off");
     }
@@ -175,7 +176,8 @@ pub async fn join(handle: &Handle, buffer: &Buffer, video: bool) -> Result<Value
     let (tx, rx) = tokio::sync::oneshot::channel();
     *handle.voice_wait.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     let started_empty = !handle.voice.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&channel);
-    let command = json!({ "op": 4, "d": { "guild_id": guild, "channel_id": channel, "self_mute": false, "self_deaf": false, "self_video": video, "self_stream": false } });
+    let command = json!({ "op": 4, "d": { "guild_id": guild, "channel_id": channel, "self_mute": muted || deafened, "self_deaf": deafened, "self_video": video, "self_stream": false } });
+    *handle.voice_media.lock().unwrap_or_else(|e| e.into_inner()) = (video, false);
     handle.gateway.send(command.to_string()).map_err(|_| anyhow!("the connection to Fluxer is not up"))?;
     let answer = tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow!("Fluxer did not answer with a way into the call"))?.map_err(|_| anyhow!("the connection to Fluxer went away"))?;
     let grant = answer.map_err(|words| anyhow!(words))?;
@@ -202,11 +204,40 @@ pub fn leave(handle: &Handle) {
     }
 }
 
-/// Says the microphone, camera and shared screen as they are now, so others see them.
-pub fn set_state(handle: &Handle, muted: bool, camera: bool, screen: bool) {
+/// Says the camera and shared screen as they are now, with the microphone and hearing as the voice buttons stand, so
+/// others see them.
+pub fn set_state(handle: &Handle, muted: bool, deafened: bool, camera: bool, screen: bool) {
+    *handle.voice_media.lock().unwrap_or_else(|e| e.into_inner()) = (camera, screen);
+    say_state(handle, muted, deafened);
+}
+
+/// Says a change of the voice buttons in the call this account is in, if it is in one; camera and screen stay as
+/// they were last said.
+pub fn say_state(handle: &Handle, muted: bool, deafened: bool) {
+    let (camera, screen) = *handle.voice_media.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((guild, channel, connection)) = handle.voice_here.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        let _ = handle.gateway.send(json!({ "op": 4, "d": { "guild_id": guild, "channel_id": channel, "connection_id": connection, "self_mute": muted, "self_deaf": false, "self_video": camera, "self_stream": screen } }).to_string());
+        let _ = handle.gateway.send(json!({ "op": 4, "d": { "guild_id": guild, "channel_id": channel, "connection_id": connection, "self_mute": muted || deafened, "self_deaf": deafened, "self_video": camera, "self_stream": screen } }).to_string());
     }
+}
+
+/// The picture Fluxer keeps of somebody's shared screen, as a data URL; `None` where they share none, or the sharer's
+/// app has not sent one yet. A stream is named by where it is and by the sharer's voice connection
+/// (`{guild}:{channel}:{connection}`, `dm` in place of a guild), as Fluxer's own app names it.
+pub async fn stream_preview(handle: &Handle, buffer: &Buffer, user: &str) -> Result<Option<String>> {
+    use base64::Engine;
+    let (channel, guild, _) = place_of(handle, buffer)?;
+    let connection = handle.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).and_then(|list| list.iter().find(|m| m.user == user && m.screen).map(|m| m.connection.clone()));
+    let Some(connection) = connection.filter(|c| !c.is_empty()) else { return Ok(None) };
+    let key = stream_key(guild.as_deref(), &channel, &connection);
+    let Some((content_type, bytes)) = handle.api.get_bytes(&format!("/streams/{key}/preview")).await.map_err(|e| anyhow!("{e}"))? else { return Ok(None) };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!("data:{content_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))))
+}
+
+fn stream_key(guild: Option<&str>, channel: &str, connection: &str) -> String {
+    format!("{}:{channel}:{connection}", guild.unwrap_or("dm"))
 }
 
 /// Stops a call ringing this account.
@@ -231,5 +262,11 @@ mod tests {
         let (gone, _) = parse_state(&json!({ "user_id": "5", "channel_id": null, "connection_id": "c1" })).unwrap();
         assert!(gone.is_none());
         assert!(parse_state(&json!({ "channel_id": "9" })).is_none());
+    }
+
+    #[test]
+    fn a_stream_is_named_as_fluxer_names_it() {
+        assert_eq!(stream_key(Some("1"), "2", "c3"), "1:2:c3");
+        assert_eq!(stream_key(None, "2", "c3"), "dm:2:c3");
     }
 }
