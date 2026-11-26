@@ -440,7 +440,7 @@ pub(super) fn encode_form(fields: &[(&str, &str)]) -> String {
 }
 
 /// Percent-encode for `application/x-www-form-urlencoded`.
-fn percent_encode(s: &str) -> String {
+pub(super) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {

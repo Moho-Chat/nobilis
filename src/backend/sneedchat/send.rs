@@ -18,11 +18,31 @@ pub struct ReplyTo {
 
 /// The body that goes out: the reply's quote, as the site's own client
 /// writes one, then what was typed.
+///
+/// A reply with nothing of theirs to quote - "Mention" on a name arms one with
+/// no message - is a mention instead: `@Name, ` at the front, the way people
+/// address each other in the room, unless the text already opens with them.
 pub(super) fn compose(body: &str, reply: Option<&ReplyTo>) -> String {
     let text = body.trim();
     match reply {
-        Some(r) => format!("{}{text}", protocol::reply_quote(&r.from, &r.id, &r.body)),
+        Some(r) => match protocol::reply_quote(&r.from, &r.id, &r.body) {
+            quote if !quote.is_empty() => format!("{quote}{text}"),
+            _ => addressed(&r.from, text),
+        },
         None => text.to_string(),
+    }
+}
+
+/// `text` opened with a mention of `name`, unless it already names them first.
+fn addressed(name: &str, text: &str) -> String {
+    let name = name.trim();
+    let lower = text.to_lowercase();
+    let at = format!("@{}", name.to_lowercase());
+    let already = lower.strip_prefix(&at).is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()));
+    if name.is_empty() || already {
+        text.to_string()
+    } else {
+        format!("@{name}, {text}")
     }
 }
 
@@ -538,8 +558,15 @@ mod tests {
         let reply = ReplyTo { from: "Ryo Ma".into(), id: "01A1".into(), body: "what's up".into() };
         assert_eq!(compose("not much", Some(&reply)), "[quote=\"Ryo Ma, chat_message: 01a1\"]what's up[/quote]\nnot much");
         assert_eq!(compose("  plain  ", None), "plain");
-        // Nothing of their own to quote: sent without a quote rather than not at all.
+        // Nothing of their own to quote ("Mention" on a name): they are named at the front instead.
         let empty = ReplyTo { from: "Ryo".into(), id: "x".into(), body: "".into() };
-        assert_eq!(compose("hi", Some(&empty)), "hi");
+        assert_eq!(compose("hi", Some(&empty)), "@Ryo, hi");
+        let mention = ReplyTo { from: "Ryo Ma".into(), id: "".into(), body: "".into() };
+        assert_eq!(compose(" hello ", Some(&mention)), "@Ryo Ma, hello");
+        // Already addressed by hand: not named twice. A longer name is not them.
+        assert_eq!(compose("@ryo ma: hello", Some(&mention)), "@ryo ma: hello");
+        assert_eq!(compose("@Ryo Max hi", Some(&mention)), "@Ryo Ma, @Ryo Max hi");
+        let nobody = ReplyTo { from: " ".into(), id: "".into(), body: "".into() };
+        assert_eq!(compose("hi", Some(&nobody)), "hi");
     }
 }
