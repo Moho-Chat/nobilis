@@ -9188,6 +9188,12 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("fluxer:") {
+                let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                    return (Some(serde_json::json!([])), None);
+                };
+                return (Some(backend::fluxer::send::list_stickers(&handle, &buffer)), None);
+            }
             let token = state.accounts.get_discord(&buffer.account_id).map(|c| c.token).unwrap_or_default();
             (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id, &token).await)), None)
         }
@@ -9214,10 +9220,46 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
+            if buffer.account_id.starts_with("fluxer:") {
+                return match backend::fluxer::send::send_sticker(state, &buffer, sticker_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
             match backend::discord::stickers::send(state, buffer_id, &cfg.token, sticker_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "startFluxerThread" => {
+            let (Some(buffer), Some(message_id)) = (p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)), p_str_opt(params, "messageId")) else {
+                return (None, Some("startFluxerThread requires \"bufferId\" and \"messageId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            let name = p_str(params, "name", "").trim();
+            if name.is_empty() {
+                return (None, Some("A thread needs a name".to_string()));
+            }
+            match backend::fluxer::threads::start_from(state, &handle, &buffer, message_id, name).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "setFluxerNote" => {
+            let (Some(account_id), Some(user_id)) = (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) else {
+                return (None, Some("setFluxerNote requires \"accountId\" and \"userId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.fluxer_handle(account_id) else {
+                return (None, Some("that Fluxer account is not connected".to_string()));
+            };
+            match backend::fluxer::profile::set_note(&handle, user_id, p_str(params, "note", "")).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }

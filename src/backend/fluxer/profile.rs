@@ -68,6 +68,9 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
             Some("None")
         };
         profile::set(&mut card, "relationship", relation.map(|r| json!(r)));
+        if target != world.own_id {
+            card["userNote"] = json!(world.notes.get(&target).cloned().unwrap_or_default());
+        }
     }
     let Ok(full) = handle.api.get(&format!("/users/{target}/profile"), &query).await else { return card };
     let user = &full["user"];
@@ -119,4 +122,17 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
         }
     }
     card
+}
+
+/// Sets or clears this account's private note on another Fluxer user (`PUT /users/@me/notes/{id}`).
+pub async fn set_note(handle: &super::Handle, user_id: &str, note: &str) -> anyhow::Result<()> {
+    let trimmed = note.trim();
+    handle.api.put(&format!("/users/@me/notes/{user_id}"), Some(&json!({ "note": trimmed }))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    if trimmed.is_empty() {
+        world.notes.remove(user_id);
+    } else {
+        world.notes.insert(user_id.to_string(), trimmed.to_string());
+    }
+    Ok(())
 }

@@ -234,6 +234,13 @@ pub struct Guild {
     pub features: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Sticker {
+    pub name: String,
+    pub animated: bool,
+    pub guild: String,
+}
+
 #[derive(Debug, Default)]
 pub struct World {
     pub own_id: String,
@@ -241,6 +248,9 @@ pub struct World {
     pub guilds: HashMap<String, Guild>,
     pub channels: HashMap<String, Channel>,
     pub emojis: HashMap<String, Emoji>,
+    pub stickers: HashMap<String, Sticker>,
+    /// Private notes this account wrote on other users (`READY.notes` + `USER_NOTE_UPDATE`).
+    pub notes: HashMap<String, String>,
     /// People this account has blocked, or who are friends (relationship type 2 and 1).
     pub blocked: HashSet<String>,
     pub friends: HashSet<String>,
@@ -306,6 +316,12 @@ impl World {
         for e in g["emojis"].as_array().into_iter().flatten() {
             if let Some(eid) = e["id"].as_str() {
                 self.emojis.insert(eid.to_string(), Emoji { name: e["name"].as_str().unwrap_or("emoji").to_string(), animated: e["animated"].as_bool().unwrap_or(false), guild: id.clone() });
+            }
+        }
+        self.stickers.retain(|_, s| s.guild != id);
+        for s in g["stickers"].as_array().into_iter().flatten() {
+            if let Some(sid) = s["id"].as_str() {
+                self.stickers.insert(sid.to_string(), Sticker { name: s["name"].as_str().unwrap_or("sticker").to_string(), animated: s["animated"].as_bool().unwrap_or(false), guild: id.clone() });
             }
         }
         self.guilds.insert(id.clone(), guild);

@@ -244,6 +244,13 @@ pub fn ready(state: &AppState, handle: &Handle, data: &Value) {
                 world.read.insert(id.to_string(), (r["last_message_id"].as_str().map(str::to_string), r["mention_count"].as_u64().unwrap_or(0)));
             }
         }
+        if let Some(notes) = data["notes"].as_object() {
+            for (uid, text) in notes {
+                if let Some(s) = text.as_str().filter(|s| !s.is_empty()) {
+                    world.notes.insert(uid.clone(), s.to_string());
+                }
+            }
+        }
     }
     register_all(state, handle);
     super::own::settings_changed(state, handle, &data["user_settings"]);
@@ -568,6 +575,30 @@ pub fn handle(state: &AppState, handle: &Handle, kind: &str, data: &Value) {
                     }
                 }
                 state.runtime.remove_buffer_group(state, &rail_id(account_id, id));
+            }
+        }
+        "USER_NOTE_UPDATE" => {
+            if let Some(uid) = data["id"].as_str() {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                match data["note"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(text) => {
+                        world.notes.insert(uid.to_string(), text.to_string());
+                    }
+                    None => {
+                        world.notes.remove(uid);
+                    }
+                }
+            }
+        }
+        "GUILD_STICKERS_UPDATE" => {
+            if let Some(guild) = data["guild_id"].as_str() {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                world.stickers.retain(|_, s| s.guild != guild);
+                for s in data["stickers"].as_array().into_iter().flatten() {
+                    if let Some(sid) = s["id"].as_str() {
+                        world.stickers.insert(sid.to_string(), world::Sticker { name: s["name"].as_str().unwrap_or("sticker").to_string(), animated: s["animated"].as_bool().unwrap_or(false), guild: guild.to_string() });
+                    }
+                }
             }
         }
         "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" | "GUILD_ROLE_UPDATE_BULK" => {

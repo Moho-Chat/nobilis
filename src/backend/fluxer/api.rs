@@ -79,6 +79,7 @@ pub fn words(status: u16, code: &str, detail: &Value) -> String {
         }
         ("GLOBAL_IP_BANNED" | "GLOBAL_IP_TEMPORARILY_BANNED", _) => "Fluxer is refusing this network. Fluxer's own app says why".to_string(),
         ("DATE_OF_BIRTH_REQUIRED", _) => "Fluxer wants this account's date of birth first. Enter it in Fluxer's own app".to_string(),
+        ("POLICY_ACCEPTANCE_REQUIRED" | "TERMS_OF_SERVICE_REQUIRED" | "MUST_ACCEPT_TERMS", _) => "Fluxer wants you to accept its updated terms first. Do it in Fluxer's own app".to_string(),
         ("SUDO_MODE_REQUIRED", _) => "Fluxer wants the password or a second factor again for this. Do it from Fluxer's own app".to_string(),
         ("ACCOUNT_LIMITED", _) => "Fluxer has limited this account, and will not allow that. Fluxer's own app says why".to_string(),
         ("SSO_REQUIRED", _) => "This instance signs people in through its own single sign-on, which moho does not do. Paste a token instead".to_string(),
@@ -337,6 +338,9 @@ mod tests {
         assert!(words(403, "MISSING_PERMISSIONS", &Value::Null).contains("permission"));
         assert!(words(404, "UNKNOWN_CHANNEL", &Value::Null).contains("not there"));
         assert!(words(403, "ACCOUNT_SUSPENDED_TEMPORARILY", &json!({ "notice": { "summary": "Suspended for a week." } })).starts_with("Suspended for a week."));
+        assert!(words(403, "DATE_OF_BIRTH_REQUIRED", &Value::Null).contains("date of birth"));
+        assert!(words(403, "POLICY_ACCEPTANCE_REQUIRED", &Value::Null).contains("terms"));
+        assert!(words(403, "SUDO_MODE_REQUIRED", &Value::Null).contains("password or a second factor"));
         assert_eq!(words(400, "SOMETHING_NEW", &json!({ "message": "Nope." })), "Fluxer refused that: Nope.");
         assert_eq!(words(418, "", &Value::Null), "Fluxer answered 418");
     }

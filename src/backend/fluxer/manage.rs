@@ -108,6 +108,9 @@ fn powers(handle: &Handle, guild: &str) -> Value {
         "permissions": has(world::MANAGE_ROLES),
         "webhooks": has(world::MANAGE_WEBHOOKS),
         "audit": has(world::VIEW_AUDIT_LOG),
+        "nickname": g.owner == world.own_id || has(world::CHANGE_NICKNAME),
+        "emojis": has(world::MANAGE_EXPRESSIONS) || has(world::CREATE_EXPRESSIONS),
+        "manageEmojis": has(world::MANAGE_EXPRESSIONS),
     })
 }
 
@@ -165,9 +168,14 @@ pub async fn overview(handle: &Handle, buffer: &Buffer) -> Result<Value> {
         .collect();
     let everyone = roles.as_array().into_iter().flatten().find(|r| r["id"].as_str() == Some(guild.as_str())).map(|r| world::mask(&r["permissions"])).unwrap_or(0);
     let icon = fresh["icon"].as_str().and_then(|h| media::asset_url(&handle.instance, "icons", &guild, h)).map(|u| media::cached(&handle.account_id, media::AVATARS, &u, None, Some("image/webp")));
+    let own_nick = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.guilds.get(&guild).and_then(|g| g.members.get(&world.own_id)).and_then(|m| m.nick.clone()).unwrap_or_default()
+    };
     Ok(json!({
         "serverId": guild,
         "name": fresh["name"], "description": fresh["description"].as_str().unwrap_or(""), "iconUrl": icon,
+        "ownNick": own_nick,
         "can": powers(handle, &guild),
         "categories": categories,
         "channels": listed,
@@ -453,6 +461,56 @@ pub async fn bans(handle: &Handle, buffer: &Buffer) -> Result<Value> {
     Ok(json!({ "bans": rows }))
 }
 
+/// Sets or clears this account's own nickname in the community (`PATCH /guilds/{id}/members/@me`).
+pub async fn set_nickname(handle: &Handle, buffer: &Buffer, nick: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    let trimmed = nick.trim();
+    let value = if trimmed.is_empty() { Value::Null } else { json!(trimmed.chars().take(32).collect::<String>()) };
+    handle.api.patch(&format!("/guilds/{guild}/members/@me"), &json!({ "nick": value })).await.map_err(fail)?;
+    let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    let own = world.own_id.clone();
+    if let Some(m) = world.guilds.get_mut(&guild).and_then(|g| g.members.get_mut(&own)) {
+        m.nick = if trimmed.is_empty() { None } else { Some(trimmed.chars().take(32).collect()) };
+    }
+    Ok(())
+}
+
+/// Custom emoji in this community.
+pub async fn emojis(handle: &Handle, buffer: &Buffer) -> Result<Value> {
+    let guild = guild_of(handle, buffer)?;
+    let list = handle.api.get(&format!("/guilds/{guild}/emojis"), &[]).await.map_err(fail)?;
+    let rows: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let id = e["id"].as_str()?;
+            let name = e["name"].as_str().unwrap_or("emoji");
+            let animated = e["animated"].as_bool().unwrap_or(false);
+            let url = media::emoji_url(&handle.instance, id, animated).map(|u| media::cached(&handle.account_id, media::MEDIA, &u, None, Some(if animated { "image/gif" } else { "image/webp" })));
+            Some(json!({ "id": id, "name": name, "animated": animated, "url": url }))
+        })
+        .collect();
+    Ok(json!({ "emojis": rows }))
+}
+
+/// Uploads a custom emoji to the community (`POST /guilds/{id}/emojis`).
+pub async fn create_emoji(handle: &Handle, buffer: &Buffer, name: &str, path: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    let name: String = name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+    if name.len() < 2 {
+        bail!("An emoji name needs at least two letters, digits or underscores");
+    }
+    let image = data_uri(path).await?;
+    handle.api.post(&format!("/guilds/{guild}/emojis"), &json!({ "name": name, "image": image })).await.map(|_| ()).map_err(fail)
+}
+
+/// Deletes a custom emoji from the community (`DELETE /guilds/{id}/emojis/{emoji}`).
+pub async fn delete_emoji(handle: &Handle, buffer: &Buffer, emoji_id: &str) -> Result<()> {
+    let guild = guild_of(handle, buffer)?;
+    handle.api.delete(&format!("/guilds/{guild}/emojis/{emoji_id}")).await.map(|_| ()).map_err(fail)
+}
+
 pub async fn run(handle: &Handle, buffer: &Buffer, action: &str, p: &Value) -> Result<Value> {
     let text = |k: &str| p[k].as_str();
     let id = |k: &str| p[k].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("{action} needs \"{k}\""));
@@ -473,6 +531,10 @@ pub async fn run(handle: &Handle, buffer: &Buffer, action: &str, p: &Value) -> R
         "setChannelPermissions" => set_channel_permissions(handle, buffer, id("channelId")?, text("roleId").filter(|r| !r.is_empty()), &names_in(&p["allow"]), &names_in(&p["deny"])).await?,
         "invites" => return invites(handle, buffer).await,
         "bans" => return bans(handle, buffer).await,
+        "emojis" => return emojis(handle, buffer).await,
+        "setNickname" => set_nickname(handle, buffer, text("nick").unwrap_or("")).await?,
+        "createEmoji" => create_emoji(handle, buffer, text("name").unwrap_or(""), id("path")?).await?,
+        "deleteEmoji" => delete_emoji(handle, buffer, id("emojiId")?).await?,
         "deleteInvite" => {
             handle.api.delete(&format!("/invites/{}", id("code")?)).await.map_err(fail)?;
         }
