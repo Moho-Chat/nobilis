@@ -425,7 +425,7 @@ pub fn permalinks(server: &str, text: &str) -> Vec<String> {
                 out.push(id);
             }
         }
-        rest = &after[..];
+        rest = after;
         if rest.is_empty() {
             break;
         }
