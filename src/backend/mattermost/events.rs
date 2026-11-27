@@ -527,6 +527,29 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) -> Outcome {
                 people::status_changed(state, handle, &id, "");
             }
         }
+        // A role's permissions changed (a channel made read-only, a team's rights changed): every conversation is told
+        // again whether it may be written in.
+        "role_updated" => {
+            let role = inner(data, "role");
+            if let Some(name) = role["name"].as_str() {
+                let held = {
+                    let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                    let held = world.role_permissions.contains_key(name);
+                    if held {
+                        world.role_permissions.insert(name.to_string(), role["permissions"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect());
+                    }
+                    held
+                };
+                if held {
+                    register_all(state, handle);
+                }
+            }
+        }
+        // A channel given a scheme of its own (its moderation): its membership's roles are read again.
+        "channel_scheme_updated" => {
+            let channel = channel_of();
+            later(state, handle, move |state, handle| async move { fetch_channel(&state, &handle, &channel).await });
+        }
         "emoji_added" => {
             let e = inner(data, "emoji");
             if let (Some(name), Some(id)) = (e["name"].as_str(), e["id"].as_str()) {
