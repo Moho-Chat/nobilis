@@ -4673,6 +4673,11 @@ impl Runtime {
         self.mattermost_handles.lock().unwrap().remove(account_id);
     }
 
+    /// Every connected Mattermost account.
+    pub fn all_mattermost_handles(&self) -> Vec<crate::backend::mattermost::Handle> {
+        self.mattermost_handles.lock().unwrap().values().cloned().collect()
+    }
+
     pub fn mattermost_handle(&self, account_id: &str) -> Option<crate::backend::mattermost::Handle> {
         self.mattermost_handles.lock().unwrap().get(account_id).cloned()
     }

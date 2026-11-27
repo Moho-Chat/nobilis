@@ -3355,6 +3355,7 @@ pub async fn dispatch(
                     })
                 })
                 .chain(state.runtime.all_stoat_handles().into_iter().flat_map(|h| backend::stoat::events::ringing(state, &h)))
+                .chain(state.runtime.all_mattermost_handles().into_iter().flat_map(|h| backend::mattermost::calls::ringing(state, &h)))
                 .chain(state.runtime.all_fluxer_handles().into_iter().flat_map(|h| backend::fluxer::voice::ringing(state, &h)))
                 .collect();
             (Some(Value::Array(calls)), None)
@@ -5683,6 +5684,13 @@ pub async fn dispatch(
                 }
             }
         }
+        "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("mattermost:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.mattermost_handle(a)) else {
+                return (None, Some("listStoatVoice requires a connected \"accountId\"".to_string()));
+            };
+            let map: serde_json::Map<String, serde_json::Value> = backend::mattermost::calls::all_members(state, &handle).into_iter().collect();
+            (Some(serde_json::Value::Object(map)), None)
+        }
         "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
             let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
                 return (None, Some("that Fluxer account is not connected".to_string()));
@@ -5957,6 +5965,37 @@ pub async fn dispatch(
                         handle.api.put(&format!("/api/v4/users/{own}/preferences"), &serde_json::json!([{ "user_id": own, "category": "display_settings", "name": "collapsed_reply_threads", "value": if on { "on" } else { "off" } }])).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                         handle.world.lock().unwrap_or_else(|e| e.into_inner()).collapsed_choice = Some(on);
                         backend::mattermost::events::register_all(state, &handle);
+                        serde_json::json!({ "ok": true })
+                    }
+                    // A call (backend/mattermost/calls.rs): the window's peer connection says what it has to say through
+                    // these, and hears the server's side as `mattermostCallSignal`.
+                    "callJoin" => backend::mattermost::calls::join(state, &handle, &need_buffer()?).await?,
+                    "callDecline" => {
+                        backend::mattermost::calls::decline(state, &handle, &need_buffer()?).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "callHost" => {
+                        backend::mattermost::calls::host(&handle, &need_buffer()?, p_str(params, "do", ""), p_str_opt(params, "sessionId")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "callSdp" | "callIce" | "callMute" | "callScreen" | "callHand" | "callReact" | "callLeave" => {
+                        use backend::mattermost::calls::Say;
+                        let buffer = need_buffer()?;
+                        let said = match action {
+                            "callSdp" => Say::Sdp(p_str(params, "sdp", "").to_string()),
+                            "callIce" => Say::Ice(p_str(params, "candidate", "").to_string()),
+                            "callMute" => Say::Action(if p_bool(params, "muted", true) { "mute" } else { "unmute" }, serde_json::json!({})),
+                            "callScreen" if p_bool(params, "on", true) => Say::Action("screen_on", serde_json::json!({ "data": serde_json::json!({ "screenStreamID": p_str(params, "streamId", "") }).to_string() })),
+                            "callScreen" => Say::Action("screen_off", serde_json::json!({})),
+                            "callHand" => Say::Action(if p_bool(params, "raised", true) { "raise_hand" } else { "unraise_hand" }, serde_json::json!({})),
+                            "callReact" => {
+                                let name = backend::mattermost::emoji::wire_name(p_str(params, "emoji", ""));
+                                let unicode = backend::mattermost::emoji::char_of(&name).map(|c| c.chars().map(|ch| format!("{:x}", ch as u32)).collect::<Vec<_>>().join("-")).unwrap_or_default();
+                                Say::Action("react", serde_json::json!({ "data": serde_json::json!({ "name": name, "unified": unicode, "literal": "" }).to_string() }))
+                            }
+                            _ => Say::Leave,
+                        };
+                        backend::mattermost::calls::say(&buffer.id, said)?;
                         serde_json::json!({ "ok": true })
                     }
                     other => anyhow::bail!("there is no Mattermost action called {other}"),

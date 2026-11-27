@@ -28,6 +28,15 @@ pub fn buffer_of(state: &AppState, account_id: &str, channel_id: &str) -> Option
 /// What a system post says, where the server left its words empty.
 pub fn system_text(world: &World, style: &str, post: &Value) -> String {
     let said = post["message"].as_str().unwrap_or("").trim();
+    if post["type"].as_str().is_some_and(|t| t.starts_with("custom_calls")) {
+        let who = world.name_of(post["user_id"].as_str().unwrap_or(""), style);
+        let ended = post["props"]["end_at"].as_i64().unwrap_or(0) > 0;
+        return match (said, ended) {
+            ("", false) => format!("{who} started a call"),
+            ("", true) => "The call ended".to_string(),
+            (s, _) => s.to_string(),
+        };
+    }
     if !said.is_empty() {
         return said.to_string();
     }
@@ -312,7 +321,9 @@ pub fn shape(handle: &Handle, post: &Value) -> Shaped {
     let props = &post["props"];
     let metadata = &post["metadata"];
     let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
-    let system = post["type"].as_str().is_some_and(|t| t.starts_with("system_"));
+    // The channel speaking, and the Calls plugin's own posts (a call started, ended, recorded), which carry a card that only
+    // repeats their words.
+    let system = post["type"].as_str().is_some_and(|t| t.starts_with("system_") || t.starts_with("custom_calls"));
     if system {
         let text = system_text(&world, &style, post);
         return Shaped { from: "Mattermost".into(), avatar: None, body: text, html: None, attachments: Vec::new(), embeds: Vec::new(), reactions: Vec::new(), badges: Vec::new(), highlight: false, system: true };
