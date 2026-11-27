@@ -184,18 +184,20 @@ pub fn parse_server_info(server_url: &str, info_json: &Value, settings_json: &Va
                         }
                     }
                 }
-                other if other.starts_with("SAML_Custom_") && other.ends_with("_enabled") => {
-                    if val.as_bool().unwrap_or(false) {
-                        let name = other
-                            .trim_start_matches("SAML_Custom_")
-                            .trim_end_matches("_enabled")
-                            .to_string();
-                        out.sso_providers.push(SsoProvider {
-                            id: format!("saml:{name}"),
-                            name: format!("SAML ({name})"),
-                            kind: "saml".to_string(),
-                        });
-                    }
+                other
+                    if other.starts_with("SAML_Custom_")
+                        && other.ends_with("_enabled")
+                        && val.as_bool().unwrap_or(false) =>
+                {
+                    let name = other
+                        .trim_start_matches("SAML_Custom_")
+                        .trim_end_matches("_enabled")
+                        .to_string();
+                    out.sso_providers.push(SsoProvider {
+                        id: format!("saml:{name}"),
+                        name: format!("SAML ({name})"),
+                        kind: "saml".to_string(),
+                    });
                 }
                 _ => {}
             }

@@ -325,7 +325,7 @@ pub fn decrypt_message_cbc(ks: &[u8], ciphertext_with_key_id: &str) -> Result<Va
     } else {
         anyhow::bail!("unsupported AES-CBC key length {}", ks.len());
     };
-    Ok(serde_json::from_slice(&pt).context("parsing decrypted AES-CBC JSON")?)
+    serde_json::from_slice(&pt).context("parsing decrypted AES-CBC JSON")
 }
 
 /// Encrypt a plaintext payload in Rocket.Chat's modern AES-256-GCM mode (`rc.v2.aes-sha2`).
@@ -358,7 +358,7 @@ pub fn decrypt_message_v2(ks: &[u8], iv_b64: &str, ciphertext_b64: &str) -> Resu
     let pt = cipher
         .decrypt(Nonce::from_slice(&iv), ct.as_ref())
         .map_err(|_| anyhow!("AES-GCM v2 decryption failed"))?;
-    Ok(serde_json::from_slice(&pt).context("parsing decrypted AES-GCM v2 JSON")?)
+    serde_json::from_slice(&pt).context("parsing decrypted AES-GCM v2 JSON")
 }
 
 /// Decrypt a combined `base64(iv_12 || ct_tag)` AES-GCM ciphertext (compat fallback).
@@ -375,7 +375,7 @@ pub fn decrypt_message_gcm(ks: &[u8], ciphertext_b64: &str) -> Result<Value> {
     let pt = cipher
         .decrypt(Nonce::from_slice(iv), ct)
         .map_err(|_| anyhow!("AES-GCM decryption failed"))?;
-    Ok(serde_json::from_slice(&pt).context("parsing decrypted AES-GCM JSON")?)
+    serde_json::from_slice(&pt).context("parsing decrypted AES-GCM JSON")
 }
 
 /// WebCrypto-compatible AES-256-CTR (`length: 64`: first 8 bytes fixed nonce, last 8 bytes big-endian counter).

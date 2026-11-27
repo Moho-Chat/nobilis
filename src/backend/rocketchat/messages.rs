@@ -62,7 +62,7 @@ pub fn extract_reactions(msg: &Value, own_username: &str) -> Vec<Reaction> {
         if users.is_empty() {
             continue;
         }
-        let me = users.iter().any(|u| *u == own_username);
+        let me = users.contains(&own_username);
         out.push(Reaction {
             emoji: emoji.clone(),
             count: users.len() as i64,
