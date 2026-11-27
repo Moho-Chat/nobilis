@@ -1,9 +1,11 @@
 //! People: who is in a channel and who is online, the card for a person, the account's own status and profile, and a
 //! direct message opened with somebody.
 //!
-//! Mattermost tells a client of status changes as they happen (`status_change`), for everybody, and answers for many
-//! people at once (`/users/status/ids`). A status is `online`, `away`, `dnd` or `offline`; somebody may put an emoji and
-//! a few words beside it for a while (a custom status).
+//! Mattermost tells a client of its own status changes as they happen (`status_change`), and of nobody else's: those it
+//! answers for many people at once (`/users/status/ids`), and its own app asks once a minute for the people it shows.
+//! So does this: the people of the member list the window opened last, and those of every direct and group message.
+//! A status is `online`, `away`, `dnd` or `offline`; somebody may put an emoji and a few words beside it for a while (a
+//! custom status).
 
 use super::world::User;
 use super::{emoji, events, media, messages, Handle};
@@ -104,19 +106,58 @@ pub async fn refresh_members(state: &AppState, handle: &Handle, buffer: &Buffer)
     Ok(total)
 }
 
-/// Asks for many people's status at once and keeps it.
-async fn statuses_of(handle: &Handle, ids: &[String]) {
+/// Asks for many people's status at once and keeps it; says whose differs from what was kept, with the new one.
+async fn statuses_of(handle: &Handle, ids: &[String]) -> Vec<(String, String)> {
+    let mut changed = Vec::new();
     for chunk in ids.chunks(500) {
         if let Ok(list) = handle.api.post("/api/v4/users/status/ids", &json!(chunk)).await {
             let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
             for s in list.as_array().into_iter().flatten() {
                 if let (Some(id), Some(status)) = (s["user_id"].as_str(), s["status"].as_str()) {
                     if let Some(u) = world.users.get_mut(id) {
+                        if u.status != status {
+                            changed.push((id.to_string(), status.to_string()));
+                        }
                         u.status = status.to_string();
                     }
                 }
             }
         }
+    }
+    changed
+}
+
+/// The window opened this conversation's member list: its people are the ones whose statuses are kept up.
+pub fn watch_members(handle: &Handle, buffer_id: &str) {
+    handle.world.lock().unwrap_or_else(|e| e.into_inner()).watched = Some(buffer_id.to_string());
+}
+
+/// The people whose statuses are asked after every minute: those of the member list opened last, and those in the
+/// account's direct and group messages (the sidebar shows theirs).
+fn shown_people(state: &AppState, handle: &Handle) -> Vec<String> {
+    let own = handle.own_id();
+    let (watched, mut ids): (Option<String>, Vec<String>) = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let partners = world.channels.values().filter_map(|c| c.other(&own)).collect();
+        (world.watched.clone(), partners)
+    };
+    if let Some(list) = watched.and_then(|b| state.runtime.get_presence(&b)) {
+        ids.extend(list.as_array().into_iter().flatten().filter_map(|m| m["userId"].as_str().map(str::to_string)));
+    }
+    ids.retain(|id| *id != own);
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Asks after the statuses the window shows, and tells it of those that changed.
+pub async fn poll_statuses(state: &AppState, handle: &Handle) {
+    let ids = shown_people(state, handle);
+    if ids.is_empty() {
+        return;
+    }
+    for (id, status) in statuses_of(handle, &ids).await {
+        status_changed(state, handle, &id, &status);
     }
 }
 

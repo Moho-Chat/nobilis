@@ -2396,6 +2396,7 @@ pub async fn dispatch(
                     },
                     Some(buffer) if buffer.account_id.starts_with("mattermost:") => match state.runtime.mattermost_handle(&buffer.account_id) {
                         Some(handle) => {
+                            backend::mattermost::people::watch_members(&handle, &buffer.id);
                             let state = state.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = backend::mattermost::people::refresh_members(&state, &handle, &buffer).await {

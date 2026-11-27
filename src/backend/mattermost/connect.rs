@@ -7,7 +7,8 @@
 //! which names the connection, and the events after it, each numbered (`seq`). A reconnect asks for the same connection
 //! and the number after the last one heard; if the server answers `hello` with the same connection id, everything
 //! missed is replayed and nothing has to be loaded again. A ping goes every thirty seconds, as Mattermost's own app sends
-//! one; a connection that has heard nothing for ninety is let go and made again.
+//! one (and with every other one, the statuses the window shows are asked after); a connection that has heard nothing
+//! for ninety is let go and made again.
 
 use super::api::{Api, ApiError};
 use super::world::{ServerInfo, World};
@@ -28,6 +29,9 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 const SILENT_FOR: Duration = Duration::from_secs(90);
 /// How many pings go between asking whether the session still is one (every five minutes).
 const SESSION_CHECK_PINGS: u64 = 10;
+/// How many pings go between asking after the statuses the window shows (every minute, as Mattermost's own app does:
+/// the server tells nobody else's).
+const STATUS_POLL_PINGS: u64 = 2;
 
 /// How a connection ended.
 #[derive(Debug, PartialEq)]
@@ -228,6 +232,10 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
                 pings += 1;
                 if api.halted() || (pings.is_multiple_of(SESSION_CHECK_PINGS) && matches!(api.get("/api/v4/users/me", &[]).await, Err(ApiError::Unauthorized))) {
                     break Ending::SignInAgain("Mattermost has ended this session".to_string());
+                }
+                if pings.is_multiple_of(STATUS_POLL_PINGS) {
+                    let (state, handle) = (state.clone(), handle.clone());
+                    tokio::spawn(async move { super::people::poll_statuses(&state, &handle).await });
                 }
                 seq += 1;
                 sink.send(Ws::text(json!({ "seq": seq, "action": "ping" }).to_string())).await.context("pinging")?;

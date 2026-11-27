@@ -282,6 +282,8 @@ pub struct World {
     pub replies: HashMap<String, i64>,
     /// The account's own choice of collapsed threads (its `display_settings` preference), where the server leaves it.
     pub collapsed_choice: Option<bool>,
+    /// The conversation whose member list the window opened last: its people's statuses are asked after every minute.
+    pub watched: Option<String>,
 }
 
 impl World {
