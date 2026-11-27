@@ -132,6 +132,14 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_fluxer(id) {
             backend::fluxer::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("mattermost:") {
+        if let Some(cfg) = state.accounts.get_mattermost(id) {
+            backend::mattermost::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("rocketchat:") {
+        if let Some(cfg) = state.accounts.get_rocketchat(id) {
+            backend::rocketchat::spawn(state.clone(), cfg);
+        }
     } else if id.starts_with("signal:") {
         // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
         // where an account set to strict Tor stayed on its direct connection).
@@ -167,6 +175,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
         "addFluxerAccount" | "addFluxerAccountToken" => Some("fluxer"),
+        "addMattermostAccount" | "addMattermostAccountToken" => Some("mattermost"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -595,8 +604,10 @@ pub async fn dispatch(
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
                 { "id": "fluxer", "name": "Fluxer", "available": true },
+                { "id": "mattermost", "name": "Mattermost", "available": true },
                 { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
+                { "id": "rocketchat", "name": "Rocket.Chat", "available": true },
             ])),
             None,
         ),
@@ -698,6 +709,23 @@ pub async fn dispatch(
                             let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
                             if let Err(e) = backend::fluxer::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("fluxer history: {e:#}");
+                            }
+                        }
+                    }
+                    // Mattermost's history is paged by post id, going back from the oldest held.
+                    if buffer.account_id.starts_with("mattermost:") {
+                        if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) {
+                            let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
+                            if let Err(e) = backend::mattermost::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
+                                tracing::debug!("mattermost history: {e:#}");
+                            }
+                        }
+                    }
+                    if buffer.account_id.starts_with("rocketchat:") {
+                        if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                            let before_ts = if before > 0 { Some(before) } else { None };
+                            if let Err(e) = backend::rocketchat::messages::history(state, &handle, &buffer, before_ts).await {
+                                tracing::debug!("rocketchat history: {e:#}");
                             }
                         }
                     }
@@ -1012,6 +1040,9 @@ pub async fn dispatch(
                 let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
                 // The same for Fluxer: only a session moho made is ended there.
                 let fluxer_session = state.accounts.get_fluxer(id).filter(|a| a.made_here && !a.token.is_empty());
+                // A Mattermost session made here is ended at the server; a personal access token is left alone.
+                let mattermost_account = state.accounts.get_mattermost(id);
+                let rocketchat_session = state.accounts.get_rocketchat(id).filter(|a| a.made_here && !a.auth_token.is_empty());
                 // A Signal device is taken off the account at Signal, and its file deleted.
                 let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
@@ -1033,6 +1064,22 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_fluxer_handle(id);
+                        if let Some(config) = mattermost_account {
+                            tokio::spawn(async move { backend::mattermost::login::end_session(&config).await });
+                        }
+                        state.runtime.clear_mattermost_handle(id);
+                        if let Some(config) = rocketchat_session {
+                            tokio::spawn(async move {
+                                let api = backend::rocketchat::api::Api::new(
+                                    &config.account_id(),
+                                    &config.server_url,
+                                    Some(config.user_id.clone()),
+                                    Some(config.auth_token.clone()),
+                                );
+                                let _ = backend::rocketchat::login::logout(&api).await;
+                            });
+                        }
+                        state.runtime.clear_rocketchat_handle(id);
                         if let Some(config) = signal_account {
                             backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
@@ -1063,6 +1110,12 @@ pub async fn dispatch(
             Some(id) => {
                 let connect = p_bool(params, "connected", true);
                 if connect {
+                    if !state.accounts.has_account(id) {
+                        return (None, Some("no such account".to_string()));
+                    }
+                    if let Err(e) = state.accounts.set_disconnected(id, false) {
+                        return (None, Some(format!("{e:#}")));
+                    }
                     if id.starts_with("discord:") {
                         match state.accounts.get_discord(id) {
                             Some(cfg) => {
@@ -1111,6 +1164,30 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("telegram:") {
+                        match state.accounts.get_telegram(id) {
+                            Some(cfg) => {
+                                backend::telegram::connect::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("stoat:") {
+                        match state.accounts.get_stoat(id) {
+                            Some(cfg) => {
+                                backend::stoat::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("fluxer:") {
+                        match state.accounts.get_fluxer(id) {
+                            Some(cfg) => {
+                                backend::fluxer::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else if id.starts_with("signal:") {
                         match state.accounts.get_signal(id) {
                             Some(cfg) => {
@@ -1127,6 +1204,22 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("mattermost:") {
+                        match state.accounts.get_mattermost(id) {
+                            Some(cfg) => {
+                                backend::mattermost::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("rocketchat:") {
+                        match state.accounts.get_rocketchat(id) {
+                            Some(cfg) => {
+                                backend::rocketchat::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else {
                         match state.accounts.get_irc(id) {
                             Some(cfg) => {
@@ -1136,6 +1229,14 @@ pub async fn dispatch(
                             None => (None, Some("no such account".to_string())),
                         }
                     }
+                } else if state.accounts.has_account(id) {
+                    if let Err(e) = state.accounts.set_disconnected(id, true) {
+                        return (None, Some(format!("{e:#}")));
+                    }
+                    if !state.runtime.disconnect(state, id) {
+                        state.runtime.set_conn_state(state, id, crate::runtime::ConnState::Disconnected, None);
+                    }
+                    (Some(ok_node()), None)
                 } else if state.runtime.disconnect(state, id) {
                     (Some(ok_node()), None)
                 } else {
@@ -1297,6 +1398,16 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             }
+            // A Mattermost team (by name or invite link) or channel (`team/channel`, or a channel's name in any team).
+            if id.starts_with("mattermost:") {
+                let Some(handle) = state.runtime.mattermost_handle(id) else {
+                    return (None, Some("that Mattermost account is not connected".to_string()));
+                };
+                return match backend::mattermost::manage::join(state, &handle, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             // A Fluxer guild too.
             if id.starts_with("fluxer:") {
                 let Some(handle) = state.runtime.fluxer_handle(id) else {
@@ -1400,6 +1511,22 @@ pub async fn dispatch(
                     if typing {
                         if let Err(e) = backend::fluxer::send::typing(state, &buffer).await {
                             tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => {
+                    if typing {
+                        if let Err(e) = backend::mattermost::send::typing(state, &buffer, p_str_opt(params, "threadId")) {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                        if let Err(e) = backend::rocketchat::send::send_typing(&handle, &buffer, typing) {
+                            tracing::debug!("rocketchat sendTyping: {e}");
                         }
                     }
                     (Some(ok_node()), None)
@@ -1566,6 +1693,7 @@ pub async fn dispatch(
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "fluxer" => backend::fluxer::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "mattermost" => backend::mattermost::people::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "signal" => backend::signal::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
@@ -1593,6 +1721,12 @@ pub async fn dispatch(
                     Ok(messages) => messages,
                     Err(e) => return (None, Some(format!("{e:#}"))),
                 }
+            } else if let Some(handle) = state.runtime.mattermost_handle(&account_id).filter(|_| account_id.starts_with("mattermost:")) {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
+                return match backend::mattermost::messages::thread(state, &handle, &buffer, root_id).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
             } else if account_id.starts_with("telegram:") {
                 let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
                 return match backend::telegram::threads::fetch(state, &buffer, root_id).await {
@@ -1671,6 +1805,20 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => {
                     if let Err(e) = backend::fluxer::send::mark_read(state, &buffer).await {
                         tracing::debug!("fluxer read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => {
+                    if let Err(e) = backend::mattermost::send::mark_read(state, &buffer).await {
+                        tracing::debug!("mattermost read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                        if let Err(e) = backend::rocketchat::send::mark_read(state, &handle, &buffer).await {
+                            tracing::debug!("rocketchat read position: {e}");
+                        }
                     }
                     (Some(ok_node()), None)
                 }
@@ -2206,6 +2354,13 @@ pub async fn dispatch(
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
             } else if let Some(handle) = state.runtime.fluxer_handle(account_id).filter(|_| account_id.starts_with("fluxer:")) {
                 backend::fluxer::own::apply_status(&handle, status, text.as_deref()).await
+            } else if let Some(handle) = state.runtime.mattermost_handle(account_id).filter(|_| account_id.starts_with("mattermost:")) {
+                match backend::mattermost::people::apply_status(&handle, status, text.as_deref()).await {
+                    Ok(()) => true,
+                    Err(e) => return (None, Some(format!("{e:#}"))),
+                }
+            } else if let Some(handle) = state.runtime.rocketchat_handle(account_id).filter(|_| account_id.starts_with("rocketchat:")) {
+                backend::rocketchat::profile::set_status(&handle, status, text.as_deref()).await.is_ok()
             } else if account_id.starts_with("telegram:") {
                 // Online or not, which is all Telegram shows; recorded above for the next connection either way.
                 backend::telegram::account::presence_changed(state, account_id)
@@ -2268,6 +2423,12 @@ pub async fn dispatch(
                     let shown = shown.clone();
                     tokio::spawn(async move { backend::fluxer::own::apply_status(&handle, &shown, None).await });
                     true
+                } else if let Some(handle) = state.runtime.mattermost_handle(id).filter(|_| id.starts_with("mattermost:")) {
+                    let shown = shown.clone();
+                    tokio::spawn(async move {
+                        let _ = backend::mattermost::people::apply_status(&handle, &shown, None).await;
+                    });
+                    true
                 } else if id.starts_with("telegram:") {
                     backend::telegram::account::presence_changed(state, id)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
@@ -2317,6 +2478,19 @@ pub async fn dispatch(
                             tokio::spawn(async move {
                                 if let Err(e) = backend::stoat::members::refresh(&state, &handle, &buffer).await {
                                     tracing::debug!("stoat members: {e}");
+                                }
+                            });
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(buffer) if buffer.account_id.starts_with("mattermost:") => match state.runtime.mattermost_handle(&buffer.account_id) {
+                        Some(handle) => {
+                            backend::mattermost::people::watch_members(&handle, &buffer.id);
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backend::mattermost::people::refresh_members(&state, &handle, &buffer).await {
+                                    tracing::debug!("mattermost members: {e}");
                                 }
                             });
                             true
@@ -2780,6 +2954,14 @@ pub async fn dispatch(
             // And whatever this channel's bots offer, which only Discord has.
             // Its own search does the matching, so a query no built-in
             // answers can still be answered here.
+            // And what the Mattermost team's integrations offer, from the server's own list.
+            if service == "mattermost" {
+                if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) {
+                    if let Ok(rows) = backend::mattermost::extra::commands(&handle, &buffer, query).await {
+                        out.extend(rows);
+                    }
+                }
+            }
             if service == "discord" {
                 match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
                     Ok(answer) => {
@@ -2935,6 +3117,8 @@ pub async fn dispatch(
                 backend::stoat::search::context(state, &handle, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::search::context(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
+                backend::mattermost::extra::context(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2981,6 +3165,8 @@ pub async fn dispatch(
                 backend::stoat::search::newer(state, &handle, &buffer, message_id).await
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::search::newer(state, &handle, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
+                backend::mattermost::extra::newer(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -3012,6 +3198,8 @@ pub async fn dispatch(
                 backend::stoat::search::pins(&handle, &buffer).await
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::search::pins(&handle, &buffer).await
+            } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
+                backend::mattermost::extra::pins(&handle, &buffer).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -3040,6 +3228,8 @@ pub async fn dispatch(
                 backend::telegram::people::reactors(state, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::send::reactors(&handle, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
+            } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
+                backend::mattermost::extra::reactors(&handle, message_id, emoji).await
             } else if buffer.account_id.starts_with("sneedchat:") {
                 backend::sneedchat::reactors(&buffer.account_id, &buffer.name, message_id, emoji)
                     .await
@@ -3076,6 +3266,8 @@ pub async fn dispatch(
                 backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
                 backend::stoat::search::set_pinned(&handle, &buffer, message_id, pinned).await
+            } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
+                backend::mattermost::extra::set_pinned(state, &handle, &buffer, message_id, pinned).await
             } else if let Some(handle) = state.runtime.fluxer_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("fluxer:")) {
                 backend::fluxer::search::set_pinned(&handle, &buffer, message_id, pinned).await
             } else {
@@ -3262,6 +3454,7 @@ pub async fn dispatch(
                     })
                 })
                 .chain(state.runtime.all_stoat_handles().into_iter().flat_map(|h| backend::stoat::events::ringing(state, &h)))
+                .chain(state.runtime.all_mattermost_handles().into_iter().flat_map(|h| backend::mattermost::calls::ringing(state, &h)))
                 .chain(state.runtime.all_fluxer_handles().into_iter().flat_map(|h| backend::fluxer::voice::ringing(state, &h)))
                 .collect();
             (Some(Value::Array(calls)), None)
@@ -3982,6 +4175,15 @@ pub async fn dispatch(
                                 let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
                             }
                             let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
+                        } else if buffer.account_id.starts_with("mattermost:") {
+                            // A channel is left at the server (a direct message closed), which takes the buffer away.
+                            let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) else {
+                                return (None, Some("that Mattermost account is not connected".to_string()));
+                            };
+                            return match backend::mattermost::manage::leave_channel(state, &handle, &buffer).await {
+                                Ok(()) => (Some(ok_node()), None),
+                                Err(e) => (None, Some(format!("{e:#}"))),
+                            };
                         } else if buffer.account_id.starts_with("telegram:") && backend::telegram::topics::topic_of_buffer(&buffer).is_some() {
                             // Closing one topic of a group only stops showing it: the group is left from its rail entry.
                         } else if buffer.account_id.starts_with("telegram:") {
@@ -4092,6 +4294,11 @@ pub async fn dispatch(
             };
             let result = if let Some(group) = backend::steam::chatgroups::group_of_rail_id(group_id) {
                 backend::steam::chatgroups::act(state, group.0, backend::steam::chatgroups::Action::Leave { group: group.1 }).await.map(|_| ()).map_err(anyhow::Error::msg)
+            } else if let Some(team_id) = rest.strip_prefix("team:").filter(|_| account_id.starts_with("mattermost:")) {
+                match state.runtime.mattermost_handle(account_id) {
+                    Some(handle) => backend::mattermost::manage::leave_team(state, &handle, team_id).await,
+                    None => Err(anyhow::anyhow!("that Mattermost account is not connected")),
+                }
             } else if let Some(guild_id) = rest.strip_prefix("guild:").filter(|_| account_id.starts_with("fluxer:")) {
                 match state.runtime.fluxer_handle(account_id) {
                     Some(handle) => backend::fluxer::people::leave_guild(state, &handle, guild_id).await,
@@ -4241,6 +4448,38 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e)),
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let files: Vec<(String, bool)> = paths.into_iter().map(|p| (p, false)).collect();
+                    // A slash command that is not moho's own is the server's: run there, as Mattermost's app runs it.
+                    if files.is_empty() && body.starts_with('/') && !body.starts_with("//") {
+                        let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) else {
+                            return (None, Some("that Mattermost account is not connected".to_string()));
+                        };
+                        return match backend::mattermost::extra::run_command(state, &handle, &buffer, body, reply_to_id).await {
+                            Ok(()) => (Some(ok_node()), None),
+                            Err(e) => (None, Some(format!("{e:#}"))),
+                        };
+                    }
+                    let priority = p_str_opt(params, "priority").map(|p| (p, params.get("requestAck").and_then(|v| v.as_bool()).unwrap_or(false)));
+                    let sent = if files.is_empty() {
+                        backend::mattermost::send::send_with(state, &buffer, body, reply_to_id, &[], priority).await
+                    } else {
+                        backend::mattermost::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await
+                    };
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -4276,6 +4515,63 @@ pub async fn dispatch(
                     match sent {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) else {
+                        return (None, Some("that Rocket.Chat account is not connected".to_string()));
+                    };
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let tmid = p_str_opt(params, "tmid").or(reply_to_id.filter(|_| p_bool(params, "inThread", false)));
+                    let tshow = p_bool(params, "tshow", false);
+                    let quote = if tmid.is_none() { reply_to_id } else { None };
+                    if !paths.is_empty() {
+                        let rid = buffer.remote_id.as_deref().unwrap_or("");
+                        let mut last_err: Option<String> = None;
+                        for (idx, p) in paths.iter().enumerate() {
+                            let path = std::path::Path::new(p);
+                            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                            match tokio::fs::read(path).await {
+                                Ok(bytes) => {
+                                    let desc = if idx == 0 && !body.is_empty() { Some(body) } else { None };
+                                    if let Err(e) = backend::rocketchat::media::upload_file(&handle, rid, fname, "application/octet-stream", bytes, desc, tmid).await {
+                                        last_err = Some(format!("{e:#}"));
+                                    }
+                                }
+                                Err(e) => last_err = Some(format!("reading attachment: {e}")),
+                            }
+                        }
+                        if let Some(p) = progress {
+                            p.done(last_err.as_deref());
+                        }
+                        match last_err {
+                            None => (Some(ok_node()), None),
+                            Some(e) => (None, Some(e)),
+                        }
+                    } else if let Some(rest) = body.strip_prefix('/') {
+                        // Execute Rocket.Chat slash command (`/shrug`, `/topic`, `/invite`, etc.)
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let cmd = parts.next().unwrap_or("");
+                        let cmd_params = parts.next().unwrap_or("").trim();
+                        let rid = buffer.remote_id.as_deref().unwrap_or("");
+                        match backend::rocketchat::extras::run_command(&handle, rid, cmd, cmd_params, tmid).await {
+                            Ok(_) => (Some(ok_node()), None),
+                            Err(_) => {
+                                // Fall back to plain message if not a registered server command
+                                match backend::rocketchat::send::send_message(state, &handle, &buffer, body, tmid, tshow, quote).await {
+                                    Ok(_) => (Some(ok_node()), None),
+                                    Err(e) => (None, Some(format!("{e:#}"))),
+                                }
+                            }
+                        }
+                    } else {
+                        match backend::rocketchat::send::send_message(state, &handle, &buffer, body, tmid, tshow, quote).await {
+                            Ok(_) => (Some(ok_node()), None),
+                            Err(e) => (None, Some(format!("{e:#}"))),
+                        }
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
@@ -4538,6 +4834,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => match backend::mattermost::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4545,6 +4845,13 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::edit_message(state, &handle, &buffer, msg_id, body).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
                 },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -4598,6 +4905,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => match backend::mattermost::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4605,6 +4916,13 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::react(&handle, msg_id, emoji, add).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
                 },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::react(&buffer.account_id, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -4653,6 +4971,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("mattermost:") => match backend::mattermost::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4660,6 +4982,13 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::delete_message(state, &handle, &buffer, msg_id).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
                 },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -5532,6 +5861,13 @@ pub async fn dispatch(
                 }
             }
         }
+        "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("mattermost:")) => {
+            let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.mattermost_handle(a)) else {
+                return (None, Some("listStoatVoice requires a connected \"accountId\"".to_string()));
+            };
+            let map: serde_json::Map<String, serde_json::Value> = backend::mattermost::calls::all_members(state, &handle).into_iter().collect();
+            (Some(serde_json::Value::Object(map)), None)
+        }
         "listStoatVoice" if p_str_opt(params, "accountId").is_some_and(|a| a.starts_with("fluxer:")) => {
             let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.fluxer_handle(a)) else {
                 return (None, Some("that Fluxer account is not connected".to_string()));
@@ -5671,6 +6007,182 @@ pub async fn dispatch(
                 }
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Signing in to a Mattermost server: an id now and the rest as events (backend/mattermost/login.rs). A password
+        // (with a code if the account has a second factor), a personal access token, or the session the server's own
+        // sign-in page left (`madeHere`, from the window's sign-in window, for single sign-on).
+        "addMattermostAccount" | "addMattermostAccountToken" => {
+            let server = p_str(params, "server", "").to_string();
+            let login_id = format!("mattermost-{}", crate::model::next_message_id());
+            if method == "addMattermostAccount" {
+                let (Some(login), Some(password)) = (p_str_opt(params, "login"), p_str_opt(params, "password")) else {
+                    return (None, Some("addMattermostAccount requires \"login\" and \"password\"".to_string()));
+                };
+                backend::mattermost::login::start(state.clone(), login_id.clone(), server, login.to_string(), password.to_string());
+            } else {
+                let Some(token) = p_str_opt(params, "token") else {
+                    return (None, Some("addMattermostAccountToken requires \"token\"".to_string()));
+                };
+                backend::mattermost::login::start_token(state.clone(), login_id.clone(), server, token.to_string(), p_bool(params, "madeHere", false));
+            }
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The server's own search, from the conversation's search box: in this conversation, or everywhere on the server.
+        // Mattermost's `from:`, `in:`, `on:`, `before:` and `after:` are the server's to read.
+        "searchMattermostMessages" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("mattermost:")) else {
+                return (None, Some("searchMattermostMessages requires a Mattermost \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) else {
+                return (None, Some("that Mattermost account is not connected".to_string()));
+            };
+            let everywhere = p_str(params, "scope", "room") == "account";
+            match backend::mattermost::extra::search(state, &handle, (!everywhere).then_some(&buffer), p_str(params, "query", ""), p_i64(params, "limit", 25) as usize).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Mattermost's own verbs (backend/mattermost): one call, with what to do.
+        "mattermost" => {
+            let action = p_str(params, "action", "");
+            let buffer = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("mattermost:"));
+            let account = buffer.as_ref().map(|b| b.account_id.clone()).or_else(|| p_str_opt(params, "accountId").map(str::to_string)).unwrap_or_default();
+            let Some(handle) = state.runtime.mattermost_handle(&account).filter(|_| account.starts_with("mattermost:")) else {
+                return (None, Some("that Mattermost account is not connected".to_string()));
+            };
+            let team = p_str(params, "teamId", "").to_string();
+            let need_buffer = || buffer.clone().ok_or_else(|| anyhow::anyhow!("{action} needs a Mattermost \"bufferId\""));
+            let answer: anyhow::Result<serde_json::Value> = async {
+                use backend::mattermost::{extra, manage, people};
+                Ok(match action {
+                    "search" => extra::search(state, &handle, buffer.as_ref(), p_str(params, "query", ""), p_i64(params, "limit", 50) as usize).await?,
+                    "searchFiles" => extra::search_files(&handle, &team, p_str(params, "query", "")).await?,
+                    "saved" => extra::saved(state, &handle).await?,
+                    "setSaved" => {
+                        extra::set_saved(&handle, p_str(params, "messageId", ""), p_bool(params, "saved", true)).await?;
+                        extra::saved_changed(state, &handle);
+                        serde_json::json!({ "ok": true })
+                    }
+                    "threads" => extra::threads(state, &handle, &team, p_bool(params, "unread", false)).await?,
+                    "followThread" => {
+                        extra::follow(&handle, &team, p_str(params, "threadId", ""), p_bool(params, "follow", true)).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "readThread" => {
+                        extra::read_thread(&handle, &team, p_str(params, "threadId", "")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "drafts" => extra::drafts(state, &handle, &team).await?,
+                    "saveDraft" => {
+                        extra::save_draft(&handle, &need_buffer()?, p_str_opt(params, "rootId"), p_str(params, "text", "")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "scheduled" => extra::scheduled(state, &handle, &team).await?,
+                    "schedule" => extra::schedule(&handle, &need_buffer()?, p_str(params, "text", ""), p_str_opt(params, "rootId"), p_i64(params, "at", 0)).await?,
+                    "unschedule" => {
+                        extra::unschedule(&handle, p_str(params, "id", "")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "bookmarks" => extra::bookmarks(&handle, &need_buffer()?).await?,
+                    "setBookmark" => {
+                        extra::set_bookmark(&handle, &need_buffer()?, p_str_opt(params, "id"), p_str(params, "name", ""), p_str(params, "url", ""), p_bool(params, "remove", false)).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "acknowledge" => {
+                        backend::mattermost::send::acknowledge(state, &need_buffer()?, p_str(params, "messageId", ""), p_bool(params, "ack", true)).await.map_err(|e| anyhow::anyhow!(e))?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "powers" => manage::powers(&handle, &need_buffer()?),
+                    "manage" => manage::run(state, &handle, &need_buffer()?, p_str(params, "do", ""), params).await?,
+                    "openTeams" => manage::open_teams(&handle).await?,
+                    "browse" => manage::browse(&handle, &team, p_str(params, "term", "")).await?,
+                    "createChannel" => serde_json::json!({ "bufferId": manage::create_channel(state, &handle, &team, p_str(params, "name", ""), p_bool(params, "private", false), p_str(params, "purpose", "")).await? }),
+                    "leaveTeam" => {
+                        manage::leave_team(state, &handle, &team).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "openGroup" => {
+                        let people: Vec<String> = params.get("people").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                        serde_json::json!({ "bufferId": people::open_group(state, &handle, &people).await? })
+                    }
+                    "ownProfile" => people::own_profile(&handle).await?,
+                    "setProfile" => {
+                        people::set_profile(&handle, params).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "setAvatar" => {
+                        people::set_avatar(&handle, p_str(params, "path", "")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "setCustomStatus" => {
+                        let text = p_str(params, "text", "");
+                        if text.trim().is_empty() && p_str(params, "emoji", "").is_empty() {
+                            people::apply_status(&handle, "", Some("")).await?;
+                        } else {
+                            people::set_custom_status(&handle, p_str(params, "emoji", ""), text, p_str_opt(params, "until")).await?;
+                        }
+                        serde_json::json!({ "ok": true })
+                    }
+                    "sessions" => people::sessions(&handle).await?,
+                    "revokeSession" => {
+                        people::revoke_session(&handle, p_str(params, "sessionId", "")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "autocomplete" => {
+                        let channel = buffer.as_ref().and_then(|b| b.remote_id.clone()).unwrap_or_default();
+                        people::autocomplete(&handle, &channel, &team, p_str(params, "query", "")).await?
+                    }
+                    "server" => backend::mattermost::events::server_facts(&handle),
+                    "setCollapsedThreads" => {
+                        let own = handle.own_id();
+                        let on = p_bool(params, "on", true);
+                        handle.api.put(&format!("/api/v4/users/{own}/preferences"), &serde_json::json!([{ "user_id": own, "category": "display_settings", "name": "collapsed_reply_threads", "value": if on { "on" } else { "off" } }])).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                        handle.world.lock().unwrap_or_else(|e| e.into_inner()).collapsed_choice = Some(on);
+                        backend::mattermost::events::register_all(state, &handle);
+                        serde_json::json!({ "ok": true })
+                    }
+                    // A call (backend/mattermost/calls.rs): the window's peer connection says what it has to say through
+                    // these, and hears the server's side as `mattermostCallSignal`.
+                    "callJoin" => backend::mattermost::calls::join(state, &handle, &need_buffer()?).await?,
+                    "callDecline" => {
+                        backend::mattermost::calls::decline(state, &handle, &need_buffer()?).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "callHost" => {
+                        backend::mattermost::calls::host(&handle, &need_buffer()?, p_str(params, "do", ""), p_str_opt(params, "sessionId")).await?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    "callSdp" | "callIce" | "callMute" | "callScreen" | "callHand" | "callReact" | "callLeave" => {
+                        use backend::mattermost::calls::Say;
+                        let buffer = need_buffer()?;
+                        let said = match action {
+                            "callSdp" => Say::Sdp(p_str(params, "sdp", "").to_string()),
+                            "callIce" => Say::Ice(p_str(params, "candidate", "").to_string()),
+                            "callMute" => Say::Action(if p_bool(params, "muted", true) { "mute" } else { "unmute" }, serde_json::json!({})),
+                            "callScreen" if p_bool(params, "on", true) => Say::Action("screen_on", serde_json::json!({ "data": serde_json::json!({ "screenStreamID": p_str(params, "streamId", "") }).to_string() })),
+                            "callScreen" => Say::Action("screen_off", serde_json::json!({})),
+                            "callHand" => Say::Action(if p_bool(params, "raised", true) { "raise_hand" } else { "unraise_hand" }, serde_json::json!({})),
+                            "callReact" => {
+                                let name = backend::mattermost::emoji::wire_name(p_str(params, "emoji", ""));
+                                let unicode = backend::mattermost::emoji::char_of(&name).map(|c| c.chars().map(|ch| format!("{:x}", ch as u32)).collect::<Vec<_>>().join("-")).unwrap_or_default();
+                                Say::Action("react", serde_json::json!({ "data": serde_json::json!({ "name": name, "unified": unicode, "literal": "" }).to_string() }))
+                            }
+                            _ => Say::Leave,
+                        };
+                        backend::mattermost::calls::say(&buffer.id, said)?;
+                        serde_json::json!({ "ok": true })
+                    }
+                    other => anyhow::bail!("there is no Mattermost action called {other}"),
+                })
+            }
+            .await;
+            match answer {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // An XMPP account is its JID and password on a server of its own: no sign-in flow to wait on, so the account is
@@ -6861,6 +7373,23 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        "submitMattermostCode" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some("submitMattermostCode requires \"loginId\" and \"value\"".to_string()));
+            };
+            match backend::mattermost::login::submit_code(login_id, value) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelMattermostLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::mattermost::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
         }
 
         "cancelFluxerLogin" => {
@@ -8484,6 +9013,10 @@ pub async fn dispatch(
                     (Some(handle), true) => backend::fluxer::people::open_dm(state, &handle, user_id).await,
                 },
                 "telegram" => backend::telegram::people::open_dm(state, account_id, user_id).await.map_err(|e| anyhow::anyhow!(e)),
+                "mattermost" => match state.runtime.mattermost_handle(account_id) {
+                    None => Err(anyhow::anyhow!("that Mattermost account is not connected")),
+                    Some(handle) => backend::mattermost::people::open_dm(state, &handle, if user_id.is_empty() { nick } else { user_id }).await,
+                },
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };
             match opened {
@@ -9817,7 +10350,12 @@ pub async fn dispatch(
             }
         }
 
-        other => (None, Some(format!("unknown method \"{other}\""))),
+        other => {
+            if let Some(res) = backend::rocketchat::rpc::dispatch(state, other, params).await {
+                return res;
+            }
+            (None, Some(format!("unknown method \"{other}\"")))
+        }
     }
 }
 

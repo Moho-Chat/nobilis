@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "nobilis"
-version = "1.5.10"
+version = "1.6.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -5333,6 +5333,7 @@ dependencies = [
  "presage",
  "prost",
  "protobuf",
+ "pulldown-cmark",
  "qrcode",
  "rand 0.8.7",
  "rand 0.9.5",
@@ -6683,6 +6684,24 @@ checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "pwd-grp"

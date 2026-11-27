@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.5.10"
+version = "1.6.0"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -34,6 +34,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 # Discord backend (QR remote-auth login + gateway client)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 regex = "1"
+# Mattermost posts are GitHub-flavoured Markdown; what the window does not draw (tables, task lists) is drawn as HTML.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2", "socks", "stream"] }
 # Pulled in transitively by both of the above, but with conflicting default
 # crypto-provider features (ring vs aws-lc-rs) - direct so main.rs can pin

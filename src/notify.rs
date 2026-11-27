@@ -107,7 +107,7 @@ impl NotifyLevel {
 /// reads and writes the setting on the account, and is asked to when the level
 /// changes. Anything else is kept here.
 pub fn held_on_account(account_id: &str) -> bool {
-    ["matrix:", "discord:", "stoat:", "fluxer:", "steam:", "telegram:"].iter().any(|prefix| account_id.starts_with(prefix))
+    ["matrix:", "discord:", "stoat:", "fluxer:", "mattermost:", "steam:", "telegram:"].iter().any(|prefix| account_id.starts_with(prefix))
 }
 
 /// Sets one conversation's level, wherever its service keeps it.
@@ -166,6 +166,9 @@ async fn set_service_level(state: &crate::state::AppState, buffer: &crate::model
     } else if account.starts_with("fluxer:") {
         let handle = state.runtime.fluxer_handle(account).ok_or("that Fluxer account is not connected")?;
         backend::fluxer::settings::set_level(state, &handle, buffer, level).await.map_err(plain)
+    } else if account.starts_with("mattermost:") {
+        let handle = state.runtime.mattermost_handle(account).ok_or("that Mattermost account is not connected")?;
+        backend::mattermost::people::set_level(state, &handle, buffer, level).await.map_err(plain)
     } else if account.starts_with("steam:") {
         // A room of a group has the three; a conversation with a friend has
         // only whether their messages notify at all.

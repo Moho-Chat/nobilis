@@ -99,6 +99,9 @@ pub struct Account {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,
+    /// Whether the user explicitly disconnected this account, persisted across restarts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disconnected: bool,
     pub autojoin: String,
     #[serde(rename = "hasNickservPassword")]
     pub has_nickserv_password: bool,
@@ -984,6 +987,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("telegram") => "telegram",
         Some("stoat") => "stoat",
         Some("fluxer") => "fluxer",
+        Some("mattermost") => "mattermost",
         Some("signal") => "signal",
         Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",
@@ -1158,7 +1162,7 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:") || account_id.starts_with("fluxer:") || account_id.starts_with("telegram:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:") || account_id.starts_with("fluxer:") || account_id.starts_with("mattermost:") || account_id.starts_with("telegram:"),
         // Stoat's own: only mentions reach the account.
         "focus" => account_id.starts_with("stoat:"),
         _ => false,

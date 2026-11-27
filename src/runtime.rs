@@ -593,6 +593,10 @@ pub struct Runtime {
     stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
     /// A connected Fluxer account's client, by account id (see backend/fluxer).
     fluxer_handles: Mutex<HashMap<String, crate::backend::fluxer::Handle>>,
+    /// A connected Mattermost account's client, by account id (see backend/mattermost).
+    mattermost_handles: Mutex<HashMap<String, crate::backend::mattermost::Handle>>,
+    /// A connected Rocket.Chat account's client, by account id (see backend/rocketchat).
+    rocketchat_handles: Mutex<HashMap<String, crate::backend::rocketchat::Handle>>,
     /// A connected Signal account's way to its thread, by account id (see backend/signal).
     signal_handles: Mutex<HashMap<String, crate::backend::signal::Handle>>,
     /// A connected XMPP account's stream, by account id (see backend/xmpp).
@@ -1180,6 +1184,8 @@ impl Runtime {
             telegram_handles: Mutex::new(HashMap::new()),
             stoat_handles: Mutex::new(HashMap::new()),
             fluxer_handles: Mutex::new(HashMap::new()),
+            mattermost_handles: Mutex::new(HashMap::new()),
+            rocketchat_handles: Mutex::new(HashMap::new()),
             signal_handles: Mutex::new(HashMap::new()),
             xmpp_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
@@ -1267,6 +1273,7 @@ impl Runtime {
         // The constructors have no view of live state, so the status the
         // runtime is actually holding is filled in here.
         for account in &mut out {
+            account.disconnected = state.accounts.is_disconnected(&account.id);
             account.auto_idle = self.auto_idle_applies(state, &account.id);
             account.status = self.effective_status(state, &account.id);
             account.status_text = self.account_status_text(&account.id);
@@ -1350,6 +1357,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::fluxer_account_to_json(cfg, conn)
         }));
+        out.extend(state.accounts.all_mattermost().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::mattermost_account_to_json(cfg, conn)
+        }));
         out.extend(state.accounts.all_signal().iter().map(|cfg| {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
@@ -1359,6 +1371,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::xmpp_account_to_json(cfg, conn)
+        }));
+        out.extend(state.accounts.all_rocketchat().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::rocketchat_account_to_json(cfg, conn)
         }));
         out
     }
@@ -1972,7 +1989,11 @@ impl Runtime {
             self.connected_at.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
         }
         self.conn_states.lock().unwrap().insert(account_id.to_string(), conn.clone());
-        let mut data = json!({ "accountId": account_id, "state": conn.as_str() });
+        let mut data = json!({
+            "accountId": account_id,
+            "state": conn.as_str(),
+            "disconnected": state.accounts.is_disconnected(account_id),
+        });
         if let Some(e) = error {
             data["error"] = json!(e);
         }
@@ -4657,6 +4678,23 @@ impl Runtime {
         self.telegram_handles.lock().unwrap().get(account_id).cloned()
     }
 
+    pub fn set_mattermost_handle(&self, account_id: &str, handle: crate::backend::mattermost::Handle) {
+        self.mattermost_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_mattermost_handle(&self, account_id: &str) {
+        self.mattermost_handles.lock().unwrap().remove(account_id);
+    }
+
+    /// Every connected Mattermost account.
+    pub fn all_mattermost_handles(&self) -> Vec<crate::backend::mattermost::Handle> {
+        self.mattermost_handles.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn mattermost_handle(&self, account_id: &str) -> Option<crate::backend::mattermost::Handle> {
+        self.mattermost_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn set_fluxer_handle(&self, account_id: &str, handle: crate::backend::fluxer::Handle) {
         self.fluxer_handles.lock().unwrap().insert(account_id.to_string(), handle);
     }
@@ -4673,6 +4711,23 @@ impl Runtime {
     /// A connected Fluxer account's client.
     pub fn fluxer_handle(&self, account_id: &str) -> Option<crate::backend::fluxer::Handle> {
         self.fluxer_handles.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn set_rocketchat_handle(&self, account_id: &str, handle: crate::backend::rocketchat::Handle) {
+        self.rocketchat_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_rocketchat_handle(&self, account_id: &str) {
+        self.rocketchat_handles.lock().unwrap().remove(account_id);
+    }
+
+    #[allow(dead_code)]
+    pub fn all_rocketchat_handles(&self) -> Vec<crate::backend::rocketchat::Handle> {
+        self.rocketchat_handles.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn rocketchat_handle(&self, account_id: &str) -> Option<crate::backend::rocketchat::Handle> {
+        self.rocketchat_handles.lock().unwrap().get(account_id).cloned()
     }
 
     pub fn set_stoat_handle(&self, account_id: &str, handle: crate::backend::stoat::Handle) {
@@ -6118,7 +6173,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, fluxer_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
+            kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, fluxer_handles, mattermost_handles, rocketchat_handles, signal_handles, xmpp_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

@@ -339,45 +339,79 @@ async fn run() -> Result<()> {
     // conversation it saw last time - see Runtime::restore_layout.
     state.runtime.restore_layout(&state);
 
-    // Reconnect every saved account, same as
-    // daemon/nobilis/actions.c's nobilis_reconnect_saved_accounts() - without
-    // this, an account created in a previous run just sits there after a
-    // restart.
+    // Reconnect every saved account that the user has not explicitly
+    // disconnected, same as daemon/nobilis/actions.c's
+    // nobilis_reconnect_saved_accounts() - without this, an account created in
+    // a previous run just sits there after a restart.
     for cfg in state.accounts.all_irc() {
-        backend::irc::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::irc::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_discord() {
-        backend::discord::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::discord::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_sneedchat() {
-        backend::sneedchat::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::sneedchat::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_matrix() {
-        backend::matrix::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::matrix::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_kick() {
-        backend::kick::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::kick::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_steam() {
-        backend::steam::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::steam::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_twitch() {
-        backend::twitch::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::twitch::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_telegram() {
-        backend::telegram::connect::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::telegram::connect::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_stoat() {
-        backend::stoat::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::stoat::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_fluxer() {
-        backend::fluxer::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::fluxer::spawn(state.clone(), cfg);
+        }
+    }
+    for cfg in state.accounts.all_mattermost() {
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::mattermost::spawn(state.clone(), cfg);
+        }
+    }
+    for cfg in state.accounts.all_rocketchat() {
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::rocketchat::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_signal() {
-        backend::signal::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::signal::spawn(state.clone(), cfg);
+        }
     }
     for cfg in state.accounts.all_xmpp() {
-        backend::xmpp::spawn(state.clone(), cfg);
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::xmpp::spawn(state.clone(), cfg);
+        }
     }
 
     // What was going on last time, before anything is served: a window that

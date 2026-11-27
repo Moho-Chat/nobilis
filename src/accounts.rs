@@ -639,6 +639,116 @@ impl FluxerAccountConfig {
     }
 }
 
+/// A Mattermost account: a person on a team chat server anybody can host (see backend/mattermost and issue #25). The
+/// account names its server by its address; one server holds many teams, and they are all this one account.
+///
+/// The token is what the account is - a session the server issued to a password or a single sign-on here, or a personal
+/// access token the person pasted - and is as private as a Discord token: kept here, never logged and never put in an
+/// address.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MattermostAccountConfig {
+    /// The server's address, without a trailing slash (`https://chat.example.org`).
+    #[serde(default)]
+    pub server: String,
+    /// The server's id for the person, which survives a change of name. The account's id here is built from it.
+    #[serde(default)]
+    pub user_id: String,
+    /// The `username`, for the sidebar.
+    #[serde(default)]
+    pub username: String,
+    /// The session or access token, sent as `Authorization: Bearer`.
+    #[serde(default)]
+    pub token: String,
+    /// Whether moho made this session (a password, or the sign-in page), so it is ended at the server when the account
+    /// is removed. A personal access token belongs to the person's other uses of it and is left alone.
+    #[serde(default)]
+    pub made_here: bool,
+    /// How the account signed in: `password`, `token` or `sso`.
+    #[serde(default)]
+    pub method: String,
+    /// The id of the session moho made (a password or the sign-in page), by which it is known in the account's list.
+    #[serde(default)]
+    pub session_id: String,
+    /// What to call this account here. Local: the server is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl MattermostAccountConfig {
+    pub fn account_id(&self) -> String {
+        crate::backend::mattermost::account_id(&self.server, &self.user_id)
+    }
+
+    /// Whether there is a sign-in behind this account.
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && !self.token.is_empty()
+    }
+}
+
+/// A Rocket.Chat account: self-hostable team chat speaking REST API v1 + Meteor DDP WebSocket
+/// with optional pure-Rust E2EE (issue #31).
+/// Account ID format: `rocketchat:<server_host>:<user_id>`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RocketChatAccountConfig {
+    /// Normalized server origin without trailing slash (e.g. `https://open.rocket.chat`).
+    #[serde(default)]
+    pub server_url: String,
+    /// Lowercase `host[:port]` extracted from `server_url`, used in `account_id()`.
+    #[serde(default)]
+    pub server_host: String,
+    /// Rocket.Chat user `_id`.
+    #[serde(default)]
+    pub user_id: String,
+    /// Rocket.Chat `username`.
+    #[serde(default)]
+    pub username: String,
+    /// `X-Auth-Token` stored in `0600` `accounts.toml`. Never logged.
+    #[serde(default)]
+    pub auth_token: String,
+    /// Optional E2EE passphrase stored locally in `0600` `accounts.toml` for auto-unlock. Never logged.
+    #[serde(default)]
+    pub e2ee_passphrase: Option<String>,
+    /// Whether moho created this session (so `POST /api/v1/logout` is called on remove).
+    #[serde(default)]
+    pub made_here: bool,
+    /// Local display name override.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Default presence status applied on connect (`online`, `away`, `busy`, `offline`).
+    #[serde(default)]
+    pub default_status: Option<String>,
+    /// Optional Omnichannel / Livechat toggle for `livechat-agent` accounts.
+    #[serde(default)]
+    pub omnichannel_enabled: bool,
+    /// Route traffic through Tor or configured SOCKS5 proxy.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing for all media/links in this account's conversations.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl RocketChatAccountConfig {
+    pub fn account_id(&self) -> String {
+        let host = if self.server_host.is_empty() {
+            crate::backend::rocketchat::server_host(&self.server_url).unwrap_or_else(|_| "unknown".to_string())
+        } else {
+            self.server_host.clone()
+        };
+        format!("rocketchat:{host}:{}", self.user_id)
+    }
+
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && !self.auth_token.is_empty()
+    }
+}
+
 /// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
 /// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
 /// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
@@ -815,10 +925,18 @@ struct AccountsFile {
     stoat: Vec<StoatAccountConfig>,
     #[serde(default, rename = "fluxer_account")]
     fluxer: Vec<FluxerAccountConfig>,
+    #[serde(default, rename = "mattermost_account")]
+    mattermost: Vec<MattermostAccountConfig>,
     #[serde(default, rename = "signal_account")]
     signal: Vec<SignalAccountConfig>,
     #[serde(default, rename = "xmpp_account")]
     xmpp: Vec<XmppAccountConfig>,
+    #[serde(default, rename = "rocketchat_account")]
+    rocketchat: Vec<RocketChatAccountConfig>,
+    /// Account ids the user explicitly disconnected, so they stay disconnected
+    /// across restarts until reconnected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disconnected: Vec<String>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -847,7 +965,13 @@ pub struct AccountStore {
     /// And this one.
     fluxer: Mutex<HashMap<String, FluxerAccountConfig>>,
     /// And this one.
+    mattermost: Mutex<HashMap<String, MattermostAccountConfig>>,
+    /// And this one.
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
+    /// And this one.
+    rocketchat: Mutex<HashMap<String, RocketChatAccountConfig>>,
+    /// Account ids the user explicitly disconnected.
+    disconnected: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl AccountStore {
@@ -858,7 +982,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -875,9 +999,12 @@ impl AccountStore {
             let xmpp = file.xmpp.into_iter().map(|a| (a.account_id(), a)).collect();
             let signal = file.signal.into_iter().map(|a| (a.account_id(), a)).collect();
             let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer)
+            let mattermost = file.mattermost.into_iter().map(|a| (a.account_id(), a)).collect();
+            let rocketchat = file.rocketchat.into_iter().map(|a| (a.account_id(), a)).collect();
+            let disconnected = file.disconnected.into_iter().collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), std::collections::BTreeSet::new())
         };
         Ok(Self {
             path,
@@ -892,7 +1019,10 @@ impl AccountStore {
             telegram: Mutex::new(telegram),
             stoat: Mutex::new(stoat),
             fluxer: Mutex::new(fluxer),
+            mattermost: Mutex::new(mattermost),
             xmpp: Mutex::new(xmpp),
+            rocketchat: Mutex::new(rocketchat),
+            disconnected: Mutex::new(disconnected),
         })
     }
 
@@ -919,7 +1049,10 @@ impl AccountStore {
             telegram: self.telegram.lock().unwrap().values().cloned().collect(),
             stoat: self.stoat.lock().unwrap().values().cloned().collect(),
             fluxer: self.fluxer.lock().unwrap().values().cloned().collect(),
+            mattermost: self.mattermost.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
+            rocketchat: self.rocketchat.lock().unwrap().values().cloned().collect(),
+            disconnected: self.disconnected.lock().unwrap().iter().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -956,8 +1089,10 @@ impl AccountStore {
             || self.get_telegram(account_id).is_some()
             || self.get_stoat(account_id).is_some()
             || self.get_fluxer(account_id).is_some()
+            || self.get_mattermost(account_id).is_some()
             || self.get_xmpp(account_id).is_some()
             || self.get_signal(account_id).is_some()
+            || self.get_rocketchat(account_id).is_some()
     }
 
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
@@ -1290,6 +1425,92 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_mattermost(&self, account_id: &str) -> Option<MattermostAccountConfig> {
+        self.mattermost.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_mattermost(&self) -> Vec<MattermostAccountConfig> {
+        self.mattermost.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again as the same person on the same server is how a session the server has ended gets
+    /// replaced. What the person set up on the account - its route, its name here - stays.
+    pub fn add_mattermost(&self, mut config: MattermostAccountConfig) -> Result<MattermostAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut mattermost = self.mattermost.lock().unwrap();
+            if let Some(old) = mattermost.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            mattermost.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Mattermost account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_mattermost(&self, account_id: &str, change: impl FnOnce(&mut MattermostAccountConfig)) -> Result<bool> {
+        {
+            let mut mattermost = self.mattermost.lock().unwrap();
+            match mattermost.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
+    pub fn get_rocketchat(&self, account_id: &str) -> Option<RocketChatAccountConfig> {
+        self.rocketchat.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_rocketchat(&self) -> Vec<RocketChatAccountConfig> {
+        self.rocketchat.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn add_rocketchat(&self, mut config: RocketChatAccountConfig) -> Result<RocketChatAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut rc = self.rocketchat.lock().unwrap();
+            if let Some(old) = rc.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+                if config.e2ee_passphrase.is_none() {
+                    config.e2ee_passphrase = old.e2ee_passphrase.clone();
+                }
+                if config.default_status.is_none() {
+                    config.default_status = old.default_status.clone();
+                }
+                config.omnichannel_enabled |= old.omnichannel_enabled;
+            }
+            rc.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    pub fn mutate_rocketchat(&self, account_id: &str, change: impl FnOnce(&mut RocketChatAccountConfig)) -> Result<bool> {
+        {
+            let mut rc = self.rocketchat.lock().unwrap();
+            match rc.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
         self.xmpp.lock().unwrap().get(account_id).cloned()
     }
@@ -1546,11 +1767,19 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.mattermost.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else if let Some(a) = self.xmpp.lock().unwrap().get_mut(account_id) {
             a.use_tor = routed;
             a.strict_route = strict;
             true
         } else if let Some(a) = self.signal.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
+        } else if let Some(a) = self.rocketchat.lock().unwrap().get_mut(account_id) {
             a.use_tor = routed;
             a.strict_route = strict;
             true
@@ -1593,10 +1822,16 @@ impl AccountStore {
         if let Some(a) = self.get_fluxer(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
+        if let Some(a) = self.get_mattermost(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
         if let Some(a) = self.get_xmpp(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_signal(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_rocketchat(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1659,7 +1894,38 @@ impl AccountStore {
         }
     }
 
+    /// Whether the user explicitly disconnected this account.
+    pub fn is_disconnected(&self, account_id: &str) -> bool {
+        self.disconnected.lock().unwrap().contains(account_id)
+    }
+
+    /// Marks an account as explicitly disconnected (or clears that mark) and persists it.
+    pub fn set_disconnected(&self, account_id: &str, disconnected: bool) -> Result<bool> {
+        if !self.has_account(account_id) {
+            return Ok(false);
+        }
+        let changed = {
+            let mut set = self.disconnected.lock().unwrap();
+            if disconnected {
+                set.insert(account_id.to_string())
+            } else {
+                set.remove(account_id)
+            }
+        };
+        if changed {
+            self.persist(
+                &self.irc.lock().unwrap(),
+                &self.discord.lock().unwrap(),
+                &self.sneedchat.lock().unwrap(),
+                &self.matrix.lock().unwrap(),
+                &self.kick.lock().unwrap(),
+            )?;
+        }
+        Ok(true)
+    }
+
     pub fn remove(&self, account_id: &str) -> Result<bool> {
+        self.disconnected.lock().unwrap().remove(account_id);
         {
             let mut irc = self.irc.lock().unwrap();
             if irc.remove(account_id).is_some() {
@@ -1718,6 +1984,14 @@ impl AccountStore {
         }
         {
             let removed = self.fluxer.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.mattermost.lock().unwrap().remove(account_id).is_some()
+                || self.rocketchat.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1910,10 +2184,16 @@ impl AccountStore {
         if self.mutate_fluxer(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_mattermost(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         if self.mutate_xmpp(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
         if self.mutate_signal(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
+        if self.mutate_rocketchat(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
         let mut kick = self.kick.lock().unwrap();
@@ -1961,10 +2241,16 @@ impl AccountStore {
         if let Some(a) = self.fluxer.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
+        if let Some(a) = self.mattermost.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
         if let Some(a) = self.xmpp.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         if let Some(a) = self.signal.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.rocketchat.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -2089,6 +2375,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2132,6 +2419,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2174,6 +2462,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2225,6 +2514,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2275,6 +2565,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2320,6 +2611,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         web_session: !a.web_token.is_empty(),
         moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2366,6 +2658,7 @@ pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Accou
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2410,6 +2703,7 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2453,6 +2747,52 @@ pub fn fluxer_account_to_json(a: &FluxerAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        disconnected: false,
+        stop_reason: String::new(),
+        reactions: false,
+    }
+}
+
+/// Nor has Mattermost. `has_password` says there is a sign-in behind the account.
+pub fn mattermost_account_to_json(a: &MattermostAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "mattermost".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.username.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        disconnected: false,
         stop_reason: String::new(),
         reactions: false,
     }
@@ -2497,6 +2837,7 @@ pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: if state == "auth_failed" { crate::backend::xmpp::connect::stop_reason(&a.account_id()) } else { String::new() },
     }
 }
@@ -2541,6 +2882,55 @@ pub fn signal_account_to_json(a: &SignalAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
+        stop_reason: String::new(),
+    }
+}
+
+pub fn rocketchat_account_to_json(a: &RocketChatAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "rocketchat".to_string(),
+        status: a.default_status.clone().unwrap_or_else(|| "online".to_string()),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.username.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: a.username.clone(),
+        highlight_keywords: Vec::new(),
+        ssl: a.server_url.starts_with("https://"),
+        has_password: a.is_signed_in(),
+        avatar_url: if !a.username.is_empty() && !a.server_url.is_empty() {
+            Some(format!("{}/avatar/{}", a.server_url.trim_end_matches('/'), a.username))
+        } else {
+            None
+        },
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: a.e2ee_passphrase.as_deref().is_some_and(|s| !s.is_empty()),
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        reactions: true,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2587,6 +2977,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -3055,6 +3446,39 @@ mod has_account_tests {
             assert!(s.has_account(id), "{id} is not known, so the layout restore drops its conversations");
         }
         assert!(!s.has_account("xmpp:nobody@example.org"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disconnected_state_survives_a_restart_and_clears_on_reconnect_or_remove() {
+        let path = std::env::temp_dir().join(format!("nobilis-disconnected-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = AccountStore::open(path.clone()).unwrap();
+        let a = s.add_kick(KickAccountConfig { username: "alpha".into(), ..Default::default() }).unwrap().account_id();
+        let b = s.add_kick(KickAccountConfig { username: "beta".into(), ..Default::default() }).unwrap().account_id();
+
+        assert!(!s.is_disconnected(&a));
+        assert!(!s.set_disconnected("kick:missing", true).unwrap());
+        assert!(s.set_disconnected(&a, true).unwrap());
+        assert!(s.is_disconnected(&a));
+        assert!(!s.is_disconnected(&b));
+
+        // Persists across reopen (daemon reboot).
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        assert!(reopened.is_disconnected(&a));
+        assert!(!reopened.is_disconnected(&b));
+
+        // Reconnecting clears the flag and persists.
+        assert!(reopened.set_disconnected(&a, false).unwrap());
+        let reopened2 = AccountStore::open(path.clone()).unwrap();
+        assert!(!reopened2.is_disconnected(&a));
+
+        // Removing a disconnected account drops its disconnected entry too.
+        assert!(reopened2.set_disconnected(&b, true).unwrap());
+        assert!(reopened2.remove(&b).unwrap());
+        let reopened3 = AccountStore::open(path.clone()).unwrap();
+        assert!(!reopened3.is_disconnected(&b));
+
         let _ = std::fs::remove_file(&path);
     }
 }
