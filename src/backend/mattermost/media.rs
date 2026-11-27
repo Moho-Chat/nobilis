@@ -5,8 +5,9 @@
 //! records, beside each name, the path on the server and the account it belongs to, and fetching it again goes through
 //! that account's client (and so its route).
 //!
-//! A picture a link preview names lives on another site; it is asked for through the server's own image address
-//! (`/api/v4/image`), which goes through the server's image proxy where it has one turned on, as Mattermost's app does.
+//! A picture a link preview names lives on another site. Where the server runs an image proxy it is asked for through
+//! the server (`/api/v4/image`); where it does not, the server refuses that address, and the picture is fetched from its
+//! site over the account's route - which is what Mattermost's own app does either way.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
@@ -76,19 +77,61 @@ pub fn external_path(url: &str) -> Option<String> {
     Some(format!("{}?{}", path.path(), path.query().unwrap_or("")))
 }
 
-/// A picture on another site, through the server's image address.
+/// The accounts whose server runs an image proxy.
+fn proxied() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+/// Says whether an account's server runs an image proxy (its client config's `HasImageProxy`).
+pub fn set_image_proxy(account_id: &str, on: bool) {
+    let mut set = proxied().lock().unwrap_or_else(|e| e.into_inner());
+    if on {
+        set.insert(account_id.to_string());
+    } else {
+        set.remove(account_id);
+    }
+}
+
+/// A picture on another site: through the server's image proxy where it has one, else from the site itself.
 pub fn external(account_id: &str, url: &str) -> Option<String> {
-    Some(cached(account_id, MEDIA, &external_path(url)?, None, None))
+    let path = external_path(url)?;
+    if proxied().lock().unwrap_or_else(|e| e.into_inner()).contains(account_id) {
+        return Some(cached(account_id, MEDIA, &path, None, None));
+    }
+    let file = crate::media_cache::dir(MEDIA).join(format!("{}.{}", hash(&format!("{account_id}{url}")), extension_of(Some(url.split(['?', '#']).next().unwrap_or(url)), None)));
+    crate::media_cache::record(&file, json!({ "url": url, "account": account_id }));
+    Some(format!("file://{}", file.display()))
 }
 
 /// Fetches a cached file again, from the path recorded for it, with its account's session.
 pub async fn restore_cached(state: &crate::state::AppState, file: &Path) -> Result<PathBuf> {
     let source = crate::media_cache::source(file).ok_or_else(|| anyhow!("nothing says where this file came from"))?;
+    let account = source["account"].as_str().unwrap_or("");
+    // A picture from another site, fetched from it over the account's route.
+    if let Some(url) = source["url"].as_str() {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            bail!("not an address");
+        }
+        let router = crate::net::route::router();
+        let client = router.client_if("mattermost", router.routed(account), |b| b.user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"))).timeout(std::time::Duration::from_secs(60)));
+        let response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
+        if !response.status().is_success() {
+            bail!("{url} answered {}", response.status());
+        }
+        let bytes = response.bytes().await.context("reading the picture")?;
+        if let Some(parent) = file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let part = file.with_extension("part");
+        tokio::fs::write(&part, &bytes).await?;
+        tokio::fs::rename(&part, file).await?;
+        return Ok(file.to_path_buf());
+    }
     let path = source["path"].as_str().ok_or_else(|| anyhow!("no address was recorded for this file"))?;
     if !path.starts_with("/api/v4/") {
         bail!("not a Mattermost address");
     }
-    let account = source["account"].as_str().unwrap_or("");
     let handle = state.runtime.mattermost_handle(account).ok_or_else(|| anyhow!("that Mattermost account is not connected"))?;
     // A picture's preview is made by the server after the upload, and a small one may never be: the file itself is the
     // picture then.

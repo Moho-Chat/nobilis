@@ -122,6 +122,7 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
     let plugins = api.get("/api/v4/plugins/webapp", &[]).await.unwrap_or(Value::Null);
     let license = api.get("/api/v4/license/client", &[("format", "old".to_string())]).await.unwrap_or(Value::Null);
     let server = Arc::new(ServerInfo::from_config(&client_config, &plugins, &license));
+    super::media::set_image_proxy(account_id, client_config["HasImageProxy"].as_str() == Some("true"));
     let username = me["username"].as_str().unwrap_or("").to_string();
     if username != config.username {
         let _ = state.accounts.mutate_mattermost(account_id, |a| a.username = username.clone());
