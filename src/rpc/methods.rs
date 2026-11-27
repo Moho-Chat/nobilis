@@ -1110,6 +1110,12 @@ pub async fn dispatch(
             Some(id) => {
                 let connect = p_bool(params, "connected", true);
                 if connect {
+                    if !state.accounts.has_account(id) {
+                        return (None, Some("no such account".to_string()));
+                    }
+                    if let Err(e) = state.accounts.set_disconnected(id, false) {
+                        return (None, Some(format!("{e:#}")));
+                    }
                     if id.starts_with("discord:") {
                         match state.accounts.get_discord(id) {
                             Some(cfg) => {
@@ -1158,6 +1164,30 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("telegram:") {
+                        match state.accounts.get_telegram(id) {
+                            Some(cfg) => {
+                                backend::telegram::connect::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("stoat:") {
+                        match state.accounts.get_stoat(id) {
+                            Some(cfg) => {
+                                backend::stoat::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("fluxer:") {
+                        match state.accounts.get_fluxer(id) {
+                            Some(cfg) => {
+                                backend::fluxer::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else if id.starts_with("signal:") {
                         match state.accounts.get_signal(id) {
                             Some(cfg) => {
@@ -1182,6 +1212,14 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("rocketchat:") {
+                        match state.accounts.get_rocketchat(id) {
+                            Some(cfg) => {
+                                backend::rocketchat::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else {
                         match state.accounts.get_irc(id) {
                             Some(cfg) => {
@@ -1191,6 +1229,14 @@ pub async fn dispatch(
                             None => (None, Some("no such account".to_string())),
                         }
                     }
+                } else if state.accounts.has_account(id) {
+                    if let Err(e) = state.accounts.set_disconnected(id, true) {
+                        return (None, Some(format!("{e:#}")));
+                    }
+                    if !state.runtime.disconnect(state, id) {
+                        state.runtime.set_conn_state(state, id, crate::runtime::ConnState::Disconnected, None);
+                    }
+                    (Some(ok_node()), None)
                 } else if state.runtime.disconnect(state, id) {
                     (Some(ok_node()), None)
                 } else {

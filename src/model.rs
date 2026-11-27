@@ -99,6 +99,9 @@ pub struct Account {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,
+    /// Whether the user explicitly disconnected this account, persisted across restarts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disconnected: bool,
     pub autojoin: String,
     #[serde(rename = "hasNickservPassword")]
     pub has_nickserv_password: bool,

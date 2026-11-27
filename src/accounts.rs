@@ -933,6 +933,10 @@ struct AccountsFile {
     xmpp: Vec<XmppAccountConfig>,
     #[serde(default, rename = "rocketchat_account")]
     rocketchat: Vec<RocketChatAccountConfig>,
+    /// Account ids the user explicitly disconnected, so they stay disconnected
+    /// across restarts until reconnected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disconnected: Vec<String>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -966,6 +970,8 @@ pub struct AccountStore {
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
     /// And this one.
     rocketchat: Mutex<HashMap<String, RocketChatAccountConfig>>,
+    /// Account ids the user explicitly disconnected.
+    disconnected: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl AccountStore {
@@ -976,7 +982,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -995,9 +1001,10 @@ impl AccountStore {
             let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
             let mattermost = file.mattermost.into_iter().map(|a| (a.account_id(), a)).collect();
             let rocketchat = file.rocketchat.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat)
+            let disconnected = file.disconnected.into_iter().collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), std::collections::BTreeSet::new())
         };
         Ok(Self {
             path,
@@ -1015,6 +1022,7 @@ impl AccountStore {
             mattermost: Mutex::new(mattermost),
             xmpp: Mutex::new(xmpp),
             rocketchat: Mutex::new(rocketchat),
+            disconnected: Mutex::new(disconnected),
         })
     }
 
@@ -1044,6 +1052,7 @@ impl AccountStore {
             mattermost: self.mattermost.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
             rocketchat: self.rocketchat.lock().unwrap().values().cloned().collect(),
+            disconnected: self.disconnected.lock().unwrap().iter().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -1885,7 +1894,38 @@ impl AccountStore {
         }
     }
 
+    /// Whether the user explicitly disconnected this account.
+    pub fn is_disconnected(&self, account_id: &str) -> bool {
+        self.disconnected.lock().unwrap().contains(account_id)
+    }
+
+    /// Marks an account as explicitly disconnected (or clears that mark) and persists it.
+    pub fn set_disconnected(&self, account_id: &str, disconnected: bool) -> Result<bool> {
+        if !self.has_account(account_id) {
+            return Ok(false);
+        }
+        let changed = {
+            let mut set = self.disconnected.lock().unwrap();
+            if disconnected {
+                set.insert(account_id.to_string())
+            } else {
+                set.remove(account_id)
+            }
+        };
+        if changed {
+            self.persist(
+                &self.irc.lock().unwrap(),
+                &self.discord.lock().unwrap(),
+                &self.sneedchat.lock().unwrap(),
+                &self.matrix.lock().unwrap(),
+                &self.kick.lock().unwrap(),
+            )?;
+        }
+        Ok(true)
+    }
+
     pub fn remove(&self, account_id: &str) -> Result<bool> {
+        self.disconnected.lock().unwrap().remove(account_id);
         {
             let mut irc = self.irc.lock().unwrap();
             if irc.remove(account_id).is_some() {
@@ -2335,6 +2375,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2378,6 +2419,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2420,6 +2462,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2471,6 +2514,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2521,6 +2565,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2566,6 +2611,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         web_session: !a.web_token.is_empty(),
         moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2612,6 +2658,7 @@ pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Accou
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2656,6 +2703,7 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2699,6 +2747,7 @@ pub fn fluxer_account_to_json(a: &FluxerAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        disconnected: false,
         stop_reason: String::new(),
         reactions: false,
     }
@@ -2743,6 +2792,7 @@ pub fn mattermost_account_to_json(a: &MattermostAccountConfig, state: &str) -> A
         dehydration: false,
         web_session: false,
         moderation: false,
+        disconnected: false,
         stop_reason: String::new(),
         reactions: false,
     }
@@ -2787,6 +2837,7 @@ pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: if state == "auth_failed" { crate::backend::xmpp::connect::stop_reason(&a.account_id()) } else { String::new() },
     }
 }
@@ -2831,6 +2882,7 @@ pub fn signal_account_to_json(a: &SignalAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2878,6 +2930,7 @@ pub fn rocketchat_account_to_json(a: &RocketChatAccountConfig, state: &str) -> A
         web_session: false,
         moderation: false,
         reactions: true,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -2924,6 +2977,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         web_session: false,
         moderation: false,
         reactions: false,
+        disconnected: false,
         stop_reason: String::new(),
     }
 }
@@ -3392,6 +3446,39 @@ mod has_account_tests {
             assert!(s.has_account(id), "{id} is not known, so the layout restore drops its conversations");
         }
         assert!(!s.has_account("xmpp:nobody@example.org"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disconnected_state_survives_a_restart_and_clears_on_reconnect_or_remove() {
+        let path = std::env::temp_dir().join(format!("nobilis-disconnected-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = AccountStore::open(path.clone()).unwrap();
+        let a = s.add_kick(KickAccountConfig { username: "alpha".into(), ..Default::default() }).unwrap().account_id();
+        let b = s.add_kick(KickAccountConfig { username: "beta".into(), ..Default::default() }).unwrap().account_id();
+
+        assert!(!s.is_disconnected(&a));
+        assert!(!s.set_disconnected("kick:missing", true).unwrap());
+        assert!(s.set_disconnected(&a, true).unwrap());
+        assert!(s.is_disconnected(&a));
+        assert!(!s.is_disconnected(&b));
+
+        // Persists across reopen (daemon reboot).
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        assert!(reopened.is_disconnected(&a));
+        assert!(!reopened.is_disconnected(&b));
+
+        // Reconnecting clears the flag and persists.
+        assert!(reopened.set_disconnected(&a, false).unwrap());
+        let reopened2 = AccountStore::open(path.clone()).unwrap();
+        assert!(!reopened2.is_disconnected(&a));
+
+        // Removing a disconnected account drops its disconnected entry too.
+        assert!(reopened2.set_disconnected(&b, true).unwrap());
+        assert!(reopened2.remove(&b).unwrap());
+        let reopened3 = AccountStore::open(path.clone()).unwrap();
+        assert!(!reopened3.is_disconnected(&b));
+
         let _ = std::fs::remove_file(&path);
     }
 }

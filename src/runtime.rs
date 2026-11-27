@@ -1273,6 +1273,7 @@ impl Runtime {
         // The constructors have no view of live state, so the status the
         // runtime is actually holding is filled in here.
         for account in &mut out {
+            account.disconnected = state.accounts.is_disconnected(&account.id);
             account.auto_idle = self.auto_idle_applies(state, &account.id);
             account.status = self.effective_status(state, &account.id);
             account.status_text = self.account_status_text(&account.id);
@@ -1988,7 +1989,11 @@ impl Runtime {
             self.connected_at.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
         }
         self.conn_states.lock().unwrap().insert(account_id.to_string(), conn.clone());
-        let mut data = json!({ "accountId": account_id, "state": conn.as_str() });
+        let mut data = json!({
+            "accountId": account_id,
+            "state": conn.as_str(),
+            "disconnected": state.accounts.is_disconnected(account_id),
+        });
         if let Some(e) = error {
             data["error"] = json!(e);
         }
