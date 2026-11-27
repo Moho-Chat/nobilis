@@ -5844,6 +5844,22 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // The server's own search, from the conversation's search box: in this conversation, or everywhere on the server.
+        // Mattermost's `from:`, `in:`, `on:`, `before:` and `after:` are the server's to read.
+        "searchMattermostMessages" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("mattermost:")) else {
+                return (None, Some("searchMattermostMessages requires a Mattermost \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id) else {
+                return (None, Some("that Mattermost account is not connected".to_string()));
+            };
+            let everywhere = p_str(params, "scope", "room") == "account";
+            match backend::mattermost::extra::search(state, &handle, (!everywhere).then_some(&buffer), p_str(params, "query", ""), p_i64(params, "limit", 25) as usize).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Mattermost's own verbs (backend/mattermost): one call, with what to do.
         "mattermost" => {
             let action = p_str(params, "action", "");
@@ -5862,6 +5878,7 @@ pub async fn dispatch(
                     "saved" => extra::saved(state, &handle).await?,
                     "setSaved" => {
                         extra::set_saved(&handle, p_str(params, "messageId", ""), p_bool(params, "saved", true)).await?;
+                        extra::saved_changed(state, &handle);
                         serde_json::json!({ "ok": true })
                     }
                     "threads" => extra::threads(state, &handle, &team, p_bool(params, "unread", false)).await?,

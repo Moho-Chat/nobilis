@@ -52,7 +52,14 @@ pub async fn search(state: &AppState, handle: &Handle, buffer: Option<&Buffer>, 
     let (team, terms) = match buffer {
         Some(buffer) => {
             let channel = channel_of(buffer)?;
-            let name = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get(&channel).map(|c| c.name.clone()).unwrap_or_default();
+            // A direct message is searched in by the other person's name, as Mattermost's own box writes it.
+            let name = {
+                let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                world.channels.get(&channel).map(|c| match c.other(&world.own_id).and_then(|o| world.username_of(&o)) {
+                    Some(username) => format!("@{username}"),
+                    None => c.name.clone(),
+                }).unwrap_or_default()
+            };
             let scoped = if query.contains("in:") || name.is_empty() { query.to_string() } else { format!("{query} in:{name}") };
             (team_for(handle, &channel), scoped)
         }

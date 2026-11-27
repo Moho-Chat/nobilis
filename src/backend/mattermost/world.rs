@@ -38,7 +38,9 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
-    pub fn from_config(config: &Value, plugins: &Value) -> Self {
+    /// What the server says of itself, its plugins, and its licence (priority and acknowledgements are a licensed
+    /// feature: a server without one refuses them).
+    pub fn from_config(config: &Value, plugins: &Value, license: &Value) -> Self {
         let text = |k: &str| config[k].as_str().unwrap_or("").to_string();
         let on = |k: &str| config[k].as_str() == Some("true");
         let number = |k: &str, d: u64| config[k].as_str().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
@@ -52,7 +54,7 @@ impl ServerInfo {
             collapsed_threads: config["CollapsedThreads"].as_str().unwrap_or("disabled").to_string(),
             teammate_name: config["TeammateNameDisplay"].as_str().filter(|v| !v.is_empty()).unwrap_or("username").to_string(),
             custom_statuses: on("EnableCustomUserStatuses"),
-            post_priority: on("PostPriority"),
+            post_priority: on("PostPriority") && license["IsLicensed"].as_str() == Some("true"),
             synced_drafts: on("AllowSyncedDrafts"),
             plugins: plugins.as_array().into_iter().flatten().filter_map(|p| p["id"].as_str().map(str::to_string)).collect(),
             reaction_limit: number("UniqueEmojiReactionLimitPerPost", 50) as usize,

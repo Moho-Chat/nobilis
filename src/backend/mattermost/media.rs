@@ -90,7 +90,15 @@ pub async fn restore_cached(state: &crate::state::AppState, file: &Path) -> Resu
     }
     let account = source["account"].as_str().unwrap_or("");
     let handle = state.runtime.mattermost_handle(account).ok_or_else(|| anyhow!("that Mattermost account is not connected"))?;
-    let (bytes, _) = handle.api.bytes(path).await.map_err(|e| anyhow!("{e}"))?;
+    // A picture's preview is made by the server after the upload, and a small one may never be: the file itself is the
+    // picture then.
+    let (bytes, _) = match handle.api.bytes(path).await {
+        Ok(got) => got,
+        Err(e) => match path.strip_suffix("/preview").or_else(|| path.strip_suffix("/thumbnail")) {
+            Some(file) => handle.api.bytes(file).await.map_err(|e| anyhow!("{e}"))?,
+            None => return Err(anyhow!("{e}")),
+        },
+    };
     if let Some(parent) = file.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

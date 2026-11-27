@@ -115,7 +115,8 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
     let own_id = me["id"].as_str().ok_or_else(|| anyhow!("the server did not say who this is"))?.to_string();
     let client_config = api.get("/api/v4/config/client", &[("format", "old".to_string())]).await.map_err(anyhow::Error::from)?;
     let plugins = api.get("/api/v4/plugins/webapp", &[]).await.unwrap_or(Value::Null);
-    let server = Arc::new(ServerInfo::from_config(&client_config, &plugins));
+    let license = api.get("/api/v4/license/client", &[("format", "old".to_string())]).await.unwrap_or(Value::Null);
+    let server = Arc::new(ServerInfo::from_config(&client_config, &plugins, &license));
     let username = me["username"].as_str().unwrap_or("").to_string();
     if username != config.username {
         let _ = state.accounts.mutate_mattermost(account_id, |a| a.username = username.clone());

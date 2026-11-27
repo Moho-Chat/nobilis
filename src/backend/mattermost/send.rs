@@ -65,7 +65,10 @@ pub async fn send_with(state: &AppState, buffer: &Buffer, body: &str, reply_to: 
     if !file_ids.is_empty() {
         post["file_ids"] = json!(file_ids);
     }
-    if let Some((level, ack)) = priority.filter(|_| handle.server.post_priority) {
+    if let Some((level, ack)) = priority {
+        if !handle.server.post_priority {
+            return Err("This server does not have message priority (it needs a Mattermost licence)".to_string());
+        }
         post["metadata"] = json!({ "priority": { "priority": if level == "standard" { "" } else { level }, "requested_ack": ack } });
     }
     let sent = handle.api.post("/api/v4/posts", &post).await.map_err(words)?;
