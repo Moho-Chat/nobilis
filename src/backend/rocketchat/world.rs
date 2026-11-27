@@ -378,7 +378,11 @@ impl World {
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
         }
-        if let Some(e2e_key) = v["E2EKey"].as_str().filter(|s| !s.is_empty()) {
+        if let Some(e2e_key) = v["E2EKey"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| v["E2ESuggestedKey"].as_str().filter(|s| !s.is_empty()))
+        {
             entry.e2e_key = Some(e2e_key.to_string());
             entry.encrypted = true;
         }

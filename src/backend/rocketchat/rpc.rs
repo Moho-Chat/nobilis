@@ -45,7 +45,11 @@ pub async fn dispatch(
             };
             let route_key = p_str(params, "routeKey").unwrap_or("rocketchat:discover");
             if p_bool(params, "useTor", false) {
-                crate::net::route::router().mark(route_key, true);
+                let router = crate::net::route::router();
+                router.mark(route_key, true);
+                if let Err(e) = router.ready(|_| {}).await {
+                    return Some((None, Some(format!("proxy/Tor not ready: {e:#}"))));
+                }
             }
             match discovery::discover(route_key, url).await {
                 Ok(info) => (Some(serde_json::to_value(info).unwrap_or(Value::Null)), None),
@@ -64,7 +68,13 @@ pub async fn dispatch(
             let code = p_str(params, "code");
             let use_tor = p_bool(params, "useTor", false);
             let route_key = "rocketchat:login";
-            crate::net::route::router().mark(route_key, use_tor);
+            let router = crate::net::route::router();
+            router.mark(route_key, use_tor);
+            if use_tor || router.tunnel_all() {
+                if let Err(e) = router.ready(|_| {}).await {
+                    return Some((None, Some(format!("proxy/Tor not ready: {e:#}"))));
+                }
+            }
             match login::login_password(route_key, url, user, password, code, use_tor).await {
                 Ok(login::LoginOutcome::TotpRequired { method }) => (
                     Some(json!({ "totpRequired": true, "method": method })),
@@ -96,7 +106,13 @@ pub async fn dispatch(
             let made_here = p_bool(params, "madeHere", false);
             let use_tor = p_bool(params, "useTor", false);
             let route_key = "rocketchat:login";
-            crate::net::route::router().mark(route_key, use_tor);
+            let router = crate::net::route::router();
+            router.mark(route_key, use_tor);
+            if use_tor || router.tunnel_all() {
+                if let Err(e) = router.ready(|_| {}).await {
+                    return Some((None, Some(format!("proxy/Tor not ready: {e:#}"))));
+                }
+            }
             match login::login_token(route_key, url, user_id, token, made_here, use_tor).await {
                 Ok(mut cfg) => {
                     if let Some(pass) = p_str(params, "e2eePassphrase") {

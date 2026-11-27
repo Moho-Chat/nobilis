@@ -58,10 +58,7 @@ pub async fn list_livechat_rooms(handle: &Handle, open_only: bool) -> Result<Val
 }
 
 /// Close an Omnichannel / Livechat room (`POST /api/v1/livechat/room.close`).
-pub async fn close_livechat_room(handle: &Handle, room_id: &str, token: &str, comment: Option<&str>) -> Result<Value> {
-    let mut body = json!({ "rid": room_id, "token": token });
-    if let Some(c) = comment.filter(|s| !s.is_empty()) {
-        body["comment"] = json!(c);
-    }
+pub async fn close_livechat_room(handle: &Handle, room_id: &str, token: &str, _comment: Option<&str>) -> Result<Value> {
+    let body = json!({ "rid": room_id, "token": token });
     Ok(handle.api.post("/api/v1/livechat/room.close", &body).await?)
 }

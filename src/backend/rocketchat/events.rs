@@ -179,6 +179,15 @@ pub fn handle_ddp(state: &AppState, handle: &Handle, msg: DdpMessage) {
                                 world.merge_room_json(room_val).and_then(|rid| world.rooms.get(&rid).cloned())
                             };
                             if let Some(room) = room {
+                                // Auto-unwrap newly received E2EKey if user's E2EE keypair is already unlocked.
+                                if let Some(enc_key) = room.e2e_key.as_deref() {
+                                    let mut e2ee = handle.e2ee.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some(priv_key) = e2ee.private_key.as_ref() {
+                                        if let Ok((kid, ks)) = super::e2ee::unwrap_room_key(enc_key, priv_key) {
+                                            e2ee.room_keys.insert(room.id.clone(), (kid, ks));
+                                        }
+                                    }
+                                }
                                 register_room(state, handle, &room);
                             }
                         }
@@ -196,6 +205,15 @@ pub fn handle_ddp(state: &AppState, handle: &Handle, msg: DdpMessage) {
                                 world.merge_subscription_json(sub_val).and_then(|rid| world.rooms.get(&rid).cloned())
                             };
                             if let Some(room) = room {
+                                // Auto-unwrap newly received E2EKey if user's E2EE keypair is already unlocked.
+                                if let Some(enc_key) = room.e2e_key.as_deref() {
+                                    let mut e2ee = handle.e2ee.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some(priv_key) = e2ee.private_key.as_ref() {
+                                        if let Ok((kid, ks)) = super::e2ee::unwrap_room_key(enc_key, priv_key) {
+                                            e2ee.room_keys.insert(room.id.clone(), (kid, ks));
+                                        }
+                                    }
+                                }
                                 register_room(state, handle, &room);
                                 if room.unread == 0 && !room.alert {
                                     if let Some(buf) = messages::buffer_of(state, &handle.account_id, &room.id) {

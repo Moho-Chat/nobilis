@@ -55,7 +55,21 @@ pub async fn upload_file(
                     confirm["tmid"] = serde_json::json!(tmid);
                 }
                 if let Some(meta) = encryption_meta {
-                    confirm["content"] = meta;
+                    // Encrypt the file key metadata under the room's E2EE session key Ks (`rc.v1.aes-sha2`)
+                    // when unlocked, matching Rocket.Chat v7/v8/v9 `rooms.mediaConfirm` schema.
+                    let room_ks = handle
+                        .e2ee
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .room_keys
+                        .get(room_id)
+                        .map(|(_, k)| *k);
+                    if let Some(ks) = room_ks {
+                        if let Ok(enc_content) = super::e2ee::encrypt_message_gcm(&ks, &meta) {
+                            confirm["t"] = serde_json::json!("e2e");
+                            confirm["content"] = enc_content;
+                        }
+                    }
                 }
                 let confirmed = handle
                     .api

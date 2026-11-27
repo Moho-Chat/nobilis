@@ -189,24 +189,30 @@ pub fn wrap_room_key(ks: &[u8; 32], key_id: &str, recipient_pub: &RsaPublicKey) 
     Ok(format!("{key_id}{}", B64.encode(enc)))
 }
 
-/// Unwrap a subscription's `E2EKey` using our RSA-OAEP private key.
+/// Unwrap a subscription's `E2EKey` or `E2ESuggestedKey` using our RSA-OAEP private key.
+/// Supports both `<12-char key_id><base64>` and bare `<base64>` formats.
 pub fn unwrap_room_key(e2e_key: &str, priv_key: &RsaPrivateKey) -> Result<(String, [u8; 32])> {
-    if e2e_key.len() <= KEY_ID_LEN {
-        anyhow::bail!("E2EKey too short");
+    let try_decrypt = |b64_str: &str| -> Result<[u8; 32]> {
+        let enc = B64.decode(b64_str.trim()).context("decoding E2EKey base64")?;
+        let pt = priv_key
+            .decrypt(Oaep::new::<Sha256>(), &enc)
+            .context("RSA-OAEP decrypting room key")?;
+        let jwk: Value = serde_json::from_slice(&pt).context("parsing room key JWK")?;
+        let k_bytes = B64URL
+            .decode(jwk["k"].as_str().ok_or_else(|| anyhow!("room key JWK missing k"))?)
+            .context("decoding room key k")?;
+        k_bytes
+            .try_into()
+            .map_err(|_| anyhow!("room key is not 256-bit"))
+    };
+
+    if e2e_key.len() > KEY_ID_LEN {
+        if let Ok(ks) = try_decrypt(&e2e_key[KEY_ID_LEN..]) {
+            return Ok((e2e_key[..KEY_ID_LEN].to_string(), ks));
+        }
     }
-    let (key_id, rest) = e2e_key.split_at(KEY_ID_LEN);
-    let enc = B64.decode(rest).context("decoding E2EKey base64")?;
-    let pt = priv_key
-        .decrypt(Oaep::new::<Sha256>(), &enc)
-        .context("RSA-OAEP decrypting room key")?;
-    let jwk: Value = serde_json::from_slice(&pt).context("parsing room key JWK")?;
-    let k_bytes = B64URL
-        .decode(jwk["k"].as_str().ok_or_else(|| anyhow!("room key JWK missing k"))?)
-        .context("decoding room key k")?;
-    let ks: [u8; 32] = k_bytes
-        .try_into()
-        .map_err(|_| anyhow!("room key is not 256-bit"))?;
-    Ok((key_id.to_string(), ks))
+    let ks = try_decrypt(e2e_key)?;
+    Ok((room_key_id(&ks), ks))
 }
 
 /// Encrypt a plaintext message in legacy AES-256-CBC (PKCS#7) mode (`<key_id><base64(iv || ct)>`).
@@ -358,6 +364,29 @@ pub async fn unlock_with_passphrase(handle: &Handle, passphrase: &str) -> Result
         (priv_key, pub_jwk, true)
     };
 
+    // Refresh subscriptions so newly distributed E2EKey / E2ESuggestedKey values are picked up.
+    if let Ok(subs) = handle.api.get("/api/v1/subscriptions.get", &[]).await {
+        let mut suggested_rids = Vec::new();
+        {
+            let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+            for s in subs["update"].as_array().into_iter().flatten() {
+                if s["E2ESuggestedKey"].as_str().is_some_and(|k| !k.is_empty()) {
+                    if let Some(rid) = s["rid"].as_str() {
+                        suggested_rids.push(rid.to_string());
+                    }
+                }
+                world.merge_subscription_json(s);
+            }
+        }
+        // Accept suggested group keys on the server (Rocket.Chat v7/v8/v9 protocol)
+        for rid in suggested_rids {
+            let _ = handle
+                .api
+                .post("/api/v1/e2e.acceptSuggestedGroupKey", &json!({ "rid": rid }))
+                .await;
+        }
+    }
+
     // Unwrap every subscription's E2EKey we already have
     let room_e2e_keys: Vec<(String, String)> = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
@@ -498,10 +527,41 @@ pub async fn distribute_room_keys(handle: &Handle, room_id: &str) -> Result<usiz
     Ok(distributed)
 }
 
-/// Reset own E2EE keypair on server (`POST /api/v1/e2e.resetOwnE2EKey`).
+/// Reset own E2EE keypair on server (`POST /api/v1/users.resetE2EKey` or legacy `e2e.resetOwnE2EKey`).
 /// Clears local E2EE state; user will lose access to previous encrypted rooms until re-invited.
 pub async fn reset_own_key(handle: &Handle) -> Result<Value> {
-    let resp = handle.api.post("/api/v1/e2e.resetOwnE2EKey", &json!({})).await?;
+    let own_id = handle
+        .world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .own_id
+        .clone();
+    let resp = match handle
+        .api
+        .post("/api/v1/users.resetE2EKey", &json!({ "userId": own_id }))
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            // Fallback for older servers or non-admin self-reset via DDP method
+            let method_payload = json!({
+                "message": json!({
+                    "msg": "method",
+                    "id": super::ddp::next_id("e2e-reset"),
+                    "method": "e2e.resetOwnE2EKey",
+                    "params": [],
+                }).to_string()
+            });
+            match handle
+                .api
+                .post("/api/v1/method.call/e2e.resetOwnE2EKey", &method_payload)
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => handle.api.post("/api/v1/e2e.resetOwnE2EKey", &json!({})).await?,
+            }
+        }
+    };
     let mut e2ee = handle.e2ee.lock().unwrap_or_else(|e| e.into_inner());
     *e2ee = E2eeState::default();
     Ok(resp)
