@@ -76,6 +76,25 @@ pub fn words(status: u16, id: &str, message: &str) -> String {
     }
 }
 
+/// What a failure to reach the server says: the request's own words, and - since a refused certificate is the failure a
+/// person can act on - that in plain words, found in the error's causes.
+pub fn network_words(e: &reqwest::Error) -> String {
+    let mut causes = Vec::new();
+    let mut source: Option<&dyn std::error::Error> = std::error::Error::source(e);
+    while let Some(s) = source {
+        causes.push(s.to_string());
+        source = s.source();
+    }
+    let all = causes.join(": ");
+    if all.contains("certificate") || all.contains("UnknownIssuer") || all.contains("NotValidForName") {
+        return format!("the server's certificate is not trusted ({}). moho accepts only certificates the system trusts", causes.last().cloned().unwrap_or_default());
+    }
+    match causes.last() {
+        Some(cause) => format!("{e} ({cause})"),
+        None => e.to_string(),
+    }
+}
+
 /// Calls left before the server's window fills again.
 struct Bucket {
     remaining: u32,
@@ -176,7 +195,7 @@ impl Api {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+            let response = request.send().await.map_err(|e| ApiError::Network(network_words(&e)))?;
             self.learn(response.headers());
             let status = response.status();
             let headers = response.headers().clone();
@@ -210,7 +229,7 @@ impl Api {
             let part = reqwest::multipart::Part::bytes(bytes).file_name(name).mime_str(&content_type).map_err(|e| ApiError::Network(e.to_string()))?;
             form = form.part("files", part);
         }
-        let response = self.authorised(self.http.post(format!("{}/api/v4/files", self.base))).multipart(form).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = self.authorised(self.http.post(format!("{}/api/v4/files", self.base))).multipart(form).send().await.map_err(|e| ApiError::Network(network_words(&e)))?;
         self.learn(response.headers());
         let status = response.status();
         let text = response.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
@@ -225,7 +244,7 @@ impl Api {
     pub async fn upload_image(&self, path: &str, name: &str, content_type: &str, bytes: Vec<u8>) -> Result<(), ApiError> {
         let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_string()).mime_str(content_type).map_err(|e| ApiError::Network(e.to_string()))?;
         let form = reqwest::multipart::Form::new().part("image", part);
-        let response = self.authorised(self.http.post(format!("{}{path}", self.base))).multipart(form).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = self.authorised(self.http.post(format!("{}{path}", self.base))).multipart(form).send().await.map_err(|e| ApiError::Network(network_words(&e)))?;
         let status = response.status();
         if !status.is_success() {
             let json: Value = response.json().await.unwrap_or(Value::Null);
@@ -240,7 +259,7 @@ impl Api {
         if self.halted() {
             return Err(ApiError::Unauthorized);
         }
-        let response = self.authorised(self.http.get(format!("{}{path}", self.base))).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = self.authorised(self.http.get(format!("{}{path}", self.base))).send().await.map_err(|e| ApiError::Network(network_words(&e)))?;
         let status = response.status();
         if !status.is_success() {
             let json: Value = response.json().await.unwrap_or(Value::Null);
