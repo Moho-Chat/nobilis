@@ -50,6 +50,7 @@ pub fn entry(handle: &Handle, user: &User, admin: bool) -> Value {
     let status = status_word(&user.status);
     json!({
         "nick": world.name_of(&user.id, &handle.server.teammate_name),
+        "username": user.username,
         "userId": user.id,
         "prefix": if admin { "@" } else { "" },
         "away": status == "offline",
