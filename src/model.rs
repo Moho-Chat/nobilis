@@ -988,6 +988,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("stoat") => "stoat",
         Some("fluxer") => "fluxer",
         Some("mattermost") => "mattermost",
+        Some("googlechat") => "googlechat",
         Some("signal") => "signal",
         Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",

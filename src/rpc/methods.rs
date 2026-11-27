@@ -140,6 +140,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_rocketchat(id) {
             backend::rocketchat::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("googlechat:") {
+        if let Some(cfg) = state.accounts.get_googlechat(id) {
+            backend::googlechat::spawn(state.clone(), cfg);
+        }
     } else if id.starts_with("signal:") {
         // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
         // where an account set to strict Tor stayed on its direct connection).
@@ -176,6 +180,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
         "addFluxerAccount" | "addFluxerAccountToken" => Some("fluxer"),
         "addMattermostAccount" | "addMattermostAccountToken" => Some("mattermost"),
+        "addGoogleChatAccount" => Some("googlechat"),
         "addSignalAccount" => Some("signal"),
         "addXmppAccount" => Some("xmpp"),
         _ => None,
@@ -608,6 +613,7 @@ pub async fn dispatch(
                 { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
                 { "id": "rocketchat", "name": "Rocket.Chat", "available": true },
+                { "id": "googlechat", "name": "Google Chat", "available": true },
             ])),
             None,
         ),
@@ -718,6 +724,14 @@ pub async fn dispatch(
                             let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
                             if let Err(e) = backend::mattermost::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("mattermost history: {e:#}");
+                            }
+                        }
+                    }
+                    // Google Chat's topics have no cursor: reading further back asks for more of the newest ones.
+                    if buffer.account_id.starts_with("googlechat:") {
+                        if let Some(handle) = state.runtime.googlechat_handle(&buffer.account_id) {
+                            if let Err(e) = backend::googlechat::messages::history(state, &handle, &buffer, before > 0).await {
+                                tracing::debug!("googlechat history: {e:#}");
                             }
                         }
                     }
@@ -1080,6 +1094,8 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_rocketchat_handle(id);
+                        // A Google session is the browser's: nothing is ended at Google, the cookies are just forgotten.
+                        state.runtime.clear_googlechat_handle(id);
                         if let Some(config) = signal_account {
                             backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
@@ -1216,6 +1232,14 @@ pub async fn dispatch(
                         match state.accounts.get_rocketchat(id) {
                             Some(cfg) => {
                                 backend::rocketchat::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("googlechat:") {
+                        match state.accounts.get_googlechat(id) {
+                            Some(cfg) => {
+                                backend::googlechat::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -1811,6 +1835,12 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("mattermost:") => {
                     if let Err(e) = backend::mattermost::send::mark_read(state, &buffer).await {
                         tracing::debug!("mattermost read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => {
+                    if let Err(e) = backend::googlechat::send::mark_read(state, &buffer).await {
+                        tracing::debug!("googlechat read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -4513,6 +4543,18 @@ pub async fn dispatch(
                         }
                     }
                     match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => {
+                    let has_files = params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) || attachment_path.is_some();
+                    if has_files {
+                        return (None, Some("Sending files to Google Chat is not built yet".to_string()));
+                    }
+                    // A reply in a thread names the thread's topic; Google's topic id is its first message's id.
+                    let thread = p_str_opt(params, "threadId").or(reply_to_id.filter(|_| p_bool(params, "inThread", false)));
+                    match backend::googlechat::send::send_text(state, &buffer, body, thread).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }
@@ -10352,6 +10394,9 @@ pub async fn dispatch(
 
         other => {
             if let Some(res) = backend::rocketchat::rpc::dispatch(state, other, params).await {
+                return res;
+            }
+            if let Some(res) = backend::googlechat::rpc::dispatch(state, other, params).await {
                 return res;
             }
             (None, Some(format!("unknown method \"{other}\"")))

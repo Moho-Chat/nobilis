@@ -403,6 +403,11 @@ async fn run() -> Result<()> {
             backend::rocketchat::spawn(state.clone(), cfg);
         }
     }
+    for cfg in state.accounts.all_googlechat() {
+        if !state.accounts.is_disconnected(&cfg.account_id()) {
+            backend::googlechat::spawn(state.clone(), cfg);
+        }
+    }
     for cfg in state.accounts.all_signal() {
         if !state.accounts.is_disconnected(&cfg.account_id()) {
             backend::signal::spawn(state.clone(), cfg);

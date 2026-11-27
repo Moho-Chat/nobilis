@@ -5332,6 +5332,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "presage",
  "prost",
+ "prost-types",
  "protobuf",
  "pulldown-cmark",
  "qrcode",

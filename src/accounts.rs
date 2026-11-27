@@ -749,6 +749,48 @@ impl RocketChatAccountConfig {
     }
 }
 
+/// A Google Chat account: a consumer Gmail or Google Workspace sign-in, made in a browser window on Google's own pages
+/// (see backend/googlechat and Gitea issue #30). Google offers third-party clients no OAuth for Chat, so the account
+/// is the session that sign-in left - its cookies, which are as private as a password and a second factor together:
+/// kept here, never logged, never put in an address.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GoogleChatAccountConfig {
+    /// Google's numeric id for the person (the "gaia" id). The account's id here is built from it.
+    #[serde(default)]
+    pub user_id: String,
+    /// The account's email address, for the sidebar.
+    #[serde(default)]
+    pub email: String,
+    /// The person's name as Google has it.
+    #[serde(default)]
+    pub name: String,
+    /// The session: every cookie Google set for chat.google.com, by name. Rotated values are saved as they come.
+    #[serde(default)]
+    pub cookies: std::collections::BTreeMap<String, String>,
+    /// The sign-in window's user agent, which the daemon's requests carry so the session sees one browser.
+    #[serde(default)]
+    pub user_agent: String,
+    /// What to call this account here. Local: Google is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl GoogleChatAccountConfig {
+    pub fn account_id(&self) -> String {
+        crate::backend::googlechat::account_id(&self.user_id)
+    }
+
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && self.cookies.contains_key("SID")
+    }
+}
+
 /// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
 /// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
 /// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
@@ -933,6 +975,8 @@ struct AccountsFile {
     xmpp: Vec<XmppAccountConfig>,
     #[serde(default, rename = "rocketchat_account")]
     rocketchat: Vec<RocketChatAccountConfig>,
+    #[serde(default, rename = "googlechat_account")]
+    googlechat: Vec<GoogleChatAccountConfig>,
     /// Account ids the user explicitly disconnected, so they stay disconnected
     /// across restarts until reconnected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -970,6 +1014,8 @@ pub struct AccountStore {
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
     /// And this one.
     rocketchat: Mutex<HashMap<String, RocketChatAccountConfig>>,
+    /// And this one.
+    googlechat: Mutex<HashMap<String, GoogleChatAccountConfig>>,
     /// Account ids the user explicitly disconnected.
     disconnected: Mutex<std::collections::BTreeSet<String>>,
 }
@@ -982,7 +1028,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, googlechat, disconnected) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -1001,10 +1047,11 @@ impl AccountStore {
             let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
             let mattermost = file.mattermost.into_iter().map(|a| (a.account_id(), a)).collect();
             let rocketchat = file.rocketchat.into_iter().map(|a| (a.account_id(), a)).collect();
+            let googlechat = file.googlechat.into_iter().map(|a| (a.account_id(), a)).collect();
             let disconnected = file.disconnected.into_iter().collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, disconnected)
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat, googlechat, disconnected)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), std::collections::BTreeSet::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), std::collections::BTreeSet::new())
         };
         Ok(Self {
             path,
@@ -1022,6 +1069,7 @@ impl AccountStore {
             mattermost: Mutex::new(mattermost),
             xmpp: Mutex::new(xmpp),
             rocketchat: Mutex::new(rocketchat),
+            googlechat: Mutex::new(googlechat),
             disconnected: Mutex::new(disconnected),
         })
     }
@@ -1052,6 +1100,7 @@ impl AccountStore {
             mattermost: self.mattermost.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
             rocketchat: self.rocketchat.lock().unwrap().values().cloned().collect(),
+            googlechat: self.googlechat.lock().unwrap().values().cloned().collect(),
             disconnected: self.disconnected.lock().unwrap().iter().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
@@ -1093,6 +1142,7 @@ impl AccountStore {
             || self.get_xmpp(account_id).is_some()
             || self.get_signal(account_id).is_some()
             || self.get_rocketchat(account_id).is_some()
+            || self.get_googlechat(account_id).is_some()
     }
 
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
@@ -1511,6 +1561,44 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_googlechat(&self, account_id: &str) -> Option<GoogleChatAccountConfig> {
+        self.googlechat.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_googlechat(&self) -> Vec<GoogleChatAccountConfig> {
+        self.googlechat.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again replaces the session and keeps what the person set up here.
+    pub fn add_googlechat(&self, mut config: GoogleChatAccountConfig) -> Result<GoogleChatAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut gc = self.googlechat.lock().unwrap();
+            if let Some(old) = gc.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            gc.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    pub fn mutate_googlechat(&self, account_id: &str, change: impl FnOnce(&mut GoogleChatAccountConfig)) -> Result<bool> {
+        {
+            let mut gc = self.googlechat.lock().unwrap();
+            match gc.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
         self.xmpp.lock().unwrap().get(account_id).cloned()
     }
@@ -1783,6 +1871,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.googlechat.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -1832,6 +1924,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_rocketchat(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_googlechat(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1991,7 +2086,8 @@ impl AccountStore {
         }
         {
             let removed = self.mattermost.lock().unwrap().remove(account_id).is_some()
-                || self.rocketchat.lock().unwrap().remove(account_id).is_some();
+                || self.rocketchat.lock().unwrap().remove(account_id).is_some()
+                || self.googlechat.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -2196,6 +2292,9 @@ impl AccountStore {
         if self.mutate_rocketchat(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_googlechat(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -2251,6 +2350,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.rocketchat.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.googlechat.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -2777,6 +2879,52 @@ pub fn mattermost_account_to_json(a: &MattermostAccountConfig, state: &str) -> A
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        disconnected: false,
+        stop_reason: String::new(),
+        reactions: false,
+    }
+}
+
+/// Google Chat has none of IRC's concepts. `has_password` says there is a session behind the account.
+pub fn googlechat_account_to_json(a: &GoogleChatAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "googlechat".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.email.clone()).filter(|s| !s.is_empty()))
+            .or_else(|| Some(a.name.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: a.name.clone(),
         highlight_keywords: Vec::new(),
         ssl: true,
         has_password: a.is_signed_in(),
