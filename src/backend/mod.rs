@@ -14,6 +14,7 @@ pub mod discord;
 pub mod irc;
 pub mod kick;
 pub mod matrix;
+pub mod rocketchat;
 pub mod signal;
 pub mod sneedchat;
 pub mod steam;
