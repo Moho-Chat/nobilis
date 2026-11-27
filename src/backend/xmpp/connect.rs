@@ -176,11 +176,19 @@ async fn attempt(state: &AppState, account_id: &str, connector: &Connector, iden
             super::sasl::Way::Password
         },
     };
+    let no_sm = observed.lock().unwrap_or_else(|e| e.into_inner()).sm_declined;
     let (raw, bindings) = connector.open(identity).await.map_err(LoginError::Transport)?;
     let wire = super::wire::Wire::new(raw, observed.clone());
-    let resumable = observed.lock().unwrap_or_else(|e| e.into_inner()).resumable;
+    let resumable = {
+        let mut o = observed.lock().unwrap_or_else(|e| e.into_inner());
+        o.sm_on = false;
+        if no_sm {
+            o.resumable = false;
+        }
+        o.resumable
+    };
     let tap = connector.tap.clone();
-    let outcome = super::login::login(wire, bindings, identity, &creds, resumable, move |w| Box::new(super::tap::Tapped::new(w, tap)) as Box<dyn tokio_xmpp::connect::AsyncReadAndWrite>, TIMEOUTS).await?;
+    let mut outcome = super::login::login(wire, bindings, identity, &creds, resumable, move |w| Box::new(super::tap::Tapped::new(w, tap)) as Box<dyn tokio_xmpp::connect::AsyncReadAndWrite>, TIMEOUTS).await?;
     observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error = None;
     tracing::info!("xmpp[{account_id}]: signed in with {}{}{}", outcome.mechanism, if outcome.sasl2 { " over SASL2" } else { "" }, if outcome.bound_inline { ", bound inline (Bind2)" } else { "" });
     {
@@ -203,6 +211,11 @@ async fn attempt(state: &AppState, account_id: &str, connector: &Connector, iden
             a.last_mechanism = how;
         });
     }
+    if no_sm && outcome.connection.features.stream_management.is_some() {
+        // The library enables stream management when the features offer it; without the offer it runs the stream bare.
+        tracing::info!("xmpp[{account_id}]: not asking for stream management: the server could not hold what it sent until acknowledged, and offers no resumption");
+        outcome.connection.features.stream_management = None;
+    }
     Ok(outcome.connection)
 }
 
@@ -214,7 +227,15 @@ fn reconnector(state: AppState, account_id: String, connector: Connector, identi
     Box::new(move |_preferred_location, mut slot| {
         let (state, account_id, connector, identity, seen, observed, stop, handed) = (state.clone(), account_id.clone(), connector.clone(), identity.clone(), seen.clone(), observed.clone(), stop.clone(), handed.clone());
         tokio::spawn(async move {
-            let quick = {
+            // The last connection ended because of stream management, which the next one goes without: a different
+            // attempt, not the same one again, so it is not held back as one that fell over at once.
+            let declined = std::mem::take(&mut observed.lock().unwrap_or_else(|e| e.into_inner()).sm_just_declined);
+            if declined {
+                tracing::info!("xmpp[{account_id}]: the server ended a stream it would not let resume because acknowledgements fell behind; connecting again without stream management");
+            }
+            let quick = if declined {
+                None
+            } else {
                 let mut h = handed.lock().unwrap_or_else(|e| e.into_inner());
                 match h.0 {
                     Some(at) if at.elapsed() < Duration::from_secs(10) => {
@@ -240,7 +261,7 @@ fn reconnector(state: AppState, account_id: String, connector: Connector, identi
             // How the last connection ended, if the server said.
             // Read, not taken: the account's task says it too, and may get to it after this. It is cleared once signed in again.
             let ended = observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error.clone();
-            if let Some(e) = &ended {
+            if let Some(e) = ended.as_ref().filter(|_| !declined) {
                 state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, Some(&super::login::stream_error_words(e).0));
                 match e.condition.as_str() {
                     "conflict" => {
@@ -482,7 +503,14 @@ async fn run(state: &AppState, account_id: &str) {
                     }
                     Event::Stream(StreamEvent::Suspended) => {
                         // If the server said why, it is said here too.
-                        let why = observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error.clone().map(|e| super::login::stream_error_words(&e).0);
+                        let why = {
+                            let o = observed.lock().unwrap_or_else(|e| e.into_inner());
+                            match &o.stream_error {
+                                // Handled: the next connection goes without stream management (see `Observed::sm_declined`).
+                                Some(e) if o.sm_declined && e.condition == "resource-constraint" => Some("The server could not keep up with acknowledgements; connecting again without stream management".to_string()),
+                                e => e.as_ref().map(|e| super::login::stream_error_words(e).0),
+                            }
+                        };
                         tracing::info!("xmpp[{account_id}]: the connection dropped{}; the session is kept for resuming", why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
                         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, why.as_deref())
                     }

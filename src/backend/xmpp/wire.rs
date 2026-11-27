@@ -28,6 +28,16 @@ pub struct Observed {
     pub stream_error: Option<StreamError>,
     /// Whether the library holds a session it can resume (XEP-0198 `<enabled resume='true'/>` and not since lost).
     pub resumable: bool,
+    /// Stream management is on in this connection (the server answered `<enabled/>`).
+    pub sm_on: bool,
+    /// Stream management is not asked for again while the account runs. Set when a server that enabled it *without*
+    /// resumption then ended the stream with `resource-constraint`: it could not hold what it had sent until acknowledged
+    /// (a large room's occupants on joining are enough), so with it on the account cannot stay connected. Enabling stream
+    /// management is the client's choice (XEP-0198 section 3), and with no resumption granted, going without it loses
+    /// nothing. A server that grants resumption never trips this. Not kept past the run: the next start asks again.
+    pub sm_declined: bool,
+    /// `sm_declined` was set by the connection that just ended: the next attempt is a different one, not a retry.
+    pub sm_just_declined: bool,
     /// The connection is to be treated as dead (it stopped answering after the computer woke up): the next read fails.
     cut: bool,
     /// Whoever is waiting to read, so a cut is noticed at once.
@@ -187,11 +197,18 @@ impl<S> Wire<S> {
             let text = String::from_utf8_lossy(&el);
             let mut o = self.observed.lock().unwrap_or_else(|e| e.into_inner());
             if text.starts_with("<stream:error") {
-                o.stream_error = Some(parse_stream_error(&text));
+                let e = parse_stream_error(&text);
+                if e.condition == "resource-constraint" && o.sm_on && !o.resumable && !o.sm_declined {
+                    o.sm_declined = true;
+                    o.sm_just_declined = true;
+                }
+                o.stream_error = Some(e);
                 o.resumable = false;
             } else if text.starts_with("<enabled") && text.contains("urn:xmpp:sm:3") {
+                o.sm_on = true;
                 o.resumable = ["resume='true'", "resume=\"true\"", "resume='1'", "resume=\"1\""].iter().any(|r| text.contains(r));
             } else if text.starts_with("<failed") && text.contains("urn:xmpp:sm:3") {
+                o.sm_on = false;
                 o.resumable = false;
             }
         }
@@ -450,5 +467,25 @@ mod tests {
         done = w.feed(b"ume='true' id='x'/><message><body>a</body></message>");
         assert_eq!(done.len(), 2);
         assert!(String::from_utf8_lossy(&done[0]).starts_with("<enabled"));
+    }
+
+    #[test]
+    fn a_server_that_falls_behind_without_granting_resumption_is_not_asked_for_stream_management_again() {
+        let error = b"<stream:error><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-streams'/><text xmlns='urn:ietf:params:xml:ns:xmpp-streams' xml:lang='en'>Too far behind.</text></stream:error>";
+        let run = |enabled: &str| {
+            let observed: ObservedSlot = Default::default();
+            let mut wire = Wire::new(tokio::io::empty(), observed.clone());
+            wire.watch(b"<stream:stream xmlns='jabber:client'>");
+            wire.watch(enabled.as_bytes());
+            wire.watch(error);
+            let o = observed.lock().unwrap().clone();
+            (o.sm_declined, o.stream_error.map(|e| e.condition))
+        };
+        let busy = Some("resource-constraint".to_string());
+        assert_eq!(run("<enabled xmlns='urn:xmpp:sm:3'/>"), (true, busy.clone()));
+        // A server that grants resumption keeps stream management: going without would lose what it offers.
+        assert_eq!(run("<enabled xmlns='urn:xmpp:sm:3' id='s1' resume='true'/>"), (false, busy.clone()));
+        // Without stream management the same words are a server that is busy, nothing more.
+        assert_eq!(run(""), (false, busy));
     }
 }
