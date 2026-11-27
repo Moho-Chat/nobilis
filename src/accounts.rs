@@ -666,6 +666,9 @@ pub struct MattermostAccountConfig {
     /// How the account signed in: `password`, `token` or `sso`.
     #[serde(default)]
     pub method: String,
+    /// The id of the session moho made (a password or the sign-in page), by which it is known in the account's list.
+    #[serde(default)]
+    pub session_id: String,
     /// What to call this account here. Local: the server is never told about it.
     #[serde(default)]
     pub display_name: Option<String>,

@@ -372,20 +372,22 @@ pub async fn set_avatar(handle: &Handle, path: &str) -> Result<()> {
 pub async fn sessions(handle: &Handle) -> Result<Value> {
     let own = handle.own_id();
     let list = handle.api.get(&format!("/api/v4/users/{own}/sessions"), &[]).await.map_err(|e| anyhow!("{e}"))?;
-    let token = handle.api.token().unwrap_or("").to_string();
+    let own_session = handle.world.lock().unwrap_or_else(|e| e.into_inner()).own_session.clone();
     let out: Vec<Value> = list
         .as_array()
         .into_iter()
         .flatten()
         .map(|s| {
             let props = &s["props"];
-            let what = [props["platform"].as_str(), props["os"].as_str(), props["browser"].as_str()].into_iter().flatten().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ");
+            let this = !own_session.is_empty() && s["id"].as_str() == Some(own_session.as_str());
+            let what = [props["platform"].as_str(), props["os"].as_str(), props["browser"].as_str()].into_iter().flatten().filter(|t| !t.is_empty() && !t.starts_with("Unknown")).collect::<Vec<_>>().join(", ");
+            let what = if this { "moho (this one)".to_string() } else if what.is_empty() { "Unknown".to_string() } else { what };
             json!({
                 "id": s["id"],
-                "what": if what.is_empty() { "Unknown".to_string() } else { what },
+                "what": what,
                 "lastActive": s["last_activity_at"].as_i64().map(|ms| ms / 1000),
                 "created": s["create_at"].as_i64().map(|ms| ms / 1000),
-                "this": !token.is_empty() && s["token"].as_str() == Some(token.as_str()),
+                "this": this,
                 "kind": if s["is_oauth"].as_bool() == Some(true) { "OAuth" } else if props["type"].as_str() == Some("UserAccessToken") { "Access token" } else { "Session" },
             })
         })

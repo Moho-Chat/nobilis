@@ -2,7 +2,8 @@
 //! holds the missed events, loaded afresh when it does not - and stopped, not retried, when the server has ended the
 //! session (the same token can never work again).
 //!
-//! One connection, one `authentication_challenge` (the token goes in a message, never in the address), then `hello`,
+//! One connection, authenticated in its upgrade's header and again by `authentication_challenge` (the token is never in
+//! the address), then `hello`,
 //! which names the connection, and the events after it, each numbered (`seq`). A reconnect asks for the same connection
 //! and the number after the last one heard; if the server answers `hello` with the same connection id, everything
 //! missed is replayed and nothing has to be loaded again. A ping goes every thirty seconds, as Mattermost's own app sends
@@ -25,6 +26,8 @@ const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 const PING_EVERY: Duration = Duration::from_secs(30);
 const SILENT_FOR: Duration = Duration::from_secs(90);
+/// How many pings go between asking whether the session still is one (every five minutes).
+const SESSION_CHECK_PINGS: u64 = 10;
 
 /// How a connection ended.
 #[derive(Debug, PartialEq)]
@@ -119,24 +122,41 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
     }
 
     let address = socket_address(&config.server, &carry.connection_id, carry.next_seq)?;
-    let (socket, _) = crate::net::route::websocket(account_id, address).await.context("connecting to the websocket")?;
+    // The session goes in the upgrade's header, as Mattermost's own apps send theirs: a connection the server knows the
+    // session of at once is one it can resume, and one it learns of only from the challenge after is always new.
+    let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(address.as_str()).context("the websocket's address")?;
+    request.headers_mut().insert("Authorization", format!("Bearer {}", config.token).parse().context("the session")?);
+    let (socket, _) = crate::net::route::websocket(account_id, request).await.context("connecting to the websocket")?;
     let (mut sink, mut stream) = socket.split();
     let (outgoing_tx, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<String>();
     let world = carry.world.clone().unwrap_or_else(|| Arc::new(Mutex::new(World::default())));
-    world.lock().unwrap_or_else(|e| e.into_inner()).own_id = own_id.clone();
+    {
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+        w.own_id = own_id.clone();
+        w.own_session = config.session_id.clone();
+    }
     if let Some(user) = super::world::parse_user(&me) {
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
         w.system_roles = user.roles.split_whitespace().map(str::to_string).collect();
         w.users.insert(user.id.clone(), user);
     }
     let handle = Handle { account_id: account_id.to_string(), api: api.clone(), world: world.clone(), server: server.clone(), socket: outgoing_tx };
-    // The token goes in a message, so it is never in an address a log could hold.
+    // The challenge too, which a server that took no notice of the header answers; the token is never in an address.
     let mut seq: i64 = 1;
     sink.send(Ws::text(json!({ "seq": seq, "action": "authentication_challenge", "data": { "token": config.token } }).to_string())).await.context("authenticating")?;
 
+    // A connection asked to be resumed is up as soon as it is open: the server sends it what it missed and no `hello`
+    // (and does not answer the challenge on a connection its header already signed in). If the server could not resume
+    // it, a `hello` with a new connection id comes first, and everything is read again.
+    if !carry.connection_id.is_empty() && carry.world.is_some() {
+        state.runtime.set_mattermost_handle(account_id, handle.clone());
+        state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
+        tracing::info!("mattermost[{account_id}]: connected as {own_id} (resuming)");
+    }
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
     let mut heard = Instant::now();
+    let mut pings: u64 = 0;
     let ending = loop {
         tokio::select! {
             frame = stream.next() => {
@@ -151,7 +171,7 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
                 let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
                 // A reply to something this client sent: the authentication's refusal ends the session.
                 if event.get("seq_reply").is_some() {
-                    if event["status"].as_str() == Some("FAIL") && event["seq_reply"].as_i64() == Some(1) {
+                    if event["seq_reply"].as_i64() == Some(1) && event["status"].as_str() == Some("FAIL") {
                         break Ending::SignInAgain("Mattermost did not accept this session".to_string());
                     }
                     continue;
@@ -195,6 +215,12 @@ async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &st
             _ = ping.tick() => {
                 if heard.elapsed() > SILENT_FOR {
                     break Ending::Closed;
+                }
+                // The server keeps a revoked session's websocket open, so the session itself is asked after now and then;
+                // and a request anywhere that was refused for it has already said so.
+                pings += 1;
+                if api.halted() || (pings.is_multiple_of(SESSION_CHECK_PINGS) && matches!(api.get("/api/v4/users/me", &[]).await, Err(ApiError::Unauthorized))) {
+                    break Ending::SignInAgain("Mattermost has ended this session".to_string());
                 }
                 seq += 1;
                 sink.send(Ws::text(json!({ "seq": seq, "action": "ping" }).to_string())).await.context("pinging")?;

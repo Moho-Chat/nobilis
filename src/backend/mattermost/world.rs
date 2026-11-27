@@ -253,6 +253,8 @@ pub const DEACTIVATED: &str = "This person's account is deactivated: they cannot
 #[derive(Debug, Default)]
 pub struct World {
     pub own_id: String,
+    /// The id of the session this client made, where it made one.
+    pub own_session: String,
     pub users: HashMap<String, User>,
     pub teams: HashMap<String, Team>,
     /// The teams in the order the account keeps them.

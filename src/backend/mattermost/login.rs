@@ -180,6 +180,13 @@ async fn flow(state: &AppState, login_id: &str, server: &str, method: Method, mu
         other => anyhow!("{other}"),
     })?;
     let user_id = me["id"].as_str().ok_or_else(|| anyhow!("the server did not say who this is"))?.to_string();
+    // The session just made is the account's newest: its id is how it is known in the list of sessions. The server never
+    // shows a session's token again, so there is no other way to tell it.
+    let session_id = if made_here {
+        session.get(&format!("/api/v4/users/{user_id}/sessions"), &[]).await.ok().and_then(|l| l.as_array().and_then(|l| l.iter().max_by_key(|s| s["create_at"].as_i64().unwrap_or(0)).and_then(|s| s["id"].as_str().map(str::to_string)))).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let config = MattermostAccountConfig {
         server,
         user_id,
@@ -187,6 +194,7 @@ async fn flow(state: &AppState, login_id: &str, server: &str, method: Method, mu
         token,
         made_here,
         method: method_name.to_string(),
+        session_id,
         use_tor: crate::net::route::router().wanted(&key),
         ..Default::default()
     };

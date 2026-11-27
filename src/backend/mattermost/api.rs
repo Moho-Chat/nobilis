@@ -109,11 +109,6 @@ impl Api {
         &self.base
     }
 
-    /// The token, for the websocket's authentication challenge.
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
-    }
-
     /// Whether the session was refused.
     pub fn halted(&self) -> bool {
         self.halted.load(Ordering::Relaxed)
