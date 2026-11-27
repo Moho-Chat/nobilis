@@ -376,6 +376,9 @@ async fn run() -> Result<()> {
     for cfg in state.accounts.all_mattermost() {
         backend::mattermost::spawn(state.clone(), cfg);
     }
+    for cfg in state.accounts.all_rocketchat() {
+        backend::rocketchat::spawn(state.clone(), cfg);
+    }
     for cfg in state.accounts.all_signal() {
         backend::signal::spawn(state.clone(), cfg);
     }

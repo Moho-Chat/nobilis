@@ -136,6 +136,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_mattermost(id) {
             backend::mattermost::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("rocketchat:") {
+        if let Some(cfg) = state.accounts.get_rocketchat(id) {
+            backend::rocketchat::spawn(state.clone(), cfg);
+        }
     } else if id.starts_with("signal:") {
         // Its route is read when it connects: a change applies by connecting again (seen on the first real account,
         // where an account set to strict Tor stayed on its direct connection).
@@ -603,6 +607,7 @@ pub async fn dispatch(
                 { "id": "mattermost", "name": "Mattermost", "available": true },
                 { "id": "signal", "name": "Signal", "available": true },
                 { "id": "xmpp", "name": "XMPP", "available": true },
+                { "id": "rocketchat", "name": "Rocket.Chat", "available": true },
             ])),
             None,
         ),
@@ -713,6 +718,14 @@ pub async fn dispatch(
                             let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
                             if let Err(e) = backend::mattermost::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
                                 tracing::debug!("mattermost history: {e:#}");
+                            }
+                        }
+                    }
+                    if buffer.account_id.starts_with("rocketchat:") {
+                        if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                            let before_ts = if before > 0 { Some(before) } else { None };
+                            if let Err(e) = backend::rocketchat::messages::history(state, &handle, &buffer, before_ts).await {
+                                tracing::debug!("rocketchat history: {e:#}");
                             }
                         }
                     }
@@ -1029,6 +1042,7 @@ pub async fn dispatch(
                 let fluxer_session = state.accounts.get_fluxer(id).filter(|a| a.made_here && !a.token.is_empty());
                 // A Mattermost session made here is ended at the server; a personal access token is left alone.
                 let mattermost_account = state.accounts.get_mattermost(id);
+                let rocketchat_session = state.accounts.get_rocketchat(id).filter(|a| a.made_here && !a.auth_token.is_empty());
                 // A Signal device is taken off the account at Signal, and its file deleted.
                 let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
@@ -1054,6 +1068,18 @@ pub async fn dispatch(
                             tokio::spawn(async move { backend::mattermost::login::end_session(&config).await });
                         }
                         state.runtime.clear_mattermost_handle(id);
+                        if let Some(config) = rocketchat_session {
+                            tokio::spawn(async move {
+                                let api = backend::rocketchat::api::Api::new(
+                                    &config.account_id(),
+                                    &config.server_url,
+                                    Some(config.user_id.clone()),
+                                    Some(config.auth_token.clone()),
+                                );
+                                let _ = backend::rocketchat::login::logout(&api).await;
+                            });
+                        }
+                        state.runtime.clear_rocketchat_handle(id);
                         if let Some(config) = signal_account {
                             backend::signal::unlink::start(config.aci, config.use_tor || crate::net::route::router().tunnel_all());
                         }
@@ -1451,6 +1477,14 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                        if let Err(e) = backend::rocketchat::send::send_typing(&handle, &buffer, typing) {
+                            tracing::debug!("rocketchat sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
                     if let Err(e) = backend::signal::send::typing(state, &buffer, typing) {
                         tracing::debug!("sendTyping: {e}");
@@ -1731,6 +1765,14 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("mattermost:") => {
                     if let Err(e) = backend::mattermost::send::mark_read(state, &buffer).await {
                         tracing::debug!("mattermost read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    if let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) {
+                        if let Err(e) = backend::rocketchat::send::mark_read(state, &handle, &buffer).await {
+                            tracing::debug!("rocketchat read position: {e}");
+                        }
                     }
                     (Some(ok_node()), None)
                 }
@@ -2271,6 +2313,8 @@ pub async fn dispatch(
                     Ok(()) => true,
                     Err(e) => return (None, Some(format!("{e:#}"))),
                 }
+            } else if let Some(handle) = state.runtime.rocketchat_handle(account_id).filter(|_| account_id.starts_with("rocketchat:")) {
+                backend::rocketchat::profile::set_status(&handle, status, text.as_deref()).await.is_ok()
             } else if account_id.starts_with("telegram:") {
                 // Online or not, which is all Telegram shows; recorded above for the next connection either way.
                 backend::telegram::account::presence_changed(state, account_id)
@@ -4427,6 +4471,63 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e)),
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => {
+                    let Some(handle) = state.runtime.rocketchat_handle(&buffer.account_id) else {
+                        return (None, Some("that Rocket.Chat account is not connected".to_string()));
+                    };
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let tmid = p_str_opt(params, "tmid").or(reply_to_id.filter(|_| p_bool(params, "inThread", false)));
+                    let tshow = p_bool(params, "tshow", false);
+                    let quote = if tmid.is_none() { reply_to_id } else { None };
+                    if !paths.is_empty() {
+                        let rid = buffer.remote_id.as_deref().unwrap_or("");
+                        let mut last_err: Option<String> = None;
+                        for (idx, p) in paths.iter().enumerate() {
+                            let path = std::path::Path::new(p);
+                            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                            match tokio::fs::read(path).await {
+                                Ok(bytes) => {
+                                    let desc = if idx == 0 && !body.is_empty() { Some(body) } else { None };
+                                    if let Err(e) = backend::rocketchat::media::upload_file(&handle, rid, fname, "application/octet-stream", bytes, desc, tmid).await {
+                                        last_err = Some(format!("{e:#}"));
+                                    }
+                                }
+                                Err(e) => last_err = Some(format!("reading attachment: {e}")),
+                            }
+                        }
+                        if let Some(p) = progress {
+                            p.done(last_err.as_deref());
+                        }
+                        match last_err {
+                            None => (Some(ok_node()), None),
+                            Some(e) => (None, Some(e)),
+                        }
+                    } else if let Some(rest) = body.strip_prefix('/') {
+                        // Execute Rocket.Chat slash command (`/shrug`, `/topic`, `/invite`, etc.)
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let cmd = parts.next().unwrap_or("");
+                        let cmd_params = parts.next().unwrap_or("").trim();
+                        let rid = buffer.remote_id.as_deref().unwrap_or("");
+                        match backend::rocketchat::extras::run_command(&handle, rid, cmd, cmd_params, tmid).await {
+                            Ok(_) => (Some(ok_node()), None),
+                            Err(_) => {
+                                // Fall back to plain message if not a registered server command
+                                match backend::rocketchat::send::send_message(state, &handle, &buffer, body, tmid, tshow, quote).await {
+                                    Ok(_) => (Some(ok_node()), None),
+                                    Err(e) => (None, Some(format!("{e:#}"))),
+                                }
+                            }
+                        }
+                    } else {
+                        match backend::rocketchat::send::send_message(state, &handle, &buffer, body, tmid, tshow, quote).await {
+                            Ok(_) => (Some(ok_node()), None),
+                            Err(e) => (None, Some(format!("{e:#}"))),
+                        }
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -4699,6 +4800,13 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::edit_message(state, &handle, &buffer, msg_id, body).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
+                },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4763,6 +4871,13 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::react(&handle, msg_id, emoji, add).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
+                },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::react(&buffer.account_id, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
@@ -4821,6 +4936,13 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("fluxer:") => match backend::fluxer::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("rocketchat:") => match state.runtime.rocketchat_handle(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(handle) => match backend::rocketchat::send::delete_message(state, &handle, &buffer, msg_id).await {
+                        Ok(_) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
                 },
                 Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -10182,7 +10304,12 @@ pub async fn dispatch(
             }
         }
 
-        other => (None, Some(format!("unknown method \"{other}\""))),
+        other => {
+            if let Some(res) = backend::rocketchat::rpc::dispatch(state, other, params).await {
+                return res;
+            }
+            (None, Some(format!("unknown method \"{other}\"")))
+        }
     }
 }
 

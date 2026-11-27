@@ -691,6 +691,64 @@ impl MattermostAccountConfig {
     }
 }
 
+/// A Rocket.Chat account: self-hostable team chat speaking REST API v1 + Meteor DDP WebSocket
+/// with optional pure-Rust E2EE (issue #31).
+/// Account ID format: `rocketchat:<server_host>:<user_id>`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RocketChatAccountConfig {
+    /// Normalized server origin without trailing slash (e.g. `https://open.rocket.chat`).
+    #[serde(default)]
+    pub server_url: String,
+    /// Lowercase `host[:port]` extracted from `server_url`, used in `account_id()`.
+    #[serde(default)]
+    pub server_host: String,
+    /// Rocket.Chat user `_id`.
+    #[serde(default)]
+    pub user_id: String,
+    /// Rocket.Chat `username`.
+    #[serde(default)]
+    pub username: String,
+    /// `X-Auth-Token` stored in `0600` `accounts.toml`. Never logged.
+    #[serde(default)]
+    pub auth_token: String,
+    /// Optional E2EE passphrase stored locally in `0600` `accounts.toml` for auto-unlock. Never logged.
+    #[serde(default)]
+    pub e2ee_passphrase: Option<String>,
+    /// Whether moho created this session (so `POST /api/v1/logout` is called on remove).
+    #[serde(default)]
+    pub made_here: bool,
+    /// Local display name override.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Default presence status applied on connect (`online`, `away`, `busy`, `offline`).
+    #[serde(default)]
+    pub default_status: Option<String>,
+    /// Optional Omnichannel / Livechat toggle for `livechat-agent` accounts.
+    #[serde(default)]
+    pub omnichannel_enabled: bool,
+    /// Route traffic through Tor or configured SOCKS5 proxy.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing for all media/links in this account's conversations.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl RocketChatAccountConfig {
+    pub fn account_id(&self) -> String {
+        let host = if self.server_host.is_empty() {
+            crate::backend::rocketchat::server_host(&self.server_url).unwrap_or_else(|_| "unknown".to_string())
+        } else {
+            self.server_host.clone()
+        };
+        format!("rocketchat:{host}:{}", self.user_id)
+    }
+
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && !self.auth_token.is_empty()
+    }
+}
+
 /// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
 /// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
 /// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
@@ -873,6 +931,8 @@ struct AccountsFile {
     signal: Vec<SignalAccountConfig>,
     #[serde(default, rename = "xmpp_account")]
     xmpp: Vec<XmppAccountConfig>,
+    #[serde(default, rename = "rocketchat_account")]
+    rocketchat: Vec<RocketChatAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -904,6 +964,8 @@ pub struct AccountStore {
     mattermost: Mutex<HashMap<String, MattermostAccountConfig>>,
     /// And this one.
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
+    /// And this one.
+    rocketchat: Mutex<HashMap<String, RocketChatAccountConfig>>,
 }
 
 impl AccountStore {
@@ -914,7 +976,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -932,9 +994,10 @@ impl AccountStore {
             let signal = file.signal.into_iter().map(|a| (a.account_id(), a)).collect();
             let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
             let mattermost = file.mattermost.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost)
+            let rocketchat = file.rocketchat.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost, rocketchat)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -951,6 +1014,7 @@ impl AccountStore {
             fluxer: Mutex::new(fluxer),
             mattermost: Mutex::new(mattermost),
             xmpp: Mutex::new(xmpp),
+            rocketchat: Mutex::new(rocketchat),
         })
     }
 
@@ -979,6 +1043,7 @@ impl AccountStore {
             fluxer: self.fluxer.lock().unwrap().values().cloned().collect(),
             mattermost: self.mattermost.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
+            rocketchat: self.rocketchat.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -1018,6 +1083,7 @@ impl AccountStore {
             || self.get_mattermost(account_id).is_some()
             || self.get_xmpp(account_id).is_some()
             || self.get_signal(account_id).is_some()
+            || self.get_rocketchat(account_id).is_some()
     }
 
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
@@ -1392,6 +1458,50 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_rocketchat(&self, account_id: &str) -> Option<RocketChatAccountConfig> {
+        self.rocketchat.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_rocketchat(&self) -> Vec<RocketChatAccountConfig> {
+        self.rocketchat.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn add_rocketchat(&self, mut config: RocketChatAccountConfig) -> Result<RocketChatAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut rc = self.rocketchat.lock().unwrap();
+            if let Some(old) = rc.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+                if config.e2ee_passphrase.is_none() {
+                    config.e2ee_passphrase = old.e2ee_passphrase.clone();
+                }
+                if config.default_status.is_none() {
+                    config.default_status = old.default_status.clone();
+                }
+                config.omnichannel_enabled |= old.omnichannel_enabled;
+            }
+            rc.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    pub fn mutate_rocketchat(&self, account_id: &str, change: impl FnOnce(&mut RocketChatAccountConfig)) -> Result<bool> {
+        {
+            let mut rc = self.rocketchat.lock().unwrap();
+            match rc.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
         self.xmpp.lock().unwrap().get(account_id).cloned()
     }
@@ -1660,6 +1770,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.rocketchat.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -1706,6 +1820,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_signal(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_rocketchat(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1833,7 +1950,8 @@ impl AccountStore {
             }
         }
         {
-            let removed = self.mattermost.lock().unwrap().remove(account_id).is_some();
+            let removed = self.mattermost.lock().unwrap().remove(account_id).is_some()
+                || self.rocketchat.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -2035,6 +2153,9 @@ impl AccountStore {
         if self.mutate_signal(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_rocketchat(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -2087,6 +2208,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.signal.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.rocketchat.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -2707,6 +2831,53 @@ pub fn signal_account_to_json(a: &SignalAccountConfig, state: &str) -> Account {
         web_session: false,
         moderation: false,
         reactions: false,
+        stop_reason: String::new(),
+    }
+}
+
+pub fn rocketchat_account_to_json(a: &RocketChatAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "rocketchat".to_string(),
+        status: a.default_status.clone().unwrap_or_else(|| "online".to_string()),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.username.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: a.username.clone(),
+        highlight_keywords: Vec::new(),
+        ssl: a.server_url.starts_with("https://"),
+        has_password: a.is_signed_in(),
+        avatar_url: if !a.username.is_empty() && !a.server_url.is_empty() {
+            Some(format!("{}/avatar/{}", a.server_url.trim_end_matches('/'), a.username))
+        } else {
+            None
+        },
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: a.e2ee_passphrase.as_deref().is_some_and(|s| !s.is_empty()),
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        reactions: true,
         stop_reason: String::new(),
     }
 }
