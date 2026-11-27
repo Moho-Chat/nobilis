@@ -327,6 +327,25 @@ pub async fn fetch_channel(state: &AppState, handle: &Handle, channel_id: &str) 
     register_channel(state, handle, &channel);
 }
 
+/// Reads the permissions of roles the account now holds and has not seen; answers whether there were any.
+pub async fn learn_roles(handle: &Handle, roles: Vec<String>) -> bool {
+    let missing: Vec<String> = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        roles.into_iter().filter(|r| !world.role_permissions.contains_key(r)).collect()
+    };
+    if missing.is_empty() {
+        return false;
+    }
+    let Ok(list) = handle.api.post("/api/v4/roles/names", &json!(missing)).await else { return false };
+    let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    for role in list.as_array().into_iter().flatten() {
+        if let Some(name) = role["name"].as_str() {
+            world.role_permissions.insert(name.to_string(), role["permissions"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect());
+        }
+    }
+    true
+}
+
 /// A team's categories read again (one was made, changed or removed), and its channels filed again.
 async fn refile(state: &AppState, handle: &Handle, team_id: &str) {
     let Ok(c) = handle.api.get(&format!("/api/v4/users/me/teams/{team_id}/channels/categories"), &[]).await else { return };
@@ -469,6 +488,12 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) -> Outcome {
             let member = inner(data, "channelMember");
             if member["user_id"].as_str() == Some(handle.own_id().as_str()) {
                 if let Some((id, membership)) = world::parse_membership(&member) {
+                    let roles = membership.roles.clone();
+                    later(state, handle, move |state, handle| async move {
+                        if learn_roles(&handle, roles).await {
+                            register_all(&state, &handle);
+                        }
+                    });
                     let channel = {
                         let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
                         world.members.insert(id.clone(), membership);
@@ -543,6 +568,21 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) -> Outcome {
                 };
                 if held {
                     register_all(state, handle);
+                }
+            }
+        }
+        // The account's roles in a team changed (made a Team Admin, or no longer): its team roles, and the permissions of
+        // any role not known yet, are read again.
+        "memberrole_updated" => {
+            let member = inner(data, "member");
+            if member["user_id"].as_str() == Some(handle.own_id().as_str()) {
+                if let Some(team) = member["team_id"].as_str() {
+                    let roles: Vec<String> = member["roles"].as_str().unwrap_or("").split_whitespace().map(str::to_string).collect();
+                    handle.world.lock().unwrap_or_else(|e| e.into_inner()).team_roles.insert(team.to_string(), roles.clone());
+                    later(state, handle, move |state, handle| async move {
+                        learn_roles(&handle, roles).await;
+                        register_all(&state, &handle);
+                    });
                 }
             }
         }
