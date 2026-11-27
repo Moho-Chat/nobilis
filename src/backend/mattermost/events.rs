@@ -260,7 +260,8 @@ pub fn server_facts(handle: &Handle) -> Value {
         "calls": handle.server.has_calls(),
         "customStatuses": handle.server.custom_statuses,
         "priority": handle.server.post_priority,
-        "scheduled": handle.server.at_least(10, 3),
+        "scheduled": handle.server.at_least(10, 3) && handle.server.licensed,
+        "licensed": handle.server.licensed,
         "teams": teams,
     })
 }

@@ -299,6 +299,9 @@ pub async fn scheduled(state: &AppState, handle: &Handle, team: &str) -> Result<
     if !handle.server.at_least(10, 3) {
         return Err(anyhow!("This server is older than scheduled posts (Mattermost 10.3)"));
     }
+    if !handle.server.licensed {
+        return Err(anyhow!("Scheduled posts need a Mattermost licence, which this server does not have"));
+    }
     let answer = handle.api.get(&format!("/api/v4/posts/scheduled/team/{team}"), &[("includeDirectChannels", "true".into())]).await.map_err(err)?;
     let mut out = Vec::new();
     for list in answer.as_object().map(|o| o.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
@@ -314,6 +317,9 @@ pub async fn scheduled(state: &AppState, handle: &Handle, team: &str) -> Result<
 pub async fn schedule(handle: &Handle, buffer: &Buffer, text: &str, root: Option<&str>, at: i64) -> Result<Value> {
     if !handle.server.at_least(10, 3) {
         return Err(anyhow!("This server is older than scheduled posts (Mattermost 10.3)"));
+    }
+    if !handle.server.licensed {
+        return Err(anyhow!("Scheduled posts need a Mattermost licence, which this server does not have"));
     }
     if at * 1000 <= chrono::Utc::now().timestamp_millis() {
         return Err(anyhow!("That time has passed"));
@@ -332,7 +338,8 @@ pub async fn unschedule(handle: &Handle, id: &str) -> Result<()> {
 /// A channel's bookmarks: links and files along the top.
 pub async fn bookmarks(handle: &Handle, buffer: &Buffer) -> Result<Value> {
     let channel = channel_of(buffer)?;
-    if !handle.server.at_least(9, 11) {
+    // Bookmarks came in 9.11, and need a licence.
+    if !handle.server.at_least(9, 11) || !handle.server.licensed {
         return Ok(json!({ "bookmarks": [] }));
     }
     let list = handle.api.get(&format!("/api/v4/channels/{channel}/bookmarks"), &[]).await.map_err(err)?;
@@ -357,6 +364,9 @@ pub async fn bookmarks(handle: &Handle, buffer: &Buffer) -> Result<Value> {
 /// Adds a link bookmark, changes one, or removes one.
 pub async fn set_bookmark(handle: &Handle, buffer: &Buffer, id: Option<&str>, name: &str, url: &str, remove: bool) -> Result<()> {
     let channel = channel_of(buffer)?;
+    if !handle.server.licensed {
+        return Err(anyhow!("Channel bookmarks need a Mattermost licence, which this server does not have"));
+    }
     match (id, remove) {
         (Some(id), true) => handle.api.delete(&format!("/api/v4/channels/{channel}/bookmarks/{id}")).await.map(|_| ()),
         (Some(id), false) => handle.api.request(reqwest::Method::PATCH, &format!("/api/v4/channels/{channel}/bookmarks/{id}"), &[], Some(&json!({ "display_name": name, "link_url": url }))).await.map(|_| ()),

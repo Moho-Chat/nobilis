@@ -390,6 +390,9 @@ pub fn record(state: &AppState, handle: &Handle, post: &Value) -> bool {
     let author = post["user_id"].as_str().map(str::to_string);
     let style = (!shaped.badges.is_empty()).then_some(crate::model::SenderStyle { color: None, badges: shaped.badges });
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &shaped.from, &shaped.body, false, "chat", reply, Some(id.to_string()), shaped.highlight, shaped.avatar, shaped.embeds, shaped.attachments, author, Some(ts), shaped.html, style);
+    if recorded {
+        quote_links_later(state, handle, &buffer.id, id, post["message"].as_str().unwrap_or(""));
+    }
     if recorded && !shaped.reactions.is_empty() && state.store.set_reactions(&buffer.id, id, &shaped.reactions).unwrap_or(false) {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": shaped.reactions }));
     }
@@ -405,6 +408,73 @@ pub fn record(state: &AppState, handle: &Handle, post: &Value) -> bool {
         state.runtime.update_message_body_only(state, &buffer.id, id, &shape(handle, post).body);
     }
     recorded
+}
+
+/// The post ids a post's words link to on this server (`<server>/<team>/pl/<post id>`).
+pub fn permalinks(server: &str, text: &str) -> Vec<String> {
+    let base = server.trim_end_matches('/');
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(base) {
+        let after = &rest[at + base.len()..];
+        // `/<team>/pl/<id>`
+        let mut parts = after.trim_start_matches('/').splitn(3, '/');
+        if let (Some(_team), Some("pl"), Some(tail)) = (parts.next(), parts.next(), parts.next()) {
+            let id: String = tail.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if super::is_id(&id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        rest = &after[..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// The address the window reads as "go to this message", for a quote's button.
+pub fn jump_link(buffer_id: &str, post: &str) -> String {
+    let mut url = url::Url::parse("moho:jump").expect("a fixed address parses");
+    url.query_pairs_mut().append_pair("buffer", buffer_id).append_pair("message", post);
+    url.to_string()
+}
+
+/// Draws the posts a post links to as quotes under it, read from the server: a permalink's preview is the server's only
+/// where it knows its own address, which many servers do not say.
+pub fn quote_links_later(state: &AppState, handle: &Handle, buffer_id: &str, post_id: &str, text: &str) {
+    let ids = permalinks(handle.api.base(), text);
+    if ids.is_empty() {
+        return;
+    }
+    let (state, handle, buffer_id, post_id) = (state.clone(), handle.clone(), buffer_id.to_string(), post_id.to_string());
+    tokio::spawn(async move {
+        let mut cards = state.store.get_message(&buffer_id, &post_id).ok().flatten().map(|m| m.embeds).unwrap_or_default();
+        let before = cards.len();
+        for id in ids {
+            if cards.iter().any(|c| c.target.as_deref() == Some(id.as_str())) {
+                continue;
+            }
+            let Ok(quoted) = handle.api.get(&format!("/api/v4/posts/{id}"), &[]).await else { continue };
+            learn_authors(&handle, &[&quoted]).await;
+            let shaped = shape(&handle, &quoted);
+            let channel = quoted["channel_id"].as_str().unwrap_or("");
+            let where_ = buffer_of(&state, &handle.account_id, channel);
+            let title = where_.as_ref().map(|b| format!("Message in {}", b.name.rsplit('/').next().unwrap_or(&b.name))).unwrap_or_else(|| "Message".to_string());
+            cards.push(Embed {
+                kind: Some("quote".into()),
+                author: Some(shaped.from),
+                title: Some(title),
+                description: Some(shaped.body),
+                target: Some(id.clone()),
+                cta: where_.map(|b| EmbedLink { label: "Go to the message".into(), url: Some(jump_link(&b.id, &id)) }),
+                ..Default::default()
+            });
+        }
+        if cards.len() > before {
+            state.runtime.set_message_embeds(&state, &buffer_id, &post_id, &cards);
+        }
+    });
 }
 
 /// A reply heard live moves its thread's count on.
@@ -546,6 +616,14 @@ mod tests {
         assert_eq!(priority_of(&json!({ "priority": { "priority": "urgent", "requested_ack": true } })).as_deref(), Some("Urgent · acknowledgement requested"));
         assert_eq!(priority_of(&json!({ "priority": { "priority": "", "requested_ack": false } })), None);
         assert_eq!(priority_of(&json!({})), None);
+    }
+
+    #[test]
+    fn a_link_to_a_post_on_this_server_is_found() {
+        let id = "bx955xywntf83q76gx1ost4pkr";
+        assert_eq!(permalinks("https://chat.example.org", &format!("see https://chat.example.org/alpha/pl/{id}, and https://elsewhere.org/alpha/pl/{id}")), vec![id.to_string()]);
+        assert!(permalinks("https://chat.example.org", "https://chat.example.org/alpha/channels/town-square").is_empty());
+        assert!(jump_link("mattermost:h:u|Alpha/Town", id).starts_with("moho:jump?buffer=mattermost%3Ah%3Au%7CAlpha%2FTown&message="));
     }
 
     #[test]

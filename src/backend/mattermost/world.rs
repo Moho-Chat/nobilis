@@ -35,6 +35,8 @@ pub struct ServerInfo {
     pub plugins: HashSet<String>,
     /// How many different reactions a post may carry.
     pub reaction_limit: usize,
+    /// Whether the server has a licence: priority, scheduled posts, group calls and channel moderation need one.
+    pub licensed: bool,
 }
 
 impl ServerInfo {
@@ -58,6 +60,7 @@ impl ServerInfo {
             synced_drafts: on("AllowSyncedDrafts"),
             plugins: plugins.as_array().into_iter().flatten().filter_map(|p| p["id"].as_str().map(str::to_string)).collect(),
             reaction_limit: number("UniqueEmojiReactionLimitPerPost", 50) as usize,
+            licensed: license["IsLicensed"].as_str() == Some("true"),
         }
     }
 
