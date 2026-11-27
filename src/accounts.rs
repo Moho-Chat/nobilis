@@ -639,6 +639,55 @@ impl FluxerAccountConfig {
     }
 }
 
+/// A Mattermost account: a person on a team chat server anybody can host (see backend/mattermost and issue #25). The
+/// account names its server by its address; one server holds many teams, and they are all this one account.
+///
+/// The token is what the account is - a session the server issued to a password or a single sign-on here, or a personal
+/// access token the person pasted - and is as private as a Discord token: kept here, never logged and never put in an
+/// address.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MattermostAccountConfig {
+    /// The server's address, without a trailing slash (`https://chat.example.org`).
+    #[serde(default)]
+    pub server: String,
+    /// The server's id for the person, which survives a change of name. The account's id here is built from it.
+    #[serde(default)]
+    pub user_id: String,
+    /// The `username`, for the sidebar.
+    #[serde(default)]
+    pub username: String,
+    /// The session or access token, sent as `Authorization: Bearer`.
+    #[serde(default)]
+    pub token: String,
+    /// Whether moho made this session (a password, or the sign-in page), so it is ended at the server when the account
+    /// is removed. A personal access token belongs to the person's other uses of it and is left alone.
+    #[serde(default)]
+    pub made_here: bool,
+    /// How the account signed in: `password`, `token` or `sso`.
+    #[serde(default)]
+    pub method: String,
+    /// What to call this account here. Local: the server is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl MattermostAccountConfig {
+    pub fn account_id(&self) -> String {
+        crate::backend::mattermost::account_id(&self.server, &self.user_id)
+    }
+
+    /// Whether there is a sign-in behind this account.
+    pub fn is_signed_in(&self) -> bool {
+        !self.user_id.is_empty() && !self.token.is_empty()
+    }
+}
+
 /// An XMPP account: a JID on a server the account names (XMPP has no operator, so every account is "self-hosted" in
 /// the way a Matrix account is), signed in with a password. The password is as private as a Discord token is: kept
 /// here, never logged, never put in an address. See backend/xmpp and Gitea issue #23.
@@ -815,6 +864,8 @@ struct AccountsFile {
     stoat: Vec<StoatAccountConfig>,
     #[serde(default, rename = "fluxer_account")]
     fluxer: Vec<FluxerAccountConfig>,
+    #[serde(default, rename = "mattermost_account")]
+    mattermost: Vec<MattermostAccountConfig>,
     #[serde(default, rename = "signal_account")]
     signal: Vec<SignalAccountConfig>,
     #[serde(default, rename = "xmpp_account")]
@@ -847,6 +898,8 @@ pub struct AccountStore {
     /// And this one.
     fluxer: Mutex<HashMap<String, FluxerAccountConfig>>,
     /// And this one.
+    mattermost: Mutex<HashMap<String, MattermostAccountConfig>>,
+    /// And this one.
     xmpp: Mutex<HashMap<String, XmppAccountConfig>>,
 }
 
@@ -858,7 +911,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -875,9 +928,10 @@ impl AccountStore {
             let xmpp = file.xmpp.into_iter().map(|a| (a.account_id(), a)).collect();
             let signal = file.signal.into_iter().map(|a| (a.account_id(), a)).collect();
             let fluxer = file.fluxer.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer)
+            let mattermost = file.mattermost.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram, stoat, xmpp, signal, fluxer, mattermost)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -892,6 +946,7 @@ impl AccountStore {
             telegram: Mutex::new(telegram),
             stoat: Mutex::new(stoat),
             fluxer: Mutex::new(fluxer),
+            mattermost: Mutex::new(mattermost),
             xmpp: Mutex::new(xmpp),
         })
     }
@@ -919,6 +974,7 @@ impl AccountStore {
             telegram: self.telegram.lock().unwrap().values().cloned().collect(),
             stoat: self.stoat.lock().unwrap().values().cloned().collect(),
             fluxer: self.fluxer.lock().unwrap().values().cloned().collect(),
+            mattermost: self.mattermost.lock().unwrap().values().cloned().collect(),
             xmpp: self.xmpp.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
@@ -956,6 +1012,7 @@ impl AccountStore {
             || self.get_telegram(account_id).is_some()
             || self.get_stoat(account_id).is_some()
             || self.get_fluxer(account_id).is_some()
+            || self.get_mattermost(account_id).is_some()
             || self.get_xmpp(account_id).is_some()
             || self.get_signal(account_id).is_some()
     }
@@ -1290,6 +1347,48 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_mattermost(&self, account_id: &str) -> Option<MattermostAccountConfig> {
+        self.mattermost.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_mattermost(&self) -> Vec<MattermostAccountConfig> {
+        self.mattermost.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again as the same person on the same server is how a session the server has ended gets
+    /// replaced. What the person set up on the account - its route, its name here - stays.
+    pub fn add_mattermost(&self, mut config: MattermostAccountConfig) -> Result<MattermostAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut mattermost = self.mattermost.lock().unwrap();
+            if let Some(old) = mattermost.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            mattermost.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Mattermost account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_mattermost(&self, account_id: &str, change: impl FnOnce(&mut MattermostAccountConfig)) -> Result<bool> {
+        {
+            let mut mattermost = self.mattermost.lock().unwrap();
+            match mattermost.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn get_xmpp(&self, account_id: &str) -> Option<XmppAccountConfig> {
         self.xmpp.lock().unwrap().get(account_id).cloned()
     }
@@ -1546,6 +1645,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.mattermost.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else if let Some(a) = self.xmpp.lock().unwrap().get_mut(account_id) {
             a.use_tor = routed;
             a.strict_route = strict;
@@ -1591,6 +1694,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_fluxer(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_mattermost(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_xmpp(account_id) {
@@ -1718,6 +1824,13 @@ impl AccountStore {
         }
         {
             let removed = self.fluxer.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.mattermost.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1910,6 +2023,9 @@ impl AccountStore {
         if self.mutate_fluxer(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_mattermost(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         if self.mutate_xmpp(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
@@ -1959,6 +2075,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.fluxer.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.mattermost.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         if let Some(a) = self.xmpp.lock().unwrap().get(account_id) {
@@ -2419,6 +2538,50 @@ pub fn fluxer_account_to_json(a: &FluxerAccountConfig, state: &str) -> Account {
     Account {
         id: a.account_id(),
         service: "fluxer".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.username.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.user_id.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+        stop_reason: String::new(),
+        reactions: false,
+    }
+}
+
+/// Nor has Mattermost. `has_password` says there is a sign-in behind the account.
+pub fn mattermost_account_to_json(a: &MattermostAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "mattermost".to_string(),
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,

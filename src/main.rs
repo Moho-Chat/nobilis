@@ -373,6 +373,9 @@ async fn run() -> Result<()> {
     for cfg in state.accounts.all_fluxer() {
         backend::fluxer::spawn(state.clone(), cfg);
     }
+    for cfg in state.accounts.all_mattermost() {
+        backend::mattermost::spawn(state.clone(), cfg);
+    }
     for cfg in state.accounts.all_signal() {
         backend::signal::spawn(state.clone(), cfg);
     }
