@@ -27,17 +27,20 @@ pub async fn upload_file(
         .get(room_id)
         .is_some_and(|r| r.encrypted);
 
-    let (upload_bytes, encryption_meta) = if is_encrypted {
+    let plaintext_len = bytes.len();
+    let (upload_bytes, upload_name, encryption_meta) = if is_encrypted {
         let (ct, meta) = super::e2ee::encrypt_file_bytes(&bytes)?;
-        (ct, Some(meta))
+        use sha2::Digest;
+        let hashed_name = hex::encode(sha2::Sha256::digest(filename.as_bytes()));
+        (ct, hashed_name, Some(meta))
     } else {
-        (bytes, None)
+        (bytes, filename.to_string(), None)
     };
 
     // Rocket.Chat v7+/v8+/v9 uses two-step `rooms.media/{rid}` + `rooms.mediaConfirm/{rid}/{fileId}`;
     // older v6 servers use single-step `rooms.upload/{rid}`.
     let part = reqwest::multipart::Part::bytes(upload_bytes.clone())
-        .file_name(filename.to_string())
+        .file_name(upload_name.clone())
         .mime_str(mime_type)?;
     let media_form = reqwest::multipart::Form::new().part("file", part);
     match handle
@@ -47,29 +50,75 @@ pub async fn upload_file(
     {
         Ok(up) => {
             if let Some(file_id) = up["file"]["_id"].as_str() {
+                let file_url = up["file"]["url"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("/file-upload/{file_id}/{upload_name}"));
                 let mut confirm = serde_json::json!({});
-                if let Some(desc) = description.filter(|s| !s.is_empty()) {
-                    confirm["description"] = serde_json::json!(desc);
-                }
                 if let Some(tmid) = thread_id.filter(|s| !s.is_empty()) {
                     confirm["tmid"] = serde_json::json!(tmid);
                 }
                 if let Some(meta) = encryption_meta {
-                    // Encrypt the file key metadata under the room's E2EE session key Ks (`rc.v1.aes-sha2`)
-                    // when unlocked, matching Rocket.Chat v7/v8/v9 `rooms.mediaConfirm` schema.
-                    let room_ks = handle
+                    // Encrypt both `content` (attachments/files/msg) and `fileContent` under Ks (`rc.v2.aes-sha2`),
+                    // matching Rocket.Chat v8/v9 `processMessageUploads.ts` so official clients decrypt & render it.
+                    let room_key = handle
                         .e2ee
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .room_keys
                         .get(room_id)
-                        .map(|(_, k)| *k);
-                    if let Some(ks) = room_ks {
-                        if let Ok(enc_content) = super::e2ee::encrypt_message_gcm(&ks, &meta) {
+                        .cloned();
+                    if let Some((kid, ks)) = room_key {
+                        let ext = filename.rsplit('.').next().unwrap_or("");
+                        let type_group = mime_type.split('/').next().unwrap_or("application");
+                        let mut attachment = serde_json::json!({
+                            "title": filename,
+                            "type": "file",
+                            "title_link": file_url,
+                            "title_link_download": true,
+                            "encryption": meta["encryption"],
+                            "hashes": meta["hashes"],
+                            "fileId": file_id,
+                            "size": plaintext_len,
+                            "format": ext,
+                        });
+                        if matches!(type_group, "image" | "audio" | "video") {
+                            attachment[format!("{type_group}_url")] = serde_json::json!(file_url);
+                            attachment[format!("{type_group}_type")] = serde_json::json!(mime_type);
+                            attachment[format!("{type_group}_size")] = serde_json::json!(plaintext_len);
+                        }
+                        let file_obj = serde_json::json!({
+                            "_id": file_id,
+                            "name": filename,
+                            "type": mime_type,
+                            "size": plaintext_len,
+                            "format": ext,
+                        });
+                        let msg_inner = serde_json::json!({
+                            "attachments": [attachment],
+                            "files": [file_obj],
+                            "file": file_obj,
+                            "msg": description.unwrap_or(""),
+                        });
+                        let file_meta_inner = serde_json::json!({
+                            "type": mime_type,
+                            "typeGroup": type_group,
+                            "name": filename,
+                            "encryption": meta["encryption"],
+                            "hashes": meta["hashes"],
+                        });
+                        if let (Ok(enc_content), Ok(enc_file_content)) = (
+                            super::e2ee::encrypt_message_v2(&ks, &kid, &msg_inner),
+                            super::e2ee::encrypt_message_v2(&ks, &kid, &file_meta_inner),
+                        ) {
                             confirm["t"] = serde_json::json!("e2e");
+                            confirm["msg"] = serde_json::json!("");
                             confirm["content"] = enc_content;
+                            confirm["fileContent"] = enc_file_content;
                         }
                     }
+                } else if let Some(desc) = description.filter(|s| !s.is_empty()) {
+                    confirm["description"] = serde_json::json!(desc);
                 }
                 let confirmed = handle
                     .api
