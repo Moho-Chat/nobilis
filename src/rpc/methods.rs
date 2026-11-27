@@ -1148,6 +1148,14 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("mattermost:") {
+                        match state.accounts.get_mattermost(id) {
+                            Some(cfg) => {
+                                backend::mattermost::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else {
                         match state.accounts.get_irc(id) {
                             Some(cfg) => {

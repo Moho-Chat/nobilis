@@ -342,6 +342,10 @@ pub async fn own_profile(handle: &Handle) -> Result<Value> {
         "status": custom.as_ref().and_then(|s| s["status"].as_str()).map(status_word),
         "customStatus": parsed.and_then(|p| p.custom_status).map(|(e, t)| json!({ "emoji": e, "text": t })),
         "customStatuses": handle.server.custom_statuses,
+        "server": handle.api.base(),
+        // What notifies the account by default, on every app: desktop `all`/`mention`/`none`, and the same for phones.
+        "desktop": me["notify_props"]["desktop"],
+        "push": me["notify_props"]["push"],
     }))
 }
 
@@ -352,6 +356,17 @@ pub async fn set_profile(handle: &Handle, fields: &Value) -> Result<()> {
         if let Some(v) = fields[from].as_str() {
             patch.insert(to.to_string(), json!(v));
         }
+    }
+    // The account's default notifications, kept with its other notify props (which a patch replaces whole).
+    if fields["desktop"].is_string() || fields["push"].is_string() {
+        let me = handle.api.get("/api/v4/users/me", &[]).await.map_err(|e| anyhow!("{e}"))?;
+        let mut notify = me["notify_props"].clone();
+        for key in ["desktop", "push"] {
+            if let Some(v) = fields[key].as_str().filter(|v| matches!(*v, "all" | "mention" | "none")) {
+                notify[key] = json!(v);
+            }
+        }
+        patch.insert("notify_props".to_string(), notify);
     }
     if patch.is_empty() {
         return Ok(());

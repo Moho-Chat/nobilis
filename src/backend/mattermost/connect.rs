@@ -109,6 +109,11 @@ pub fn socket_address(server: &str, connection_id: &str, next_seq: i64) -> Resul
 
 /// One go at being connected.
 async fn run(state: &AppState, config: &MattermostAccountConfig, account_id: &str, carry: &mut Carry) -> Result<Ending> {
+    // A routed account waits for its route: moho's Tor started, or the proxy's address read.
+    let router = crate::net::route::router();
+    if router.routed(account_id) {
+        router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.context("starting Tor or reaching the proxy")?;
+    }
     let api = Arc::new(Api::new(account_id, &config.server, Some(config.token.clone())));
     // Who the session is, which also finds out whether it still is one.
     let me = api.get("/api/v4/users/me", &[]).await.map_err(anyhow::Error::from)?;

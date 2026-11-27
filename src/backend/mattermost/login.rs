@@ -143,6 +143,10 @@ async fn flow(state: &AppState, login_id: &str, server: &str, method: Method, mu
     let server = normalize_server(server).ok_or_else(|| anyhow!("that does not look like the address of a Mattermost server"))?;
     status(state, login_id, "Reaching the server");
     let key = crate::net::route::pending_key("mattermost");
+    let router = crate::net::route::router();
+    if router.routed(&key) {
+        router.ready(|msg| status(state, login_id, msg)).await.map_err(|e| anyhow!("starting Tor or reaching the proxy: {e:#}"))?;
+    }
     let anonymous = Api::new(&key, &server, None);
     ping(&anonymous).await?;
 
