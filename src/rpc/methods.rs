@@ -5933,17 +5933,7 @@ pub async fn dispatch(
                         let channel = buffer.as_ref().and_then(|b| b.remote_id.clone()).unwrap_or_default();
                         people::autocomplete(&handle, &channel, &team, p_str(params, "query", "")).await?
                     }
-                    "server" => serde_json::json!({
-                        "version": handle.server.version,
-                        "siteName": handle.server.site_name,
-                        "collapsedThreads": handle.server.collapsed_threads,
-                        "collapsedOn": backend::mattermost::messages::collapsed(&handle),
-                        "calls": handle.server.has_calls(),
-                        "customStatuses": handle.server.custom_statuses,
-                        "priority": handle.server.post_priority,
-                        "scheduled": handle.server.at_least(10, 3),
-                        "teams": handle.world.lock().unwrap_or_else(|e| e.into_inner()).team_order.iter().filter_map(|t| handle.world.lock().ok().and_then(|w| w.teams.get(t).map(|team| serde_json::json!({ "id": team.id, "name": team.display_name })))).collect::<Vec<_>>(),
-                    }),
+                    "server" => backend::mattermost::events::server_facts(&handle),
                     "setCollapsedThreads" => {
                         let own = handle.own_id();
                         let on = p_bool(params, "on", true);

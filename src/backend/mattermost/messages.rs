@@ -382,10 +382,31 @@ pub fn record(state: &AppState, handle: &Handle, post: &Value) -> bool {
     if recorded && !shaped.reactions.is_empty() && state.store.set_reactions(&buffer.id, id, &shaped.reactions).unwrap_or(false) {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": shaped.reactions }));
     }
+    // How many replies a post has, as the server counts them: with threads collapsed they are not in the channel to be
+    // counted, and the window's "3 replies" is drawn from this.
+    if root.is_none() {
+        if let Some(count) = post["reply_count"].as_i64().filter(|n| *n > 0) {
+            handle.world.lock().unwrap_or_else(|e| e.into_inner()).replies.insert(id.to_string(), count);
+            state.events.emit("threadCount", json!({ "bufferId": buffer.id, "id": id, "count": count }));
+        }
+    }
     if recorded && post["edit_at"].as_i64().unwrap_or(0) > 0 {
         state.runtime.update_message_body_only(state, &buffer.id, id, &shape(handle, post).body);
     }
     recorded
+}
+
+/// A reply heard live moves its thread's count on.
+pub fn count_reply(state: &AppState, handle: &Handle, post: &Value) {
+    let (Some(root), Some(channel)) = (post["root_id"].as_str().filter(|r| !r.is_empty()), post["channel_id"].as_str()) else { return };
+    let Some(buffer) = buffer_of(state, &handle.account_id, channel) else { return };
+    let count = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let n = world.replies.entry(root.to_string()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    state.events.emit("threadCount", json!({ "bufferId": buffer.id, "id": root, "count": count }));
 }
 
 /// An edited post brought up to date: its words, files, cards and reactions.

@@ -240,6 +240,31 @@ pub fn apply_preferences(world: &mut world::World, preferences: &Value) {
     }
 }
 
+/// Tells the window what the server offers and how the account reads threads there.
+pub fn tell_server(state: &AppState, handle: &Handle) {
+    let mut about = server_facts(handle);
+    about["accountId"] = json!(handle.account_id);
+    state.events.emit("mattermostServer", about);
+}
+
+/// What the server offers and how the account reads threads there, as the window reads it.
+pub fn server_facts(handle: &Handle) -> Value {
+    let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    let teams: Vec<Value> = world.team_order.iter().filter_map(|t| world.teams.get(t)).map(|t| json!({ "id": t.id, "name": t.display_name })).collect();
+    drop(world);
+    json!({
+        "version": handle.server.version,
+        "siteName": handle.server.site_name,
+        "collapsedThreads": handle.server.collapsed_threads,
+        "collapsedOn": messages::collapsed(handle),
+        "calls": handle.server.has_calls(),
+        "customStatuses": handle.server.custom_statuses,
+        "priority": handle.server.post_priority,
+        "scheduled": handle.server.at_least(10, 3),
+        "teams": teams,
+    })
+}
+
 /// The rail and every conversation, from what the world holds; and anything the account no longer has, taken away.
 pub fn register_all(state: &AppState, handle: &Handle) {
     let account_id = &handle.account_id;
@@ -250,6 +275,7 @@ pub fn register_all(state: &AppState, handle: &Handle) {
         (teams, channels, world.name_of(&world.own_id, &handle.server.teammate_name))
     };
     state.runtime.set_own_identity(account_id, &own_name);
+    tell_server(state, handle);
     for (position, team) in teams.iter().enumerate() {
         register_team(state, handle, team, position as i64);
     }
@@ -379,6 +405,7 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) -> Outcome {
                     messages::record(&state, &handle, &post);
                 });
             }
+            messages::count_reply(state, handle, &inner(data, "post"));
             // A new post moves a direct message to the top.
             if let Some(c) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get_mut(&channel_of()) {
                 c.last_post_at = chrono::Utc::now().timestamp_millis();

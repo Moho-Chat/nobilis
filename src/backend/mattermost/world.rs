@@ -271,6 +271,8 @@ pub struct World {
     pub emoji: HashMap<String, String>,
     /// The post ids of the account's saved posts.
     pub flagged: HashSet<String>,
+    /// How many replies each thread root has, as the server last counted them (and as live replies have added since).
+    pub replies: HashMap<String, i64>,
     /// The account's own choice of collapsed threads (its `display_settings` preference), where the server leaves it.
     pub collapsed_choice: Option<bool>,
 }
