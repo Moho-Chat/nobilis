@@ -34,24 +34,57 @@ pub async fn upload_file(
         (bytes, None)
     };
 
-    let part = reqwest::multipart::Part::bytes(upload_bytes)
+    // Rocket.Chat v7+/v8+/v9 uses two-step `rooms.media/{rid}` + `rooms.mediaConfirm/{rid}/{fileId}`;
+    // older v6 servers use single-step `rooms.upload/{rid}`.
+    let part = reqwest::multipart::Part::bytes(upload_bytes.clone())
         .file_name(filename.to_string())
         .mime_str(mime_type)?;
-    let mut form = reqwest::multipart::Form::new().part("file", part);
-    if let Some(desc) = description.filter(|s| !s.is_empty()) {
-        form = form.text("description", desc.to_string());
-    }
-    if let Some(tmid) = thread_id.filter(|s| !s.is_empty()) {
-        form = form.text("tmid", tmid.to_string());
-    }
-    if let Some(meta) = encryption_meta {
-        form = form.text("content", meta.to_string());
-    }
-
-    Ok(handle
+    let media_form = reqwest::multipart::Form::new().part("file", part);
+    match handle
         .api
-        .upload_multipart(&format!("/api/v1/rooms.upload/{room_id}"), form)
-        .await?)
+        .upload_multipart(&format!("/api/v1/rooms.media/{room_id}"), media_form)
+        .await
+    {
+        Ok(up) => {
+            if let Some(file_id) = up["file"]["_id"].as_str() {
+                let mut confirm = serde_json::json!({});
+                if let Some(desc) = description.filter(|s| !s.is_empty()) {
+                    confirm["description"] = serde_json::json!(desc);
+                }
+                if let Some(tmid) = thread_id.filter(|s| !s.is_empty()) {
+                    confirm["tmid"] = serde_json::json!(tmid);
+                }
+                if let Some(meta) = encryption_meta {
+                    confirm["content"] = meta;
+                }
+                let confirmed = handle
+                    .api
+                    .post(&format!("/api/v1/rooms.mediaConfirm/{room_id}/{file_id}"), &confirm)
+                    .await?;
+                return Ok(confirmed);
+            }
+            Ok(up)
+        }
+        Err(_) => {
+            let part2 = reqwest::multipart::Part::bytes(upload_bytes)
+                .file_name(filename.to_string())
+                .mime_str(mime_type)?;
+            let mut form = reqwest::multipart::Form::new().part("file", part2);
+            if let Some(desc) = description.filter(|s| !s.is_empty()) {
+                form = form.text("description", desc.to_string());
+            }
+            if let Some(tmid) = thread_id.filter(|s| !s.is_empty()) {
+                form = form.text("tmid", tmid.to_string());
+            }
+            if let Some(meta) = encryption_meta {
+                form = form.text("content", meta.to_string());
+            }
+            Ok(handle
+                .api
+                .upload_multipart(&format!("/api/v1/rooms.upload/{room_id}"), form)
+                .await?)
+        }
+    }
 }
 
 /// Download an authenticated Rocket.Chat file or avatar.

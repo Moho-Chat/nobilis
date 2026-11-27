@@ -13,20 +13,37 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 /// Search public directory (`channels`, `teams`, or `users`).
+/// Uses Rocket.Chat v7+/v8+/v9 flat params (`text`, `type`, `count`), falling back to legacy JSON `query` on v6.
 pub async fn directory(
     handle: &Handle,
     kind: &str,
     query: &str,
     count: usize,
 ) -> Result<Value> {
-    let q = json!({ "text": query, "type": kind }).to_string();
-    Ok(handle
+    let flat = handle
         .api
         .get(
             "/api/v1/directory",
-            &[("query", q), ("count", count.to_string())],
+            &[
+                ("text", query.to_string()),
+                ("type", kind.to_string()),
+                ("count", count.to_string()),
+            ],
         )
-        .await?)
+        .await;
+    match flat {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let q = json!({ "text": query, "type": kind }).to_string();
+            Ok(handle
+                .api
+                .get(
+                    "/api/v1/directory",
+                    &[("query", q), ("count", count.to_string())],
+                )
+                .await?)
+        }
+    }
 }
 
 /// Open a 1:1 or multi-user DM (`POST /api/v1/im.create`).
@@ -41,23 +58,13 @@ pub async fn create_dm(
         json!({ "usernames": usernames.join(",") })
     };
     let resp = handle.api.post("/api/v1/im.create", &body).await?;
-    if let Some(rid) = handle
-        .world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge_room_json(&resp["room"])
-    {
-        if let Some(room) = handle
-            .world
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rooms
-            .get(&rid)
-            .cloned()
-        {
-            events::register_room(state, handle, &room);
-            connect::subscribe_room(handle, &rid);
-        }
+    let room = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.merge_room_json(&resp["room"]).and_then(|rid| world.rooms.get(&rid).cloned())
+    };
+    if let Some(room) = room {
+        events::register_room(state, handle, &room);
+        connect::subscribe_room(handle, &room.id);
     }
     Ok(resp)
 }
@@ -69,23 +76,13 @@ pub async fn join_channel(state: &AppState, handle: &Handle, room_id: &str, join
         body["joinCode"] = json!(code);
     }
     let resp = handle.api.post("/api/v1/channels.join", &body).await?;
-    if let Some(rid) = handle
-        .world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge_room_json(&resp["channel"])
-    {
-        if let Some(room) = handle
-            .world
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rooms
-            .get(&rid)
-            .cloned()
-        {
-            events::register_room(state, handle, &room);
-            connect::subscribe_room(handle, &rid);
-        }
+    let room = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.merge_room_json(&resp["channel"]).and_then(|rid| world.rooms.get(&rid).cloned())
+    };
+    if let Some(room) = room {
+        events::register_room(state, handle, &room);
+        connect::subscribe_room(handle, &room.id);
     }
     Ok(resp)
 }
@@ -131,23 +128,13 @@ pub async fn create_channel_or_group(
     });
     let resp = handle.api.post(path, &body).await?;
     let key = if private { "group" } else { "channel" };
-    if let Some(rid) = handle
-        .world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge_room_json(&resp[key])
-    {
-        if let Some(room) = handle
-            .world
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rooms
-            .get(&rid)
-            .cloned()
-        {
-            events::register_room(state, handle, &room);
-            connect::subscribe_room(handle, &rid);
-        }
+    let room = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.merge_room_json(&resp[key]).and_then(|rid| world.rooms.get(&rid).cloned())
+    };
+    if let Some(room) = room {
+        events::register_room(state, handle, &room);
+        connect::subscribe_room(handle, &room.id);
     }
     Ok(resp)
 }
@@ -200,23 +187,13 @@ pub async fn create_discussion(
         body["reply"] = json!(r);
     }
     let resp = handle.api.post("/api/v1/rooms.createDiscussion", &body).await?;
-    if let Some(rid) = handle
-        .world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge_room_json(&resp["discussion"])
-    {
-        if let Some(room) = handle
-            .world
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rooms
-            .get(&rid)
-            .cloned()
-        {
-            events::register_room(state, handle, &room);
-            connect::subscribe_room(handle, &rid);
-        }
+    let room = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.merge_room_json(&resp["discussion"]).and_then(|rid| world.rooms.get(&rid).cloned())
+    };
+    if let Some(room) = room {
+        events::register_room(state, handle, &room);
+        connect::subscribe_room(handle, &room.id);
     }
     Ok(resp)
 }
@@ -235,22 +212,12 @@ pub async fn refresh_room_info(state: &AppState, handle: &Handle, room_id: &str)
         .api
         .get("/api/v1/rooms.info", &[("roomId", room_id.to_string())])
         .await?;
-    if let Some(rid) = handle
-        .world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .merge_room_json(&resp["room"])
-    {
-        if let Some(room) = handle
-            .world
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rooms
-            .get(&rid)
-            .cloned()
-        {
-            events::register_room(state, handle, &room);
-        }
+    let room = {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        world.merge_room_json(&resp["room"]).and_then(|rid| world.rooms.get(&rid).cloned())
+    };
+    if let Some(room) = room {
+        events::register_room(state, handle, &room);
     }
     Ok(resp)
 }

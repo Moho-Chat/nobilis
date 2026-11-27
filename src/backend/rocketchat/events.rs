@@ -173,20 +173,12 @@ pub fn handle_ddp(state: &AppState, handle: &Handle, msg: DdpMessage) {
                             if let Some(rid) = room_val["_id"].as_str() {
                                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).rooms.remove(rid);
                             }
-                        } else if let Some(rid) = handle
-                            .world
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .merge_room_json(room_val)
-                        {
-                            if let Some(room) = handle
-                                .world
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .rooms
-                                .get(&rid)
-                                .cloned()
-                            {
+                        } else {
+                            let room = {
+                                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                                world.merge_room_json(room_val).and_then(|rid| world.rooms.get(&rid).cloned())
+                            };
+                            if let Some(room) = room {
                                 register_room(state, handle, &room);
                             }
                         }
@@ -198,23 +190,15 @@ pub fn handle_ddp(state: &AppState, handle: &Handle, msg: DdpMessage) {
                             if let Some(rid) = sub_val["rid"].as_str() {
                                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).rooms.remove(rid);
                             }
-                        } else if let Some(rid) = handle
-                            .world
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .merge_subscription_json(sub_val)
-                        {
-                            if let Some(room) = handle
-                                .world
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .rooms
-                                .get(&rid)
-                                .cloned()
-                            {
+                        } else {
+                            let room = {
+                                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                                world.merge_subscription_json(sub_val).and_then(|rid| world.rooms.get(&rid).cloned())
+                            };
+                            if let Some(room) = room {
                                 register_room(state, handle, &room);
                                 if room.unread == 0 && !room.alert {
-                                    if let Some(buf) = messages::buffer_of(state, &handle.account_id, &rid) {
+                                    if let Some(buf) = messages::buffer_of(state, &handle.account_id, &room.id) {
                                         state.runtime.set_buffer_unread(state, &buf.id, 0, 0);
                                     }
                                 }

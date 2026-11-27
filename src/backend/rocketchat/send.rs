@@ -59,17 +59,21 @@ pub async fn send_message(
             .post("/api/v1/chat.sendMessage", &json!({ "message": message }))
             .await?
     } else {
-        let mut body = json!({
-            "roomId": rid,
-            "text": final_text,
+        // `chat.sendMessage` supports `tmid` + `tshow` consistently across Rocket.Chat v6/v7/v8/v9.
+        let mut msg = json!({
+            "rid": rid,
+            "msg": final_text,
         });
         if let Some(tmid) = thread_id.filter(|s| !s.is_empty()) {
-            body["tmid"] = json!(tmid);
+            msg["tmid"] = json!(tmid);
             if tshow {
-                body["tshow"] = json!(true);
+                msg["tshow"] = json!(true);
             }
         }
-        handle.api.post("/api/v1/chat.postMessage", &body).await?
+        handle
+            .api
+            .post("/api/v1/chat.sendMessage", &json!({ "message": msg }))
+            .await?
     };
 
     if let Some(msg) = resp.get("message") {
