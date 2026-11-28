@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "nobilis"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -5332,6 +5332,7 @@ dependencies = [
  "pbkdf2 0.12.2",
  "presage",
  "prost",
+ "prost-types",
  "protobuf",
  "pulldown-cmark",
  "qrcode",

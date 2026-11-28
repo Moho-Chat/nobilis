@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -120,6 +120,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # protoc is needed to build, and each is checked against bytes the real
 # definitions produced.
 prost = { version = "0.14", default-features = false, features = ["derive"] }
+# Google Chat (backend/googlechat): its event stream carries protobuf written as JSON ("pblite"), read by walking the
+# schema the generated types came from - the descriptor set is committed beside them.
+prost-types = { version = "0.14", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Matrix backend (Client-Server API over plain reqwest + full E2EE via

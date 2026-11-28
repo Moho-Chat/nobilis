@@ -11,6 +11,7 @@
 //! beside `crate::net` rather than sitting in this list looking like a service
 //! nobody can name.
 pub mod discord;
+pub mod googlechat;
 pub mod irc;
 pub mod kick;
 pub mod matrix;
