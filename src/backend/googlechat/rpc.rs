@@ -167,6 +167,25 @@ async fn dispatch_action(state: &AppState, params: &Value) -> Result<Value, Stri
             "cookies": handle.api.session.cookies(),
             "userAgent": handle.api.session.user_agent(),
         })),
+        "listHuddles" => {
+            let huddles = people::list_huddles(&handle);
+            Ok(json!({ "huddles": huddles }))
+        }
+        "startHuddle" => {
+            let buf = buffer.ok_or("startHuddle requires \"bufferId\"")?;
+            let huddle = people::start_huddle(state, &handle, &buf).await?;
+            Ok(json!({ "ok": true, "huddle": huddle }))
+        }
+        "joinHuddle" => {
+            let buf = buffer.ok_or("joinHuddle requires \"bufferId\"")?;
+            let huddle = people::join_huddle(state, &handle, &buf)?;
+            Ok(json!({ "ok": true, "url": huddle.meeting_url, "huddle": huddle }))
+        }
+        "dismissHuddle" => {
+            let buf = buffer.ok_or("dismissHuddle requires \"bufferId\"")?;
+            people::dismiss_huddle(state, &handle, &buf)?;
+            Ok(json!({ "ok": true }))
+        }
         "inviteMember" => {
             let buf = buffer.ok_or("inviteMember requires \"bufferId\"")?;
             let target = p_str(params, "target").ok_or("inviteMember requires \"target\" (email or user ID)")?;

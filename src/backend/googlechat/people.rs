@@ -971,3 +971,81 @@ pub async fn search_messages(handle: &Handle, raw_query: &str, scope_buffer: Opt
     }
     Ok(out)
 }
+
+/// Lists all active Huddles / Meet calls detected on this Google Chat account.
+pub fn list_huddles(handle: &Handle) -> Vec<world::ActiveHuddle> {
+    handle.world().huddles.values().filter(|h| h.active).cloned().collect()
+}
+
+/// Starts a Huddle / Meet call in a DM or Space, posts the call annotation, marks it active, and returns it.
+pub async fn start_huddle(state: &AppState, handle: &Handle, buffer: &Buffer) -> Result<world::ActiveHuddle, String> {
+    let group = buffer.remote_id.as_deref().and_then(Group::from_remote_id).ok_or("not a Google Chat conversation")?;
+    let url = create_meet_link(state, handle, buffer).await?;
+    if let Some(huddle) = handle.world().huddles.get(&group).cloned() {
+        return Ok(huddle);
+    }
+    let meeting_url = url.ok_or_else(|| "Google Chat did not return a Meet/Huddle URL".to_string())?;
+    let meeting_code = meeting_url
+        .split('/')
+        .last()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let huddle = {
+        let mut world = handle.world();
+        let own_id = world.own_id.clone();
+        let own_name = if !world.own_name.is_empty() { world.own_name.clone() } else { world.name_of(&own_id) };
+        let own_avatar = world.people.get(&own_id).and_then(|p| p.avatar.clone());
+        let h = world::ActiveHuddle {
+            buffer_id: buffer.id.clone(),
+            message_id: String::new(),
+            meeting_url,
+            meeting_code,
+            starter_id: own_id.clone(),
+            starter_name: own_name.clone(),
+            participants: vec![world::HuddleParticipant {
+                user_id: own_id,
+                name: own_name,
+                avatar_url: own_avatar,
+            }],
+            started_at: chrono::Utc::now().timestamp(),
+            active: true,
+        };
+        world.huddles.insert(group, h.clone());
+        h
+    };
+    state.events.emit("googlechatHuddle", json!({ "bufferId": buffer.id, "huddle": huddle }));
+    Ok(huddle)
+}
+
+/// Records the signed-in user as joined in the conversation's active Huddle and returns it.
+pub fn join_huddle(state: &AppState, handle: &Handle, buffer: &Buffer) -> Result<world::ActiveHuddle, String> {
+    let group = buffer.remote_id.as_deref().and_then(Group::from_remote_id).ok_or("not a Google Chat conversation")?;
+    let huddle = {
+        let mut world = handle.world();
+        let own_id = world.own_id.clone();
+        let own_name = if !world.own_name.is_empty() { world.own_name.clone() } else { world.name_of(&own_id) };
+        let own_avatar = world.people.get(&own_id).and_then(|p| p.avatar.clone());
+        let h = world.huddles.get_mut(&group).ok_or("no active Huddle in this conversation")?;
+        if !own_id.is_empty() && !h.participants.iter().any(|p| p.user_id == own_id) {
+            h.participants.push(world::HuddleParticipant {
+                user_id: own_id,
+                name: own_name,
+                avatar_url: own_avatar,
+            });
+        }
+        h.clone()
+    };
+    state.events.emit("googlechatHuddle", json!({ "bufferId": buffer.id, "huddle": huddle }));
+    Ok(huddle)
+}
+
+/// Dismisses / clears an active Huddle banner for a conversation.
+pub fn dismiss_huddle(state: &AppState, handle: &Handle, buffer: &Buffer) -> Result<(), String> {
+    let group = buffer.remote_id.as_deref().and_then(Group::from_remote_id).ok_or("not a Google Chat conversation")?;
+    handle.world().huddles.remove(&group);
+    state.events.emit("googlechatHuddle", json!({ "bufferId": buffer.id, "huddle": Value::Null }));
+    Ok(())
+}

@@ -55,6 +55,30 @@ pub struct Conversation {
     pub emoji: Option<String>,
 }
 
+/// A participant known to be in an active Google Chat Huddle / Meet call.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuddleParticipant {
+    pub user_id: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+/// An active Google Chat Huddle (Meet-backed audio-first call) detected in a DM or Space.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveHuddle {
+    pub buffer_id: String,
+    pub message_id: String,
+    pub meeting_url: String,
+    pub meeting_code: String,
+    pub starter_id: String,
+    pub starter_name: String,
+    pub participants: Vec<HuddleParticipant>,
+    pub started_at: i64,
+    pub active: bool,
+}
+
 #[derive(Default)]
 pub struct World {
     pub own_id: String,
@@ -72,6 +96,8 @@ pub struct World {
     pub reactors: HashMap<(String, String), Vec<String>>,
     /// Pending space invites received over the realtime stream (`space_id`).
     pub pending_invites: Vec<String>,
+    /// Active Huddles / Meet calls keyed by conversation `Group`.
+    pub huddles: HashMap<Group, ActiveHuddle>,
     /// The buffer whose member list is currently open.
     pub watched: Option<String>,
 }

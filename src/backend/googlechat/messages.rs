@@ -122,7 +122,7 @@ pub async fn record(state: &AppState, handle: &Handle, group: &Group, message: &
         if is_system { None } else { avatar },
         rendered.embeds,
         rendered.attachments,
-        (!is_system && !author.is_empty()).then_some(author),
+        (!is_system && !author.is_empty()).then_some(author.clone()),
         (sent_at > 0).then_some(sent_at),
         if is_system { None } else { rendered.html },
         None,
@@ -142,7 +142,94 @@ pub async fn record(state: &AppState, handle: &Handle, group: &Group, message: &
             }
         }
     }
+    // Detect active Huddle / Meet call annotations and surface them to the UI banner.
+    note_huddle(state, handle, group, &buffer.id, &id, &author, sent_at, message);
     stored
+}
+
+/// How recent a `VIDEO_CALL` message must be (in seconds) to surface as an active Huddle banner on load.
+const HUDDLE_ACTIVE_WINDOW_SECS: i64 = 2 * 60 * 60;
+
+/// Inspects a message for `VideoCallMetadata` (Meet / Huddle) and updates `world.huddles` + emits `googlechatHuddle`.
+pub(crate) fn note_huddle(
+    state: &AppState,
+    handle: &Handle,
+    group: &Group,
+    buffer_id: &str,
+    message_id: &str,
+    author_id: &str,
+    sent_at: i64,
+    message: &pb::Message,
+) {
+    let mut found: Option<(String, String)> = None;
+    for ann in &message.annotations {
+        if let Some(pb::annotation::Metadata::VideoCallMetadata(vc)) = &ann.metadata {
+            if let Some(ms) = &vc.meeting_space {
+                let url = ms.meeting_url().to_string();
+                let code = ms.meeting_code().to_string();
+                let resolved_url = if !url.is_empty() {
+                    url
+                } else if !code.is_empty() {
+                    format!("https://meet.google.com/{code}")
+                } else {
+                    continue;
+                };
+                found = Some((resolved_url, code));
+                break;
+            }
+        }
+    }
+    let Some((meeting_url, meeting_code)) = found else { return };
+    let now = chrono::Utc::now().timestamp();
+    let started_at = if sent_at > 0 { sent_at } else { now };
+    if now - started_at > HUDDLE_ACTIVE_WINDOW_SECS {
+        return;
+    }
+    let huddle = {
+        let mut world = handle.world();
+        // Don't let an older history call overwrite a newer active Huddle.
+        if let Some(existing) = world.huddles.get(group) {
+            if existing.started_at > started_at && existing.message_id != message_id {
+                return;
+            }
+        }
+        let starter_name = if !author_id.is_empty() {
+            world.name_of(author_id)
+        } else {
+            "Someone".to_string()
+        };
+        let starter_avatar = world.people.get(author_id).and_then(|p| p.avatar.clone());
+        let mut participants = world
+            .huddles
+            .get(group)
+            .filter(|h| h.message_id == message_id || h.meeting_url == meeting_url)
+            .map(|h| h.participants.clone())
+            .unwrap_or_default();
+        if !author_id.is_empty() && !participants.iter().any(|p| p.user_id == author_id) {
+            participants.insert(
+                0,
+                world::HuddleParticipant {
+                    user_id: author_id.to_string(),
+                    name: starter_name.clone(),
+                    avatar_url: starter_avatar,
+                },
+            );
+        }
+        let h = world::ActiveHuddle {
+            buffer_id: buffer_id.to_string(),
+            message_id: message_id.to_string(),
+            meeting_url,
+            meeting_code,
+            starter_id: author_id.to_string(),
+            starter_name,
+            participants,
+            started_at,
+            active: true,
+        };
+        world.huddles.insert(group.clone(), h.clone());
+        h
+    };
+    state.events.emit("googlechatHuddle", serde_json::json!({ "bufferId": buffer_id, "huddle": huddle }));
 }
 
 /// Applies a live `MESSAGE_UPDATED` edit to an existing message in the store (or records it if unseen).
@@ -151,6 +238,18 @@ pub async fn update_live(state: &AppState, handle: &Handle, group: &Group, messa
     if message.delete_time() > 0 {
         if let Some(buffer) = world::buffer_of(state, &handle.account_id, group) {
             state.runtime.delete_message(state, &buffer.id, &id);
+            let cleared = {
+                let mut world = handle.world();
+                if world.huddles.get(group).is_some_and(|h| h.message_id == id) {
+                    world.huddles.remove(group);
+                    true
+                } else {
+                    false
+                }
+            };
+            if cleared {
+                state.events.emit("googlechatHuddle", serde_json::json!({ "bufferId": buffer.id, "huddle": serde_json::Value::Null }));
+            }
         }
         return;
     }
