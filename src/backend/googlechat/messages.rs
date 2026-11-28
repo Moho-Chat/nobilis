@@ -182,6 +182,22 @@ pub async fn history(state: &AppState, handle: &Handle, buffer: &crate::model::B
     let response = handle.api.list_topics(&group, depth).await?;
     let mut messages: Vec<pb::Message> = response.topics.into_iter().flat_map(|t| t.replies).collect();
     messages.sort_by_key(|m| m.create_time());
+    // The store keeps whole seconds and orders a second's messages as they were stored. Reading further back stores
+    // older messages after newer ones, so where a page boundary falls inside one second the older would land below
+    // the newer (seen live: 16 above 15). The messages of that second already held are taken back and stored again
+    // with the rest, in order.
+    if further {
+        if let Ok(Some(boundary)) = state.store.oldest_ts(&buffer.id) {
+            let older_in_boundary = messages.iter().any(|m| super::micros_to_secs(m.create_time()) == boundary && !state.store.get_message(&buffer.id, m.id.as_ref().map(|i| i.message_id()).unwrap_or("")).ok().flatten().is_some());
+            if older_in_boundary {
+                for m in messages.iter().filter(|m| super::micros_to_secs(m.create_time()) == boundary) {
+                    if let Some(id) = m.id.as_ref().map(|i| i.message_id()).filter(|s| !s.is_empty()) {
+                        state.runtime.delete_message(state, &buffer.id, id);
+                    }
+                }
+            }
+        }
+    }
     let mut count = 0;
     for message in &messages {
         if record(state, handle, &group, message).await {
