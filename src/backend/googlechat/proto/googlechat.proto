@@ -2878,3 +2878,27 @@ message ApplyGroupLabelRequest {
 message ApplyGroupLabelResponse {
 	optional WriteRevision user_revision = 1;
 }
+
+// What the web app sends to start a direct message (`create_dm_extended`, seen live 2026-11-27):
+// [null, null, [[["<gaia>"], "<email>", 1]], null, [1], null, null, 0, 9, ..., header at 100].
+// The meaning of fields 5, 8 and 9 is not known; they are sent as the web app sends them.
+message DmInvitee {
+	optional UserId user_id = 1;
+	optional string email = 2;
+	optional int32 kind = 3;
+}
+
+message CreateDmExtendedRequest {
+	optional RequestHeader request_header = 100;
+	repeated DmInvitee invitees = 3;
+	repeated int32 unknown5 = 5;
+	optional int32 unknown8 = 8;
+	optional int32 unknown9 = 9;
+}
+
+// Answered with the conversation, its memberships and the people in it (seen live 2026-11-27).
+message CreateDmExtendedResponse {
+	optional Group dm = 1;
+	repeated Membership memberships = 4;
+	repeated Member members = 5;
+}

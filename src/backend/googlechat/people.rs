@@ -235,10 +235,31 @@ pub async fn create_dm(state: &AppState, handle: &Handle, identifier: &str) -> R
             ..Default::default()
         }
     } else if target.contains('@') {
-        pb::CreateDmRequest {
-            invitees: vec![pb::InviteeInfo { email: Some(target.to_string()), ..Default::default() }],
-            ..Default::default()
+        // By email: as the web app does it (create_dm_extended). create_dm with an invitee email is refused (500).
+        let resp = handle.api.create_dm_extended(Some(target), None).await.map_err(|e| format!("could not open DM: {e}"))?;
+        let group = Group::from_pb(resp.dm.as_ref().and_then(|d| d.group_id.as_ref()))
+            .ok_or_else(|| "Google Chat did not return a conversation ID".to_string())?;
+        let members: Vec<String> = resp
+            .memberships
+            .iter()
+            .filter_map(|m| m.id.as_ref()?.member_id.as_ref()?.id.as_ref().map(|pb::member_id::Id::UserId(u)| u.id().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        {
+            let mut world = handle.world();
+            for member in &resp.members {
+                if let Some(pb::member::Profile::User(user)) = &member.profile {
+                    world.learn(user);
+                }
+            }
+            let conversation = world.conversations.entry(group.clone()).or_default();
+            for id in members {
+                if !conversation.members.contains(&id) {
+                    conversation.members.push(id);
+                }
+            }
         }
+        return open_dm(state, handle, &group).await;
     } else {
         return Err(format!("{target:?} is neither an email address nor a numeric Google Chat user ID"));
     };
@@ -276,6 +297,16 @@ pub async fn create_dm(state: &AppState, handle: &Handle, identifier: &str) -> R
         world::learn_people(handle, unknown).await;
     }
     Ok(world::register(state, handle, &group, false))
+}
+
+/// The buffer of a direct message just made, its people read with get_group.
+async fn open_dm(state: &AppState, handle: &Handle, group: &Group) -> Result<Buffer, String> {
+    handle.world().conversations.entry(group.clone()).or_default();
+    let buffer = world::register(state, handle, group, false);
+    // Members, names and roles, then the buffer again under the other person's name.
+    let _ = refresh_members(state, handle, &buffer).await;
+    // Named again now its people are known (a direct message is called after them).
+    Ok(world::register(state, handle, group, false))
 }
 
 /// Renames a space (spaces only).

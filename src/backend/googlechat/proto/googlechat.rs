@@ -6757,6 +6757,41 @@ pub struct ApplyGroupLabelResponse {
     #[prost(message, optional, tag = "1")]
     pub user_revision: ::core::option::Option<WriteRevision>,
 }
+/// What the web app sends to start a direct message (`create_dm_extended`, seen live 2026-11-27):
+/// \[null, null, [[["<gaia>"\], "<email>", 1]], null, \[1\], null, null, 0, 9, ..., header at 100].
+/// The meaning of fields 5, 8 and 9 is not known; they are sent as the web app sends them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DmInvitee {
+    #[prost(message, optional, tag = "1")]
+    pub user_id: ::core::option::Option<UserId>,
+    #[prost(string, optional, tag = "2")]
+    pub email: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag = "3")]
+    pub kind: ::core::option::Option<i32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateDmExtendedRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, repeated, tag = "3")]
+    pub invitees: ::prost::alloc::vec::Vec<DmInvitee>,
+    #[prost(int32, repeated, packed = "false", tag = "5")]
+    pub unknown5: ::prost::alloc::vec::Vec<i32>,
+    #[prost(int32, optional, tag = "8")]
+    pub unknown8: ::core::option::Option<i32>,
+    #[prost(int32, optional, tag = "9")]
+    pub unknown9: ::core::option::Option<i32>,
+}
+/// Answered with the conversation, its memberships and the people in it (seen live 2026-11-27).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateDmExtendedResponse {
+    #[prost(message, optional, tag = "1")]
+    pub dm: ::core::option::Option<Group>,
+    #[prost(message, repeated, tag = "4")]
+    pub memberships: ::prost::alloc::vec::Vec<Membership>,
+    #[prost(message, repeated, tag = "5")]
+    pub members: ::prost::alloc::vec::Vec<Member>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum UserType {

@@ -290,6 +290,18 @@ impl Api {
         self.call("create_dm", &request, false).await
     }
 
+    /// Starts (or finds) a direct message the way the web app does: by email and, when known, id.
+    pub async fn create_dm_extended(&self, email: Option<&str>, gaia: Option<&str>) -> Result<pb::CreateDmExtendedResponse, GcError> {
+        let request = pb::CreateDmExtendedRequest {
+            request_header: Some(request_header()),
+            invitees: vec![pb::DmInvitee { user_id: gaia.map(super::user_id), email: email.map(str::to_string), kind: Some(1) }],
+            unknown5: vec![1],
+            unknown8: Some(0),
+            unknown9: Some(9),
+        };
+        self.call("create_dm_extended", &request, false).await
+    }
+
     /// Mutes or unmutes one conversation (setting_type: 4 for DM, 5 for Space).
     pub async fn update_group_notification_settings(&self, group: &super::Group, muted: bool) -> Result<pb::UpdateGroupNotificationSettingsResponse, GcError> {
         let setting_type = if group.is_dm() { 4 } else { 5 };
