@@ -582,4 +582,60 @@ mod tests {
         assert!(matches!(&anns[4].metadata, Some(Metadata::UserMentionMetadata(m)) if m.id.as_ref().and_then(|u| u.id.as_deref()) == Some("42")));
         assert!(matches!(&anns[5].metadata, Some(Metadata::UserMentionMetadata(m)) if m.r#type() == pb::user_mention_metadata::Type::MentionAll));
     }
+
+    #[test]
+    fn app_card_v2_and_html_attachment_render_safely() {
+        let addon = pb::JAddOnsContextualAddOn {
+            cards: vec![pb::j_add_ons_contextual_add_on::Card {
+                header: Some(pb::j_add_ons_contextual_add_on::card::CardHeader {
+                    title: Some(pb::JAddOnsFormattedText { original_text: Some("Deploy Bot".into()), ..Default::default() }),
+                    subtitle: Some(pb::JAddOnsFormattedText { original_text: Some("Production".into()), ..Default::default() }),
+                    ..Default::default()
+                }),
+                sections: vec![pb::j_add_ons_contextual_add_on::card::Section {
+                    header: Some(pb::JAddOnsFormattedText { original_text: Some("Status".into()), ..Default::default() }),
+                    widgets: vec![
+                        pb::JAddOnsWidget {
+                            data: Some(pb::j_add_ons_widget::Data::TextParagraph(pb::j_add_ons_widget::TextParagraph {
+                                text: Some(pb::JAddOnsFormattedText { original_text: Some("Build green".into()), ..Default::default() }),
+                            })),
+                            ..Default::default()
+                        },
+                        pb::JAddOnsWidget {
+                            data: Some(pb::j_add_ons_widget::Data::TextKeyValue(pb::j_add_ons_widget::TextKeyValue {
+                                key: Some(pb::JAddOnsFormattedText { original_text: Some("Version".into()), ..Default::default() }),
+                                text: Some(pb::JAddOnsFormattedText { original_text: Some("1.6.1".into()), ..Default::default() }),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let m = pb::Message {
+            text_body: Some("<script>alert(1)</script>".into()),
+            attachments: vec![
+                pb::Attachment {
+                    r#type: Some(pb::attachment::Type::AddOnData(addon)),
+                    ..Default::default()
+                },
+                pb::Attachment {
+                    r#type: Some(pb::attachment::Type::Html(pb::HtmlAttachment::default())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rendered = render(&m, "", "");
+        assert_eq!(rendered.embeds.len(), 2);
+        assert_eq!(rendered.embeds[0].title.as_deref(), Some("Deploy Bot"));
+        assert!(rendered.embeds[0].description.as_deref().unwrap_or("").contains("Version: 1.6.1"));
+        assert_eq!(rendered.embeds[1].title.as_deref(), Some("App Card"));
+        // Raw HTML in body is never emitted unescaped in `html`.
+        assert!(rendered.html.as_deref().map(|h| !h.contains("<script>")).unwrap_or(true));
+    }
 }
