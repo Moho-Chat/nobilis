@@ -940,7 +940,8 @@ message Annotation {
 		VideoCallMetadata video_call_metadata = 12;
 		RoomUpdatedMetadata room_updated = 14;
 		//DYNProtoGsuiteIntegrationMetadata gsuite_integration_metadata = 16;
-		//DYNProtoGroupRetentionSettingsUpdatedMetaData group_retention_settings_updated = 17;
+		// Seen live 2026-11-27 on a "history turned off" system message (annotation type 19).
+		GroupRetentionSettingsUpdatedMetaData group_retention_settings_updated = 17;
 		//DYNProtoBabelPlaceholderMetadata babel_placeholder_metadata = 18
 		//DYNProtoReadReceiptsSettingsUpdatedMetadata read_receipts_settings_metadata = 21;
 		//DYNProtoIncomingWebhookChangedMetadata incoming_webhook_changed_metadata = 22;
@@ -1110,6 +1111,13 @@ message GroupNotificationSettings {
 	// guesses: live data shows field 1 as 2 on every chat and field 2 as the
 	// same type value the update carries (5 for a space, 4 for a DM).
 	optional GroupNotificationSettingsUpdate.Mute mute = 3;
+}
+
+// A conversation's history turned on or off: the new setting and who changed it. Seen live 2026-11-27:
+// [[2, "<expiry micros>"], ["<gaia id>"]].
+message GroupRetentionSettingsUpdatedMetaData {
+	optional RetentionSettings retention_settings = 1;
+	optional UserId initiator = 2;
 }
 
 message RetentionSettings {
@@ -2480,7 +2488,8 @@ message WorldItemLite {
 	optional string avatar_url = 16;
 	//repeated ?? space_integration_payloads = 17;
 	//optional GroupIntegrationSettings group_integration_settings = 22;
-	// optional AvatarInfo avatar_info = 18;
+	// A space's emoji. Seen live 2026-11-27 in paginated_world: world_items[].18 = [["🚀"]].
+	optional AvatarInfo avatar_info = 18;
 	optional SharedAttributeCheckerGroupType attribute_checker_group_type = 19;
 	optional GroupSupportLevel group_support_level = 23;
 	optional GroupUnsupportedReason group_unsupported_reason = 24;
@@ -2646,9 +2655,13 @@ message UpdateGroupRequest {
 	repeated UpdateMask update_masks = 4;
 	optional string name = 2;
 	optional GroupVisibility visibility = 5;
-	// optional AvatarInfo avatar_info = 6;
+	optional AvatarInfo avatar_info = 6;
 	// Same shape as Group.group_details (field 37): description + guidelines.
 	optional GroupDetails space_details = 7;
+}
+
+message AvatarInfo {
+	optional Emoji emoji = 1;
 }
 
 message UpdateGroupResponse {
@@ -2734,4 +2747,134 @@ message GroupNotificationSettingsUpdate {
 }
 
 message UpdateGroupNotificationSettingsResponse {
+}
+
+message CreateVideoCallRequest {
+	optional GroupId group_id = 1;
+	optional RequestHeader request_header = 100;
+}
+
+message CreateVideoCallResponse {
+	optional Annotation annotation = 1;
+}
+
+message ListBlockedUsersRequest {
+	optional RequestHeader request_header = 100;
+}
+
+message ListBlockedUsersResponse {
+	repeated UserId blocked_user_id = 1;
+}
+
+enum BotUseCase {
+	UNKNOWN_USE_CASE = 0;
+	BOT_DM = 1;
+	MULTI_USER_SPACE = 2;
+}
+
+message SlashCommand {
+	optional string name = 1;
+	optional int64 command_id = 2;
+	optional string description = 3;
+	optional string arguments_hint = 4;
+	optional bool triggers_dialog = 5;
+}
+
+message BotSlashCommands {
+	optional User bot = 1;
+	repeated SlashCommand slash_commands = 2;
+}
+
+message AutocompleteSlashCommandsRequest {
+	optional string query = 1;
+	optional GroupId group_id = 2;
+	optional int32 max_num_results = 3;
+	optional bool restrict_to_bots_in_group = 4;
+	repeated BotUseCase bot_use_case_filters = 6;
+	optional bool include_dialogs = 7;
+	optional RequestHeader request_header = 100;
+}
+
+message AutocompleteSlashCommandsResponse {
+	repeated BotSlashCommands bots_in_group = 1;
+	repeated BotSlashCommands bots_not_in_group = 2;
+	optional bool has_more_results = 3;
+}
+
+// Captured live from chat.google.com: /u/0/api/update_group_retention_settings
+message UpdateGroupRetentionSettingsRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupId group_id = 1;
+	optional RetentionSettings retention_settings = 2;
+	optional string local_id = 3;
+}
+
+message UpdateGroupRetentionSettingsResponse {
+	optional RetentionSettings retention_settings = 1;
+	optional WriteRevision retention_revision = 2;
+}
+
+// Captured live from chat.google.com: /u/0/api/update_membership_role
+// Role values: 3 = ROLE_MEMBER, 4 = ROLE_OWNER, 6 = ROLE_MANAGER.
+message MembershipRoleUpdate {
+	optional int32 role = 2;
+	optional UserId member_id = 3;
+	optional GroupId group_id = 4;
+}
+
+message UpdateMembershipRoleRequest {
+	optional RequestHeader request_header = 100;
+	repeated MembershipRoleUpdate updates = 1;
+}
+
+message UpdateMembershipRoleResponse {
+	optional WriteRevision group_revision = 2;
+}
+
+// Captured live from chat.google.com:
+// /u/0/api/create_roster_section, /u/0/api/delete_roster_section, /u/0/api/apply_group_label
+message GroupLabelId {
+	optional int32 type = 1; // 4 = custom section
+	optional string id = 2;
+}
+
+message RosterSectionId {
+	optional int32 type = 1; // 3 = custom section
+	optional GroupLabelId label_id = 2;
+	optional string id = 3;
+}
+
+message RosterSection {
+	optional RosterSectionId section_id = 1;
+	optional int32 sort_order = 2;
+	optional string display_name = 3;
+}
+
+message CreateRosterSectionRequest {
+	optional RequestHeader request_header = 100;
+	optional RosterSection section = 1;
+}
+
+message CreateRosterSectionResponse {
+	optional RosterSection section = 1;
+	optional WriteRevision user_revision = 2;
+}
+
+message DeleteRosterSectionRequest {
+	optional RequestHeader request_header = 100;
+	optional RosterSectionId section_id = 2;
+}
+
+message DeleteRosterSectionResponse {
+	optional WriteRevision user_revision = 1;
+}
+
+message ApplyGroupLabelRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupLabelId label_id = 1;
+	optional GroupId group_id = 2;
+}
+
+message ApplyGroupLabelResponse {
+	optional WriteRevision user_revision = 1;
 }

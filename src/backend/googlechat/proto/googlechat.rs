@@ -2385,7 +2385,10 @@ pub struct Annotation {
     pub chip_render_type: ::core::option::Option<i32>,
     #[prost(bool, optional, tag = "13")]
     pub server_invalidated: ::core::option::Option<bool>,
-    #[prost(oneof = "annotation::Metadata", tags = "5, 8, 15, 4, 6, 7, 10, 11, 12, 14")]
+    #[prost(
+        oneof = "annotation::Metadata",
+        tags = "5, 8, 15, 4, 6, 7, 10, 11, 12, 14, 17"
+    )]
     pub metadata: ::core::option::Option<annotation::Metadata>,
 }
 /// Nested message and enum types in `Annotation`.
@@ -2452,15 +2455,18 @@ pub mod annotation {
         MembershipChanged(super::MembershipChangedMetadata),
         #[prost(message, tag = "12")]
         VideoCallMetadata(super::VideoCallMetadata),
+        #[prost(message, tag = "14")]
+        RoomUpdated(super::RoomUpdatedMetadata),
         /// DYNProtoGsuiteIntegrationMetadata gsuite_integration_metadata = 16;
-        /// DYNProtoGroupRetentionSettingsUpdatedMetaData group_retention_settings_updated = 17;
+        /// Seen live 2026-11-27 on a "history turned off" system message (annotation type 19).
+        ///
         /// DYNProtoBabelPlaceholderMetadata babel_placeholder_metadata = 18
         /// DYNProtoReadReceiptsSettingsUpdatedMetadata read_receipts_settings_metadata = 21;
         /// DYNProtoIncomingWebhookChangedMetadata incoming_webhook_changed_metadata = 22;
         /// DYNProtoIntegrationConfigUpdatedMetadata integration_config_updated = 23;
         /// DYNProtoConsentedAppUnfurlMetadata consented_app_unfurl_metadata = 24;
-        #[prost(message, tag = "14")]
-        RoomUpdated(super::RoomUpdatedMetadata),
+        #[prost(message, tag = "17")]
+        GroupRetentionSettingsUpdated(super::GroupRetentionSettingsUpdatedMetaData),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2805,6 +2811,15 @@ pub mod group_notification_settings {
             }
         }
     }
+}
+/// A conversation's history turned on or off: the new setting and who changed it. Seen live 2026-11-27:
+/// \[[2, "<expiry micros>"\], \["<gaia id>"]\].
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GroupRetentionSettingsUpdatedMetaData {
+    #[prost(message, optional, tag = "1")]
+    pub retention_settings: ::core::option::Option<RetentionSettings>,
+    #[prost(message, optional, tag = "2")]
+    pub initiator: ::core::option::Option<UserId>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetentionSettings {
@@ -5937,7 +5952,9 @@ pub struct WorldItemLite {
     pub avatar_url: ::core::option::Option<::prost::alloc::string::String>,
     /// repeated ?? space_integration_payloads = 17;
     /// optional GroupIntegrationSettings group_integration_settings = 22;
-    /// optional AvatarInfo avatar_info = 18;
+    /// A space's emoji. Seen live 2026-11-27 in paginated_world: world_items\[\].18 = \[["🚀"]\].
+    #[prost(message, optional, tag = "18")]
+    pub avatar_info: ::core::option::Option<AvatarInfo>,
     #[prost(enumeration = "SharedAttributeCheckerGroupType", optional, tag = "19")]
     pub attribute_checker_group_type: ::core::option::Option<i32>,
     #[prost(enumeration = "GroupSupportLevel", optional, tag = "23")]
@@ -6346,7 +6363,8 @@ pub struct UpdateGroupRequest {
     pub name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "5")]
     pub visibility: ::core::option::Option<GroupVisibility>,
-    /// optional AvatarInfo avatar_info = 6;
+    #[prost(message, optional, tag = "6")]
+    pub avatar_info: ::core::option::Option<AvatarInfo>,
     /// Same shape as Group.group_details (field 37): description + guidelines.
     #[prost(message, optional, tag = "7")]
     pub space_details: ::core::option::Option<GroupDetails>,
@@ -6401,6 +6419,11 @@ pub mod update_group_request {
             }
         }
     }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AvatarInfo {
+    #[prost(message, optional, tag = "1")]
+    pub emoji: ::core::option::Option<Emoji>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateGroupResponse {
@@ -6555,6 +6578,185 @@ pub mod group_notification_settings_update {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpdateGroupNotificationSettingsResponse {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateVideoCallRequest {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: ::core::option::Option<GroupId>,
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateVideoCallResponse {
+    #[prost(message, optional, tag = "1")]
+    pub annotation: ::core::option::Option<Annotation>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListBlockedUsersRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBlockedUsersResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub blocked_user_id: ::prost::alloc::vec::Vec<UserId>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SlashCommand {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "2")]
+    pub command_id: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub arguments_hint: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5")]
+    pub triggers_dialog: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BotSlashCommands {
+    #[prost(message, optional, tag = "1")]
+    pub bot: ::core::option::Option<User>,
+    #[prost(message, repeated, tag = "2")]
+    pub slash_commands: ::prost::alloc::vec::Vec<SlashCommand>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AutocompleteSlashCommandsRequest {
+    #[prost(string, optional, tag = "1")]
+    pub query: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub group_id: ::core::option::Option<GroupId>,
+    #[prost(int32, optional, tag = "3")]
+    pub max_num_results: ::core::option::Option<i32>,
+    #[prost(bool, optional, tag = "4")]
+    pub restrict_to_bots_in_group: ::core::option::Option<bool>,
+    #[prost(enumeration = "BotUseCase", repeated, packed = "false", tag = "6")]
+    pub bot_use_case_filters: ::prost::alloc::vec::Vec<i32>,
+    #[prost(bool, optional, tag = "7")]
+    pub include_dialogs: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AutocompleteSlashCommandsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub bots_in_group: ::prost::alloc::vec::Vec<BotSlashCommands>,
+    #[prost(message, repeated, tag = "2")]
+    pub bots_not_in_group: ::prost::alloc::vec::Vec<BotSlashCommands>,
+    #[prost(bool, optional, tag = "3")]
+    pub has_more_results: ::core::option::Option<bool>,
+}
+/// Captured live from chat.google.com: /u/0/api/update_group_retention_settings
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateGroupRetentionSettingsRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, optional, tag = "1")]
+    pub group_id: ::core::option::Option<GroupId>,
+    #[prost(message, optional, tag = "2")]
+    pub retention_settings: ::core::option::Option<RetentionSettings>,
+    #[prost(string, optional, tag = "3")]
+    pub local_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateGroupRetentionSettingsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub retention_settings: ::core::option::Option<RetentionSettings>,
+    #[prost(message, optional, tag = "2")]
+    pub retention_revision: ::core::option::Option<WriteRevision>,
+}
+/// Captured live from chat.google.com: /u/0/api/update_membership_role
+/// Role values: 3 = ROLE_MEMBER, 4 = ROLE_OWNER, 6 = ROLE_MANAGER.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MembershipRoleUpdate {
+    #[prost(int32, optional, tag = "2")]
+    pub role: ::core::option::Option<i32>,
+    #[prost(message, optional, tag = "3")]
+    pub member_id: ::core::option::Option<UserId>,
+    #[prost(message, optional, tag = "4")]
+    pub group_id: ::core::option::Option<GroupId>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateMembershipRoleRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, repeated, tag = "1")]
+    pub updates: ::prost::alloc::vec::Vec<MembershipRoleUpdate>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateMembershipRoleResponse {
+    #[prost(message, optional, tag = "2")]
+    pub group_revision: ::core::option::Option<WriteRevision>,
+}
+/// Captured live from chat.google.com:
+/// /u/0/api/create_roster_section, /u/0/api/delete_roster_section, /u/0/api/apply_group_label
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GroupLabelId {
+    /// 4 = custom section
+    #[prost(int32, optional, tag = "1")]
+    pub r#type: ::core::option::Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RosterSectionId {
+    /// 3 = custom section
+    #[prost(int32, optional, tag = "1")]
+    pub r#type: ::core::option::Option<i32>,
+    #[prost(message, optional, tag = "2")]
+    pub label_id: ::core::option::Option<GroupLabelId>,
+    #[prost(string, optional, tag = "3")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RosterSection {
+    #[prost(message, optional, tag = "1")]
+    pub section_id: ::core::option::Option<RosterSectionId>,
+    #[prost(int32, optional, tag = "2")]
+    pub sort_order: ::core::option::Option<i32>,
+    #[prost(string, optional, tag = "3")]
+    pub display_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateRosterSectionRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, optional, tag = "1")]
+    pub section: ::core::option::Option<RosterSection>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateRosterSectionResponse {
+    #[prost(message, optional, tag = "1")]
+    pub section: ::core::option::Option<RosterSection>,
+    #[prost(message, optional, tag = "2")]
+    pub user_revision: ::core::option::Option<WriteRevision>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteRosterSectionRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, optional, tag = "2")]
+    pub section_id: ::core::option::Option<RosterSectionId>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteRosterSectionResponse {
+    #[prost(message, optional, tag = "1")]
+    pub user_revision: ::core::option::Option<WriteRevision>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ApplyGroupLabelRequest {
+    #[prost(message, optional, tag = "100")]
+    pub request_header: ::core::option::Option<RequestHeader>,
+    #[prost(message, optional, tag = "1")]
+    pub label_id: ::core::option::Option<GroupLabelId>,
+    #[prost(message, optional, tag = "2")]
+    pub group_id: ::core::option::Option<GroupId>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ApplyGroupLabelResponse {
+    #[prost(message, optional, tag = "1")]
+    pub user_revision: ::core::option::Option<WriteRevision>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum UserType {
@@ -7481,6 +7683,35 @@ impl SharedAttributeCheckerGroupType {
             "THREADED_ROOM" => Some(Self::ThreadedRoom),
             "IMMUTABLE_MEMBERSHIP_HUMAN_DM" => Some(Self::ImmutableMembershipHumanDm),
             "POST_ROOM" => Some(Self::PostRoom),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BotUseCase {
+    UnknownUseCase = 0,
+    BotDm = 1,
+    MultiUserSpace = 2,
+}
+impl BotUseCase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::UnknownUseCase => "UNKNOWN_USE_CASE",
+            Self::BotDm => "BOT_DM",
+            Self::MultiUserSpace => "MULTI_USER_SPACE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNKNOWN_USE_CASE" => Some(Self::UnknownUseCase),
+            "BOT_DM" => Some(Self::BotDm),
+            "MULTI_USER_SPACE" => Some(Self::MultiUserSpace),
             _ => None,
         }
     }

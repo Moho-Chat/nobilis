@@ -81,6 +81,12 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        "googlechat" if target.chars().all(|c| c.is_ascii_digit()) && !target.is_empty() => {
+            let handle = state.runtime.googlechat_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Google Chat account is not connected"))?;
+            backend::googlechat::people::block_user(&handle, target, ignored, false).await.map_err(|e| anyhow::anyhow!(e))?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         _ => {
             state.ignores.set(account_id, target, ignored);
             Ok("window")
@@ -1432,6 +1438,15 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             }
+            if id.starts_with("googlechat:") {
+                let Some(handle) = state.runtime.googlechat_handle(id) else {
+                    return (None, Some("that Google Chat account is not connected".to_string()));
+                };
+                return match backend::googlechat::people::join_or_dm(state, &handle, name).await {
+                    Ok(_) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             // A Fluxer guild too.
             if id.starts_with("fluxer:") {
                 let Some(handle) = state.runtime.fluxer_handle(id) else {
@@ -1544,6 +1559,12 @@ pub async fn dispatch(
                         if let Err(e) = backend::mattermost::send::typing(state, &buffer, p_str_opt(params, "threadId")) {
                             tracing::debug!("sendTyping: {e}");
                         }
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => {
+                    if let Err(e) = backend::googlechat::send::typing(state, &buffer, p_str_opt(params, "threadId"), typing).await {
+                        tracing::debug!("googlechat sendTyping: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1718,6 +1739,7 @@ pub async fn dispatch(
                         "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "fluxer" => backend::fluxer::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "mattermost" => backend::mattermost::people::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "googlechat" => backend::googlechat::people::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "signal" => backend::signal::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "xmpp" => backend::xmpp::pep::profile(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
@@ -1749,6 +1771,12 @@ pub async fn dispatch(
                 let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
                 return match backend::mattermost::messages::thread(state, &handle, &buffer, root_id).await {
                     Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            } else if let Some(handle) = state.runtime.googlechat_handle(&account_id).filter(|_| account_id.starts_with("googlechat:")) {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
+                return match backend::googlechat::messages::fetch_thread(state, &handle, &buffer, root_id).await {
+                    Ok(messages) => (Some(serde_json::json!({ "messages": messages })), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 };
             } else if account_id.starts_with("telegram:") {
@@ -2391,6 +2419,11 @@ pub async fn dispatch(
                 }
             } else if let Some(handle) = state.runtime.rocketchat_handle(account_id).filter(|_| account_id.starts_with("rocketchat:")) {
                 backend::rocketchat::profile::set_status(&handle, status, text.as_deref()).await.is_ok()
+            } else if let Some(handle) = state.runtime.googlechat_handle(account_id).filter(|_| account_id.starts_with("googlechat:")) {
+                match backend::googlechat::people::apply_status(&handle, status, text.as_deref()).await {
+                    Ok(()) => true,
+                    Err(e) => return (None, Some(e)),
+                }
             } else if account_id.starts_with("telegram:") {
                 // Online or not, which is all Telegram shows; recorded above for the next connection either way.
                 backend::telegram::account::presence_changed(state, account_id)
@@ -2521,6 +2554,19 @@ pub async fn dispatch(
                             tokio::spawn(async move {
                                 if let Err(e) = backend::mattermost::people::refresh_members(&state, &handle, &buffer).await {
                                     tracing::debug!("mattermost members: {e}");
+                                }
+                            });
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(buffer) if buffer.account_id.starts_with("googlechat:") => match state.runtime.googlechat_handle(&buffer.account_id) {
+                        Some(handle) => {
+                            handle.world().watched = Some(buffer.id.clone());
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backend::googlechat::people::refresh_members(&state, &handle, &buffer).await {
+                                    tracing::debug!("googlechat members: {e}");
                                 }
                             });
                             true
@@ -2992,6 +3038,13 @@ pub async fn dispatch(
                     }
                 }
             }
+            if service == "googlechat" {
+                if let Some(handle) = state.runtime.googlechat_handle(&buffer.account_id) {
+                    if let Ok(rows) = backend::googlechat::people::slash_commands(&handle, &buffer, query).await {
+                        out.extend(rows);
+                    }
+                }
+            }
             if service == "discord" {
                 match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
                     Ok(answer) => {
@@ -3260,6 +3313,8 @@ pub async fn dispatch(
                 backend::fluxer::send::reactors(&handle, &buffer, message_id, emoji).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(handle) = state.runtime.mattermost_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("mattermost:")) {
                 backend::mattermost::extra::reactors(&handle, message_id, emoji).await
+            } else if let Some(handle) = state.runtime.googlechat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("googlechat:")) {
+                Ok(backend::googlechat::people::reactors(&handle, message_id, emoji))
             } else if buffer.account_id.starts_with("sneedchat:") {
                 backend::sneedchat::reactors(&buffer.account_id, &buffer.name, message_id, emoji)
                     .await
@@ -4214,6 +4269,10 @@ pub async fn dispatch(
                                 Ok(()) => (Some(ok_node()), None),
                                 Err(e) => (None, Some(format!("{e:#}"))),
                             };
+                        } else if buffer.account_id.starts_with("googlechat:") {
+                            if let Err(e) = backend::googlechat::send::leave(state, &buffer).await {
+                                return (None, Some(e));
+                            }
                         } else if buffer.account_id.starts_with("telegram:") && backend::telegram::topics::topic_of_buffer(&buffer).is_some() {
                             // Closing one topic of a group only stops showing it: the group is left from its rail entry.
                         } else if buffer.account_id.starts_with("telegram:") {
@@ -4548,13 +4607,20 @@ pub async fn dispatch(
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("googlechat:") => {
-                    let has_files = params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) || attachment_path.is_some();
-                    if has_files {
-                        return (None, Some("Sending files to Google Chat is not built yet".to_string()));
-                    }
-                    // A reply in a thread names the thread's topic; Google's topic id is its first message's id.
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    // A reply in a thread names the thread's topic; otherwise reply_to_id is a quote-reply.
                     let thread = p_str_opt(params, "threadId").or(reply_to_id.filter(|_| p_bool(params, "inThread", false)));
-                    match backend::googlechat::send::send_text(state, &buffer, body, thread).await {
+                    let quote = if thread.is_none() { reply_to_id } else { None };
+                    let sent = backend::googlechat::send::send_message(state, &buffer, body, thread, quote, &paths).await;
+                    if let Some(p) = progress {
+                        if !paths.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }
@@ -4880,6 +4946,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => match backend::googlechat::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4951,6 +5021,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => match backend::googlechat::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -5014,6 +5088,10 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("mattermost:") => match backend::mattermost::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("googlechat:") => match backend::googlechat::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },

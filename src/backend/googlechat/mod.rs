@@ -27,11 +27,15 @@ pub mod channel;
 pub mod chunk;
 pub mod connect;
 pub mod format;
+pub mod media;
 pub mod messages;
 pub mod pblite;
+pub mod people;
+pub mod retention;
 pub mod rpc;
 pub mod send;
 pub mod session;
+pub mod space_settings;
 pub mod world;
 
 pub use connect::spawn;

@@ -320,6 +320,19 @@ impl Store {
              );",
         );
 
+        // Messages the service deletes at a set time - Google Chat with history off keeps a message 24 hours -
+        // and when: what takes them out of scrollback when the server does, across a restart. See
+        // backend/googlechat/retention.rs.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_expiry (
+                 buffer_id TEXT NOT NULL,
+                 msg_id TEXT NOT NULL,
+                 expires_at INTEGER NOT NULL,
+                 PRIMARY KEY (buffer_id, msg_id)
+             );
+             CREATE INDEX IF NOT EXISTS message_expiry_at ON message_expiry (expires_at);",
+        );
+
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS media_sources (
                  path TEXT PRIMARY KEY,
@@ -525,6 +538,16 @@ impl Store {
         Ok(rows > 0)
     }
 
+    /// Updates or clears a message's stored HTML (used when a formatted message is edited).
+    pub fn set_message_html(&self, buffer_id: &str, msg_id: &str, html: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE messages SET html = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![html, buffer_id, msg_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// A message's earlier versions, oldest first: what it said, and when that was replaced (unix seconds).
     pub fn edit_history(&self, buffer_id: &str, msg_id: &str) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().unwrap();
@@ -666,7 +689,34 @@ impl Store {
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
+        conn.execute("DELETE FROM message_expiry WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
         Ok(rows > 0)
+    }
+
+    /// Notes when the service will delete a message (unix seconds), so it leaves scrollback then too.
+    pub fn note_expiry(&self, buffer_id: &str, msg_id: &str, expires_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO message_expiry (buffer_id, msg_id, expires_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (buffer_id, msg_id) DO UPDATE SET expires_at = excluded.expires_at",
+            params![buffer_id, msg_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// The messages whose time is up, as (buffer id, message id), for buffers whose ids begin with `prefix`.
+    pub fn expired_messages(&self, prefix: &str, now: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT buffer_id, msg_id FROM message_expiry WHERE expires_at <= ?1 AND substr(buffer_id, 1, length(?2)) = ?2")?;
+        let rows = stmt.query_map(params![now, prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Forgets a message's expiry - it is gone, or it turned out not to be going.
+    pub fn forget_expiry(&self, buffer_id: &str, msg_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM message_expiry WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
+        Ok(())
     }
 
     /// Applies one reaction add/remove to a message's stored tally and
@@ -747,6 +797,8 @@ impl Store {
         )?;
         // A warning on the conversation goes with it.
         conn.execute("UPDATE OR IGNORE buffer_notices SET buffer_id = ?2 WHERE buffer_id = ?1", params![old_id, new_id])?;
+        // And so does when its messages are due to go.
+        conn.execute("UPDATE OR IGNORE message_expiry SET buffer_id = ?2 WHERE buffer_id = ?1", params![old_id, new_id])?;
         Ok(moved)
     }
 
@@ -1432,7 +1484,7 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
         // backend/telegram/media.rs and backend/stoat/media.rs): a file that is not there yet is the usual state of one,
         // not a sign it was swept.
         let path = std::path::Path::new(rest);
-        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::fluxer::media::MEDIA, crate::backend::fluxer::media::AVATARS, crate::backend::mattermost::media::MEDIA, crate::backend::mattermost::media::AVATARS, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
+        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS, crate::backend::fluxer::media::MEDIA, crate::backend::fluxer::media::AVATARS, crate::backend::mattermost::media::MEDIA, crate::backend::mattermost::media::AVATARS, crate::backend::googlechat::media::MEDIA, crate::backend::signal::media::MEDIA, crate::backend::signal::media::AVATARS];
         if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| named_first.contains(&n)) {
             return false;
         }
@@ -1542,7 +1594,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let like = format!("{account_id}|%");
         let mut gone = 0;
-        for table in ["messages", "live_cards", "matrix_reactions", "buffer_notices"] {
+        for table in ["messages", "live_cards", "matrix_reactions", "buffer_notices", "message_expiry"] {
             gone += conn.execute(
                 &format!("DELETE FROM {table} WHERE buffer_id = ?1 OR buffer_id LIKE ?2"),
                 params![account_id, like],
@@ -1692,6 +1744,24 @@ mod tests {
         let path = dir.join("scrollback.db");
         let _ = std::fs::remove_file(&path);
         (Store::open(&path).expect("opening store"), dir)
+    }
+
+    #[test]
+    fn messages_due_to_expire_are_found_by_account_and_forgotten_when_gone() {
+        let (s, dir) = store();
+        s.note_expiry("googlechat:1|Team", "a", 100).unwrap();
+        s.note_expiry("googlechat:1|Team", "b", 300).unwrap();
+        s.note_expiry("googlechat:2|Other", "c", 50).unwrap();
+        // Noting again moves the time rather than adding a second row.
+        s.note_expiry("googlechat:1|Team", "a", 150).unwrap();
+        assert!(s.expired_messages("googlechat:1|", 120).unwrap().is_empty());
+        assert_eq!(s.expired_messages("googlechat:1|", 200).unwrap(), vec![("googlechat:1|Team".to_string(), "a".to_string())]);
+        // A deleted message takes its expiry with it; so does a forgotten account.
+        s.delete_message("googlechat:1|Team", "a").unwrap();
+        assert!(s.expired_messages("googlechat:1|", 200).unwrap().is_empty());
+        s.forget_account("googlechat:2").unwrap();
+        assert!(s.expired_messages("googlechat:2|", 1000).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn append(s: &Store, buffer: &str, id: &str) {

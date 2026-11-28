@@ -63,6 +63,13 @@ impl GcError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BatchTokens {
+    pub at: String,
+    pub bl: String,
+    pub fsid: String,
+}
+
 pub struct Session {
     /// The route key: the account's id, or a sign-in's.
     key: String,
@@ -71,6 +78,7 @@ pub struct Session {
     /// Whether the cookies changed since the account's copy was last saved.
     rotated: Mutex<bool>,
     xsrf: Mutex<Option<(String, Instant)>>,
+    batch_tokens: Mutex<Option<(BatchTokens, Instant)>>,
     /// One refresh at a time: a burst of 401s should not each fetch the page.
     refreshing: tokio::sync::Mutex<()>,
 }
@@ -84,6 +92,7 @@ impl Session {
             cookies: Mutex::new(cookies),
             rotated: Mutex::new(false),
             xsrf: Mutex::new(None),
+            batch_tokens: Mutex::new(None),
             refreshing: tokio::sync::Mutex::new(()),
         }
     }
@@ -127,6 +136,15 @@ impl Session {
     pub fn poll_client(&self) -> reqwest::Client {
         let router = crate::net::route::router();
         router.client_if("googlechat-poll", router.routed(&self.key), |b| b.connect_timeout(Duration::from_secs(30)))
+    }
+
+    /// A client that never follows redirects itself, so attachment downloads can decide per hop whether to send
+    /// cookies (only to Google hosts).
+    pub fn no_redirect_client(&self) -> reqwest::Client {
+        let router = crate::net::route::router();
+        router.client_if("googlechat-download", router.routed(&self.key), |b| {
+            b.redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(30)).timeout(Duration::from_secs(120))
+        })
     }
 
     /// The browser's headers, and the cookies for a Google host.
@@ -225,6 +243,59 @@ impl Session {
         }
         parse_wiz(&body)
     }
+
+    /// Tokens for `chat.google.com/_/DynamiteWebUi/data/batchexecute` (`SNlM0e`, `cfb2h`, `FdrFJe`).
+    pub async fn ensure_batch_tokens(&self) -> Result<BatchTokens, GcError> {
+        if let Some((tok, at)) = self.batch_tokens.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if at.elapsed() < XSRF_LIFETIME {
+                return Ok(tok.clone());
+            }
+        }
+        let _one = self.refreshing.lock().await;
+        if let Some((tok, at)) = self.batch_tokens.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if at.elapsed() < XSRF_LIFETIME {
+                return Ok(tok.clone());
+            }
+        }
+        let url = "https://chat.google.com/app/home";
+        let headers = self.headers(url);
+        let response = self.client().get(url).headers(headers).send().await.map_err(|e| GcError::Network(crate::backend::mattermost::api::network_words(&e)))?;
+        self.absorb(&response);
+        let status = response.status().as_u16();
+        let final_host = response.url().host_str().unwrap_or("").to_string();
+        let body = response.text().await.map_err(|e| GcError::Network(e.to_string()))?;
+        if final_host == "accounts.google.com" || status == 401 {
+            return Err(GcError::SignedOut);
+        }
+        if status != 200 {
+            return Err(GcError::Status { status, body: String::new() });
+        }
+        let tokens = parse_batch_wiz(&body)?;
+        *self.batch_tokens.lock().unwrap_or_else(|e| e.into_inner()) = Some((tokens.clone(), Instant::now()));
+        Ok(tokens)
+    }
+}
+
+/// Reads the `batchexecute` tokens (`SNlM0e`, `cfb2h`, `FdrFJe`) out of `WIZ_global_data`.
+pub fn parse_batch_wiz(body: &str) -> Result<BatchTokens, GcError> {
+    static WIZ: OnceLock<Regex> = OnceLock::new();
+    let wiz = WIZ.get_or_init(|| Regex::new(r">window\.WIZ_global_data = (\{.+?\});</script>").expect("a fixed pattern"));
+    let data = wiz
+        .captures(body)
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c[1]).ok())
+        .ok_or_else(|| GcError::Network("the Google Chat app page did not carry WIZ_global_data".into()))?;
+    if data["qwAQke"].as_str() == Some("AccountsSignInUi") {
+        return Err(GcError::SignedOut);
+    }
+    let at = data["SNlM0e"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| GcError::Network("Google Chat page carried no batchexecute XSRF token (SNlM0e)".into()))?.to_string();
+    let bl = data["cfb2h"].as_str().unwrap_or("boq_dynamiteuiserver_20261117.03_p1").to_string();
+    let fsid = data["FdrFJe"].as_str().or_else(|| data["FdrFJe"].as_i64().map(|_| "")).unwrap_or("").to_string();
+    let fsid = if fsid.is_empty() {
+        data["FdrFJe"].as_i64().map(|n| n.to_string()).unwrap_or_default()
+    } else {
+        fsid
+    };
+    Ok(BatchTokens { at, bl, fsid })
 }
 
 /// Reads the XSRF token out of the page's `WIZ_global_data`.
@@ -298,5 +369,14 @@ mod tests {
         assert!(missing_cookies(&jar).is_empty());
         let jar = parse_cookies(r#"{"SID":"a","OSID":"b"}"#);
         assert_eq!(missing_cookies(&jar), vec!["HSID", "SSID", "COMPASS"]);
+    }
+
+    #[test]
+    fn reads_batch_tokens_from_wiz() {
+        let page = r#"<script>window.WIZ_global_data = {"SNlM0e":"ALNv:123","cfb2h":"boq_test","FdrFJe":"99999"};</script>"#;
+        let tok = parse_batch_wiz(page).unwrap();
+        assert_eq!(tok.at, "ALNv:123");
+        assert_eq!(tok.bl, "boq_test");
+        assert_eq!(tok.fsid, "99999");
     }
 }
